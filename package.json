@@ -1,0 +1,35 @@
+{
+  "name": "binance-p2p-bot",
+  "version": "2.0.0",
+  "description": "Binance P2P Auto Chat Bot using Official SAPI v7.4",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "pm2:start": "pm2 start src/index.js --name p2p-bot",
+    "pm2:stop": "pm2 stop p2p-bot",
+    "pm2:logs": "pm2 logs p2p-bot"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^16.3.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.22.3",
+    "socket.io": "^4.8.3",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^6.0.1",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
+    "uuid": "^14.0.0",
+    "winston": "^3.11.0",
+    "winston-daily-rotate-file": "^4.7.1",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

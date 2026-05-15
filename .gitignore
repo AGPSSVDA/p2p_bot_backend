@@ -1,0 +1,73 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+*.pem
+*.key
+*.crt
+
+# ── Dependencies ────────────────────────────────────────────────────────────
+node_modules/
+.pnp
+.pnp.js
+.yarn/
+package-lock.json.bak
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+*.log.gz
+bot-*.log
+error-*.log
+combined-*.log
+
+# ── PM2 ─────────────────────────────────────────────────────────────────────
+.pm2/
+ecosystem.config.local.js
+
+# ── Runtime / cache ─────────────────────────────────────────────────────────
+.cache/
+.tmp/
+tmp/
+temp/
+.nyc_output/
+coverage/
+*.pid
+*.seed
+*.pid.lock
+
+# ── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── Editor / IDE ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.history/
+
+# ── Test / build artifacts ──────────────────────────────────────────────────
+dist/
+build/
+out/
+
+# ── Project-specific data ───────────────────────────────────────────────────
+state/
+data/
+*.sqlite
+*.db
+order-state.json
+session-*.json
