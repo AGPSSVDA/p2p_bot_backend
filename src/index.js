@@ -8,7 +8,7 @@ const { orderPoller }       = require('./bot/orderPoller');
 const { chatService }       = require('./services/chatService');
 const { stateManager }      = require('./bot/stateManager');
 const { syncBinanceTime }   = require('./utils/helpers');
-const { startDashboard }    = require('./dashboard/server');
+const { attachDashboard }   = require('./dashboard/server');
 const logger                = require('./utils/logger');
 
 const express = require("express");
@@ -35,14 +35,14 @@ const app = express();
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {
-    origin: ["http://localhost:8080", "http://localhost:3000","http://192.168.1.69:8080", "http://192.168.1.69:3000"],
+    origin: ["http://localhost:8080", "http://localhost:5000", "http://192.168.1.69:8080", "http://192.168.1.69:5000"],
     methods: ["GET", "POST"],
     credentials: true
   }
 });
 
 app.use(cors({
-  origin: ["http://localhost:8080", "http://localhost:3000","http://192.168.1.69:8080", "http://192.168.1.69:3000"],
+  origin: ["http://localhost:8080", "http://localhost:5000", "http://192.168.1.69:8080", "http://192.168.1.69:5000"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
@@ -93,12 +93,11 @@ async function main() {
   // Stats every 2 minutes
   setInterval(() => stateManager.printStats(), 2 * 60 * 1000);
 
-  // Start manual-cancel-test dashboard
-  const dashPort = parseInt(process.env.DASHBOARD_PORT, 10) || 3000;
-  startDashboard(dashPort);
+  // Mount manual-cancel-test dashboard routes onto the main app
+  attachDashboard(app);
 
-  // Start main API + Socket.IO server (auth, templates, payouts, bot-config)
-  const apiPort = parseInt(process.env.API_PORT, 10) || 4000;
+  // Start main API + Socket.IO server (auth, templates, payouts, bot-config, dashboard)
+  const apiPort = parseInt(process.env.API_PORT, 10) || 5000;
   server.listen(apiPort, () => {
     logger.info(`🌐 API server listening on http://localhost:${apiPort}`);
     logger.info(`📚 API docs available at http://localhost:${apiPort}/docs`);

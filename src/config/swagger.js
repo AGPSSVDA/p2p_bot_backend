@@ -1,7 +1,7 @@
 const swaggerJsdoc = require("swagger-jsdoc");
 const path = require("path");
 
-const apiPort = parseInt(process.env.API_PORT, 10) || 4000;
+const apiPort = parseInt(process.env.API_PORT, 10) || 5000;
 
 const options = {
   definition: {

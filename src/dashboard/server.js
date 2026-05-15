@@ -1,8 +1,4 @@
-const express = require('express');
-const path    = require('path');
-const { config } = require('../config/config');
 const {
-  ORDER_STATUS,
   CANCEL_REASON,
   getPendingOrders,
   getOrderDetail,
@@ -28,11 +24,7 @@ const logger = require('../utils/logger');
 //    GET  /api/health                 — { ok, time, botActive }
 // ─────────────────────────────────────────────────────────────────────────────
 
-function startDashboard(port) {
-  const app = express();
-  app.use(express.json());
-  app.use(express.static(path.join(__dirname, '..', '..', 'public')));
-
+function attachDashboard(app) {
   // ── List active orders + bot state for each ───────────────────────────────
   app.get('/api/orders', async (req, res) => {
     try {
@@ -139,11 +131,8 @@ function startDashboard(port) {
     });
   });
 
-  app.listen(port, () => {
-    logger.info(`📊 Dashboard running at http://localhost:${port}`);
-  });
-
+  logger.info('📊 Dashboard routes mounted on main API server');
   return app;
 }
 
-module.exports = { startDashboard };
+module.exports = { attachDashboard };
