@@ -283,6 +283,42 @@ function extractPaymentDetails(orderDetail) {
   };
 }
 
+// ─── 9. List the merchant's own P2P ads (best-effort) ────────────────────────
+//   Binance's C2C ads-list endpoint name varies by SAPI doc version. We try
+//   the most commonly-deployed path first and fall back to an empty list on
+//   error so the /api/ads endpoint stays useful even if Binance's ad-list
+//   API is unavailable to this account. Override the path via env
+//   BINANCE_MY_ADS_ENDPOINT if your account uses a different one.
+async function getMyAds() {
+  const endpoint = process.env.BINANCE_MY_ADS_ENDPOINT || '/sapi/v1/c2c/ads/searchAdsByPage';
+  try {
+    const qs = buildSignedQuery({});
+    const res = await axios.post(
+      `${config.binance.baseUrl}${endpoint}?${qs}`,
+      { page: 1, rows: 50 },
+      { headers: headers(), timeout: 12000 }
+    );
+    const d = res.data?.data || res.data;
+    const list = Array.isArray(d) ? d : (d?.advList || d?.list || d?.data || []);
+    return list.map((a) => ({
+      advNo:               a.advNo || a.advOrderNo || a.id,
+      tradeType:           a.tradeType || a.advType,
+      asset:               a.asset,
+      fiat:                a.fiatUnit || a.fiat,
+      price:               a.price,
+      minSingleTransAmount: a.minSingleTransAmount || a.minAmount,
+      maxSingleTransAmount: a.maxSingleTransAmount || a.maxAmount,
+      advStatus:           a.advStatus || a.status,
+      raw:                 a,
+    }));
+  } catch (err) {
+    logger.warn('getMyAds failed (endpoint may not be enabled for this account)', {
+      endpoint, error: err.response?.data?.msg || err.message,
+    });
+    return [];
+  }
+}
+
 module.exports = {
   ORDER_STATUS,
   CANCEL_REASON,
@@ -296,4 +332,5 @@ module.exports = {
   canCancelOrder,
   sendChatMessageREST,
   extractPaymentDetails,
+  getMyAds,
 };

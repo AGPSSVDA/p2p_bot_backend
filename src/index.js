@@ -8,25 +8,24 @@ const { orderPoller }       = require('./bot/orderPoller');
 const { chatService }       = require('./services/chatService');
 const { stateManager }      = require('./bot/stateManager');
 const { syncBinanceTime }   = require('./utils/helpers');
-const { attachDashboard }   = require('./dashboard/server');
 const logger                = require('./utils/logger');
 
 const express = require("express");
 const http = require("http");
 const { Server: SocketIOServer } = require("socket.io");
 const path = require("path");
-// const binanceConfig = require("./config/binance"); // TODO: file not created yet
 const { getDb, closeDb } = require("./config/database");
-// const { initSocket } = require("./services/socketService"); // TODO: file not created yet
-// const orderRoutes = require("./routes/orderRoutes"); // TODO: file not created yet
-// const chatRoutes = require("./routes/chatRoutes"); // TODO: file not created yet
-// const adminRoutes = require("./routes/adminRoutes"); // TODO: file not created yet
 const templateRoutes = require("./routes/templateRoutes");
 const payoutRoutes = require("./routes/payoutRoutes");
 const authRoutes = require("./routes/authRoutes");
 const botConfigRoutes = require("./routes/botConfigRoutes");
+const overviewRoutes = require("./routes/overviewRoutes");
+const ordersRoutes = require("./routes/ordersRoutes");
+const adsRoutes = require("./routes/adsRoutes");
+const paymentsRoutes = require("./routes/paymentsRoutes");
+const tdsRoutes = require("./routes/tdsRoutes");
+const adminRoutes = require("./routes/adminRoutes");
 const { initMysql } = require("./config/mysql");
-// const { auditLog } = require("./utils/logger"); // TODO: logger does not export auditLog
 const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
 const { swaggerSpec } = require("./config/swagger");
@@ -35,7 +34,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {
-    origin: ["http://localhost:8080", "http://localhost:5000", "http://192.168.1.69:8080", "http://192.168.1.69:5000"],
+    origin: ["http://localhost:8080", "http://localhost:5000", "http://192.168.1.69:8080", "http://192.168.1.69:5000","https://api.agpssvda.com"],
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -61,12 +60,23 @@ app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
 
 // ── Routes ──
 app.use("/api/auth", authRoutes);
-// app.use("/api/orders", orderRoutes); // TODO: enable when ./routes/orderRoutes is created
-// app.use("/api/chat", chatRoutes);    // TODO: enable when ./routes/chatRoutes is created
-// app.use("/api/admin", adminRoutes);  // TODO: enable when ./routes/adminRoutes is created
 app.use("/api/templates", templateRoutes);
 app.use("/api/payouts", payoutRoutes);
 app.use("/api/bot-config", botConfigRoutes);
+app.use("/api/overview", overviewRoutes);
+app.use("/api/orders", ordersRoutes);
+app.use("/api/ads", adsRoutes);
+app.use("/api/payments", paymentsRoutes);
+app.use("/api/tds", tdsRoutes);
+app.use("/api/admin", adminRoutes);
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "OK",
+    data: { time: Date.now(), botActive: Object.keys(stateManager.orders).length },
+  });
+});
 
 
 // ── Step 1: Validate config (.env) ────────────────────────────────────────────
@@ -93,10 +103,9 @@ async function main() {
   // Stats every 2 minutes
   setInterval(() => stateManager.printStats(), 2 * 60 * 1000);
 
-  // Mount manual-cancel-test dashboard routes onto the main app
-  attachDashboard(app);
-
-  // Start main API + Socket.IO server (auth, templates, payouts, bot-config, dashboard)
+  // Start main API + Socket.IO server
+  //   /api/auth, /api/overview, /api/orders, /api/ads, /api/payments,
+  //   /api/tds, /api/templates, /api/payouts, /api/bot-config, /api/admin
   const apiPort = parseInt(process.env.API_PORT, 10) || 5000;
   server.listen(apiPort, () => {
     logger.info(`🌐 API server listening on http://localhost:${apiPort}`);

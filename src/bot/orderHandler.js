@@ -3,6 +3,7 @@ const { MESSAGES }                  = require('./messages');
 const { chatService }               = require('../services/chatService');
 const { verifyPAN }                 = require('../services/panService');
 const { processPayment }            = require('../services/paymentService');
+const orderDb                       = require('../services/orderDbService');
 const {
   ORDER_STATUS,
   CANCEL_REASON,
@@ -51,6 +52,9 @@ class OrderHandler {
       asset:          rawOrder.asset       || 'USDT',
       fiat:           rawOrder.fiat        || 'INR',
     });
+
+    // Track the ad the order came from (for the Ads page aggregation)
+    orderDb.upsertAdFromOrder(rawOrder);
 
     logger.info('New order — starting handler', { orderNo });
 
@@ -319,6 +323,13 @@ class OrderHandler {
       orderNo, state: order.state, preview: text.substring(0, 70),
     });
 
+    orderDb.logChatMessage({
+      orderNo,
+      direction: 'IN',
+      sender: 'seller',
+      text,
+    });
+
     if (isProblemMessage(text)) {
       await this._escalate(orderNo, `Problem keyword: "${text.substring(0, 80)}"`);
       return;
@@ -466,10 +477,7 @@ class OrderHandler {
   // ── Handle TDS consent ────────────────────────────────────────────────────
   async _handleTDSConsent(orderNo, text) {
     if (!isAgreementMessage(text)) {
-      await this._send(orderNo,
-        `Please reply *I AGREE* to confirm TDS deduction and proceed.\n\n` +
-        `💳 🔥 I AGREE 🔥 💳`
-      );
+      await this._send(orderNo, MESSAGES.TDS_CONSENT_RETRY());
       return;
     }
 
@@ -507,6 +515,7 @@ class OrderHandler {
       // Phase 1 — manual fallback
       if (result.manual) {
         stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_RELEASE);
+        orderDb.recordPayoutPending(stateManager.get(orderNo));
         await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_PENDING(order.tds, payDetails.methodName));
         logger.warn('Manual payment required', {
           orderNo,
@@ -525,6 +534,12 @@ class OrderHandler {
         payoutId: result.payoutId,
         utr:      result.utr,
       });
+      orderDb.recordPayoutSuccess(
+        stateManager.get(orderNo),
+        result.payoutId,
+        result.utr,
+        result.mode
+      );
 
       // Mark order as paid on Binance — bot is buyer (Req #5: seller releases later)
       try {
@@ -629,9 +644,16 @@ class OrderHandler {
   }
 
   // ── Send chat message helper ──────────────────────────────────────────────
-  async _send(orderNo, text) {
+  //  Accepts a string OR Promise<string> so callers can pass MESSAGES.X()
+  //  directly (they're DB-backed and async now).
+  async _send(orderNo, textOrPromise) {
     try {
+      const text = textOrPromise && typeof textOrPromise.then === 'function'
+        ? await textOrPromise
+        : textOrPromise;
+      if (!text) return;
       await chatService.sendMessage(orderNo, text);
+      orderDb.logChatMessage({ orderNo, direction: 'OUT', sender: 'bot', text });
     } catch (err) {
       logger.error('Failed to send chat message', { orderNo, error: err.message });
     }

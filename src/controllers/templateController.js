@@ -1,5 +1,6 @@
 const { pool } = require("../config/mysql");
 const { v4: uuidv4 } = require("uuid");
+const messageService = require("../services/messageService");
 
 // Create Template / Add Messages to Template (Bulk)
 const createTemplate = async (req, res) => {
@@ -82,7 +83,8 @@ const createTemplate = async (req, res) => {
       }
 
       await connection.commit();
-      
+      messageService.invalidate();
+
       res.status(201).json({
         success: true,
         message: "Template messages added successfully",
@@ -257,11 +259,12 @@ const updateTemplate = async (req, res) => {
         );
       }
       await connection.commit();
-      
-      res.json({ 
-        success: true, 
+      messageService.invalidate();
+
+      res.json({
+        success: true,
         message: "Template messages updated successfully",
-        data: null 
+        data: null
       });
     } catch (err) {
       await connection.rollback();
@@ -293,16 +296,17 @@ const deleteTemplate = async (req, res) => {
       });
     }
 
-    res.json({ 
-      success: true, 
+    messageService.invalidate();
+    res.json({
+      success: true,
       message: "Template message deleted successfully",
-      data: null 
+      data: null
     });
   } catch (err) {
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       message: err.message,
-      data: null 
+      data: null
     });
   }
 };
@@ -321,10 +325,11 @@ const deleteTemplateGroup = async (req, res) => {
         });
       }
   
-      res.json({ 
-        success: true, 
+      messageService.invalidate();
+      res.json({
+        success: true,
         message: "Template group and all messages deleted successfully",
-        data: null 
+        data: null
       });
     } catch (err) {
       res.status(500).json({ 

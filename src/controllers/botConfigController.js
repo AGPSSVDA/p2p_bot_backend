@@ -1,4 +1,5 @@
 const { getBotConfig, createBotConfig, updateBotConfig, deleteBotConfig } = require("../services/botConfigService");
+const botStatusService = require("../services/botStatusService");
 
 const getBotConfigHandler = async (req, res) => {
   try {
@@ -46,6 +47,7 @@ const updateBotConfigHandler = async (req, res) => {
         data: null
       });
     }
+    botStatusService.invalidate();
     res.json({
       success: true,
       message: "Bot configuration updated successfully",

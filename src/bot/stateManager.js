@@ -1,4 +1,5 @@
 const logger = require('../utils/logger');
+const orderDb = require('../services/orderDbService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Order States — complete lifecycle
@@ -19,27 +20,9 @@ const ORDER_STATE = {
   CANCELLED:           'CANCELLED',
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Order Record Structure
-// {
-//   orderNo, advOrderNo, state,
-//   sellerNickname, sellerUserId,
-//   amount (INR), cryptoAmount, asset, fiat,
-//   pan, panRetries,
-//   payMethods: [...fieldList],
-//   selectedPayId,
-//   tds: { preTDS, tds, postTDS },
-//   payoutId, utr,
-//   reminderSent, lastWarningSent,
-//   lastMsgId,        ← last seen chat message ID
-//   wss: WebSocket,   ← per-order WebSocket connection
-//   createdAt, updatedAt
-// }
-// ─────────────────────────────────────────────────────────────────────────────
-
 class StateManager {
   constructor() {
-    this.orders = {};  // keyed by orderNo
+    this.orders = {};
   }
 
   add(data) {
@@ -78,6 +61,10 @@ class StateManager {
       orderNo, amount: data.amount, asset: data.asset,
     });
 
+    // Persist to MySQL (best-effort, non-blocking)
+    orderDb.upsertOrder(this.orders[orderNo]);
+    orderDb.setOrderState(orderNo, null, ORDER_STATE.NEW_ORDER);
+
     return this.orders[orderNo];
   }
 
@@ -89,6 +76,48 @@ class StateManager {
       updatedAt: Date.now(),
     });
     logger.info('State change', { orderNo, from: prev, to: newState });
+
+    if (prev !== newState) {
+      orderDb.setOrderState(orderNo, prev, newState);
+    }
+
+    // Mirror commonly-patched fields into the DB so the frontend reflects them
+    const patch = {};
+    if (extra.sellerName !== undefined) patch.seller_name = extra.sellerName || null;
+    if (extra.sellerUserId !== undefined) patch.seller_user_id = extra.sellerUserId || null;
+    if (extra.pan !== undefined) patch.pan = extra.pan || null;
+    if (extra.panName !== undefined) patch.pan_name = extra.panName || null;
+    if (extra.payoutId !== undefined) patch.payout_id = extra.payoutId || null;
+    if (extra.utr !== undefined) patch.utr_number = extra.utr || null;
+    if (extra.payMethod !== undefined) patch.payment_method = extra.payMethod || null;
+
+    if (extra.tds) {
+      patch.pre_tds_amount = extra.tds.preTDS ?? null;
+      patch.tds_amount     = extra.tds.tds ?? null;
+      patch.post_tds_amount = extra.tds.postTDS ?? null;
+    }
+
+    if (extra.paymentDetails) {
+      const pd = extra.paymentDetails;
+      patch.payment_method = pd.methodName || patch.payment_method || null;
+      patch.upi_id = pd.upiId || null;
+      patch.account_no = pd.accountNo || null;
+      patch.ifsc_code = pd.ifscCode || null;
+      patch.bank_name = pd.bankName || null;
+      patch.account_name = pd.accountName || null;
+    }
+
+    if (extra.confirmPayEndTime !== undefined && extra.confirmPayEndTime) {
+      patch.confirm_pay_end_time = new Date(Number(extra.confirmPayEndTime)).toISOString().slice(0, 19).replace('T', ' ');
+    }
+    if (extra.notifyPayEndTime !== undefined && extra.notifyPayEndTime) {
+      patch.notify_pay_end_time = new Date(Number(extra.notifyPayEndTime)).toISOString().slice(0, 19).replace('T', ' ');
+    }
+
+    if (Object.keys(patch).length) {
+      orderDb.updateOrder(orderNo, patch);
+    }
+
     return this.orders[orderNo];
   }
 
@@ -99,6 +128,7 @@ class StateManager {
   incPanRetry(orderNo) {
     if (!this.orders[orderNo]) return 0;
     this.orders[orderNo].panRetries++;
+    orderDb.setPanRetries(orderNo, this.orders[orderNo].panRetries);
     return this.orders[orderNo].panRetries;
   }
 

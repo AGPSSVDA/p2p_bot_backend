@@ -2,6 +2,7 @@ const WebSocket = require('ws');
 const { config }              = require('../config/config');
 const { uuidv4 }              = require('../utils/helpers');
 const { getChatCredential }   = require('./binanceService');
+const botStatusService        = require('./botStatusService');
 const logger = require('../utils/logger');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -299,6 +300,19 @@ class ChatService {
       logger.error('Message dropped — WSS is banned due to ILLEGAL_PARAM', { orderNo });
       return { ok: false, via: 'wss_banned' };
     }
+
+    // Bot kill-switch: if operator toggled bot OFF from the dashboard, drop
+    // outbound chat sends silently. Poller / state machine keep running so
+    // orders are still tracked in the DB while the bot is muted.
+    try {
+      const enabled = await botStatusService.isBotEnabled();
+      if (!enabled) {
+        logger.info('Chat send skipped — bot is OFF', {
+          orderNo, preview: String(text).substring(0, 60),
+        });
+        return { ok: false, via: 'bot_off' };
+      }
+    } catch (e) { /* fail-open */ }
 
     // Fast path
     if (this.ws?.readyState === WebSocket.OPEN) {
