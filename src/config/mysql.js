@@ -768,6 +768,94 @@ async function initMysql() {
       { name: 'last_synced_at', def: 'TIMESTAMP NULL' },
     ]);
 
+    // ── verified_sellers (canonical PAN-verified-sellers ledger) ─────────────
+    // Source of truth for "has this seller been verified before?" Decoupled
+    // from the orders table so the returning-seller shortcut works even if
+    // a prior order didn't reach COMPLETED. Populated whenever the bot
+    // successfully verifies a PAN AND its name match passes.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS verified_sellers (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        pan VARCHAR(20) UNIQUE NOT NULL,
+        pan_name VARCHAR(120) NULL,
+        seller_user_id VARCHAR(64) NULL,
+        seller_nickname VARCHAR(120) NULL,
+        seller_name VARCHAR(120) NULL,
+        account_no VARCHAR(64) NULL,
+        upi_id VARCHAR(100) NULL,
+        ifsc_code VARCHAR(32) NULL,
+        bank_name VARCHAR(120) NULL,
+        account_name VARCHAR(120) NULL,
+        first_order_no VARCHAR(64) NULL,
+        last_order_no VARCHAR(64) NULL,
+        verification_count INT NOT NULL DEFAULT 1,
+        first_verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_verified_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_vs_user_id (seller_user_id),
+        INDEX idx_vs_nickname (seller_nickname),
+        INDEX idx_vs_name (seller_name),
+        INDEX idx_vs_account (account_no),
+        INDEX idx_vs_upi (upi_id)
+      )
+    `);
+    await ensureColumns(connection, 'verified_sellers', [
+      { name: 'pan',                 def: 'VARCHAR(20) NULL' },
+      { name: 'pan_name',            def: 'VARCHAR(120) NULL' },
+      { name: 'seller_user_id',      def: 'VARCHAR(64) NULL' },
+      { name: 'seller_nickname',     def: 'VARCHAR(120) NULL' },
+      { name: 'seller_name',         def: 'VARCHAR(120) NULL' },
+      { name: 'account_no',          def: 'VARCHAR(64) NULL' },
+      { name: 'upi_id',              def: 'VARCHAR(100) NULL' },
+      { name: 'ifsc_code',           def: 'VARCHAR(32) NULL' },
+      { name: 'bank_name',           def: 'VARCHAR(120) NULL' },
+      { name: 'account_name',        def: 'VARCHAR(120) NULL' },
+      { name: 'first_order_no',      def: 'VARCHAR(64) NULL' },
+      { name: 'last_order_no',       def: 'VARCHAR(64) NULL' },
+      { name: 'verification_count',  def: 'INT NOT NULL DEFAULT 1' },
+      { name: 'first_verified_at',   def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+      { name: 'last_verified_at',    def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP' },
+    ]);
+
+    // Backfill verified_sellers from existing orders that already have a
+    // PAN captured by the bot. Idempotent (INSERT IGNORE on PAN unique key)
+    // so it's safe to run on every boot — picks up any new orders too.
+    try {
+      const [bf] = await connection.query(`
+        INSERT IGNORE INTO verified_sellers (
+          pan, pan_name, seller_user_id, seller_nickname, seller_name,
+          account_no, upi_id, ifsc_code, bank_name, account_name,
+          first_order_no, last_order_no,
+          first_verified_at, last_verified_at, verification_count
+        )
+        SELECT
+          o.pan,
+          MAX(o.pan_name),
+          MAX(o.seller_user_id),
+          MAX(o.seller_nickname),
+          MAX(o.seller_name),
+          MAX(o.account_no),
+          MAX(o.upi_id),
+          MAX(o.ifsc_code),
+          MAX(o.bank_name),
+          MAX(o.account_name),
+          MIN(o.order_no),
+          MAX(o.order_no),
+          MIN(o.created_at),
+          MAX(COALESCE(o.completed_at, o.created_at)),
+          COUNT(*)
+        FROM orders o
+        WHERE o.pan IS NOT NULL
+          AND o.processed_by = 'BOT'
+          AND (o.name_match_status = 'MATCH' OR o.name_match_status IS NULL)
+        GROUP BY o.pan
+      `);
+      if (bf?.affectedRows > 0) {
+        console.log(`✅ Backfilled ${bf.affectedRows} verified seller(s) from orders.`);
+      }
+    } catch (err) {
+      console.warn("⚠️ verified_sellers backfill warning:", err.message);
+    }
+
     // ── order_messages (audit trail of every chat sent / received) ────────────
     await connection.query(`
       CREATE TABLE IF NOT EXISTS order_messages (

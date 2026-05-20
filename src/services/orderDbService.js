@@ -255,38 +255,188 @@ async function upsertAdFromBinance(ad) {
   );
 }
 
-// ── Find the most recent BOT-verified order for a seller's Binance userId ───
-// Used to detect returning sellers so the bot can skip the welcome / PAN ask
-// and apply the previously-verified PAN automatically.
+// ── Upsert into the canonical verified_sellers ledger ──────────────────────
+// Called whenever the bot successfully verifies a PAN AND name match passes.
+// The unique key is `pan` — one row per PAN, accumulating each new payment
+// method / nickname over time. COALESCE keeps existing non-null values
+// (we don't want a later order's NULL to clobber the original capture).
+async function upsertVerifiedSeller(data) {
+  if (!data || !data.pan) return;
+  const sql = `
+    INSERT INTO verified_sellers (
+      pan, pan_name, seller_user_id, seller_nickname, seller_name,
+      account_no, upi_id, ifsc_code, bank_name, account_name,
+      first_order_no, last_order_no, verification_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON DUPLICATE KEY UPDATE
+      pan_name        = COALESCE(VALUES(pan_name),        pan_name),
+      seller_user_id  = COALESCE(VALUES(seller_user_id),  seller_user_id),
+      seller_nickname = COALESCE(VALUES(seller_nickname), seller_nickname),
+      seller_name     = COALESCE(VALUES(seller_name),     seller_name),
+      account_no      = COALESCE(VALUES(account_no),      account_no),
+      upi_id          = COALESCE(VALUES(upi_id),          upi_id),
+      ifsc_code       = COALESCE(VALUES(ifsc_code),       ifsc_code),
+      bank_name       = COALESCE(VALUES(bank_name),       bank_name),
+      account_name    = COALESCE(VALUES(account_name),    account_name),
+      last_order_no   = VALUES(last_order_no),
+      verification_count = verification_count + 1
+  `;
+  return safe(
+    pool.query(sql, [
+      String(data.pan),
+      data.panName || null,
+      data.sellerUserId || null,
+      data.sellerNickname || null,
+      data.sellerName || null,
+      data.accountNo || null,
+      data.upiId || null,
+      data.ifscCode || null,
+      data.bankName || null,
+      data.accountName || null,
+      data.orderNo || null,    // first_order_no — only used on INSERT
+      data.orderNo || null,    // last_order_no  — overwritten on UPDATE
+    ]),
+    `upsertVerifiedSeller:${String(data.pan).slice(0, 3)}XX`
+  );
+}
+
+// ── Find a verified seller from the verified_sellers ledger ────────────────
+// Reads from the canonical verified_sellers table (not the orders table),
+// so the lookup is independent of whether any individual prior order
+// reached COMPLETED. Once a PAN is verified for a seller, that ledger row
+// persists permanently — every future order from the same identity can
+// look it up.
 //
-// Filters:
-//   - seller_user_id matches
-//   - state = COMPLETED  (the prior trade actually settled)
-//   - pan IS NOT NULL    (PAN was actually captured)
-//   - processed_by = 'BOT'                  (bot actually ran the flow)
-//   - name_match_status = 'MATCH'           (we verified the PAN belonged
-//                                            to this Binance account)
+// IDENTITY MATCHING — SAFETY FIRST + RESILIENT TO METHOD CHANGES
+// We never trust a single soft signal. Any one of the following identity
+// proofs is acceptable; everything else falls through to the first-time
+// PAN flow (the safe default):
 //
-// Returns the most recent matching row, or null if no prior verified order.
-async function findVerifiedSellerHistory(sellerUserId) {
-  if (!sellerUserId) return null;
+//   A. seller_user_id   — Binance internal account ID (when Binance
+//                          returns it). One human ↔ one ID. Highest trust.
+//   B. nickname + name  — Binance nickname is unique at any moment, and
+//                          the KYC name cross-check blocks the rare
+//                          nickname-recycled-by-a-stranger case. Survives
+//                          payment-method changes.
+//   C. name + account_no — Bank account is KYC'd to a single PAN at the
+//                          bank; composite cannot collide between people.
+//   D. name + upi_id    — Same logic as (C).
+//
+// EXPLICITLY REJECTED:
+//   - name-only match        — two strangers can share a KYC name
+//   - nickname-only match    — a recycled nickname would leak a stranger's
+//                              previously-verified PAN
+//
+// Returns the matched verified_sellers row (with a `matched_on` field
+// indicating which branch fired), or null if no prior verification.
+async function findVerifiedSellerHistory({
+  sellerUserId,
+  sellerNickname,
+  sellerName,
+  accountNo,
+  upiId,
+} = {}) {
+  const uid      = sellerUserId   ? String(sellerUserId).trim()   : "";
+  const nick     = sellerNickname ? String(sellerNickname).trim() : "";
+  const name     = sellerName     ? String(sellerName).trim()     : "";
+  const account  = accountNo      ? String(accountNo).trim()      : "";
+  const upi      = upiId          ? String(upiId).trim()          : "";
+
+  const canMatchByUid      = !!uid;
+  const canMatchByNick     = !!nick && !!name;
+  const canMatchByAccount  = !!name && !!account;
+  const canMatchByUpi      = !!name && !!upi;
+  if (!canMatchByUid && !canMatchByNick && !canMatchByAccount && !canMatchByUpi) {
+    return null;
+  }
+
+  const columns = `id, pan, pan_name, seller_user_id, seller_nickname,
+                   seller_name, account_no, upi_id, ifsc_code,
+                   bank_name, account_name, last_order_no,
+                   verification_count, first_verified_at, last_verified_at`;
+  const orderClause = `ORDER BY last_verified_at DESC, id DESC LIMIT 1`;
+
   try {
-    const [rows] = await pool.query(
-      `SELECT order_no, pan, pan_name, name_match_status, completed_at, created_at
-         FROM orders
-        WHERE seller_user_id = ?
-          AND state = 'COMPLETED'
-          AND pan IS NOT NULL
-          AND processed_by = 'BOT'
-          AND name_match_status = 'MATCH'
-        ORDER BY COALESCE(completed_at, created_at) DESC, id DESC
-        LIMIT 1`,
-      [String(sellerUserId)]
-    );
-    return rows[0] || null;
+    // 1. PRIMARY: Binance counterPartUserId.
+    if (canMatchByUid) {
+      const [rows] = await pool.query(
+        `SELECT ${columns} FROM verified_sellers
+          WHERE seller_user_id = ?
+          ${orderClause}`,
+        [uid]
+      );
+      if (rows[0]) {
+        return {
+          ...rows[0],
+          order_no: rows[0].last_order_no,   // back-compat field name
+          matched_on: "seller_user_id",
+        };
+      }
+    }
+
+    // 2. COMPOSITE: Binance nickname + KYC name (case-insensitive).
+    if (canMatchByNick) {
+      const [rows] = await pool.query(
+        `SELECT ${columns} FROM verified_sellers
+          WHERE LOWER(TRIM(seller_nickname)) = LOWER(TRIM(?))
+            AND LOWER(TRIM(seller_name))     = LOWER(TRIM(?))
+          ${orderClause}`,
+        [nick, name]
+      );
+      if (rows[0]) {
+        return {
+          ...rows[0],
+          order_no: rows[0].last_order_no,
+          matched_on: "nickname+name",
+        };
+      }
+    }
+
+    // 3. COMPOSITE: name + bank account number.
+    if (canMatchByAccount) {
+      const [rows] = await pool.query(
+        `SELECT ${columns} FROM verified_sellers
+          WHERE LOWER(TRIM(seller_name)) = LOWER(TRIM(?))
+            AND TRIM(account_no)         = TRIM(?)
+          ${orderClause}`,
+        [name, account]
+      );
+      if (rows[0]) {
+        return {
+          ...rows[0],
+          order_no: rows[0].last_order_no,
+          matched_on: "name+account_no",
+        };
+      }
+    }
+
+    // 4. COMPOSITE: name + UPI id (both case-insensitive).
+    if (canMatchByUpi) {
+      const [rows] = await pool.query(
+        `SELECT ${columns} FROM verified_sellers
+          WHERE LOWER(TRIM(seller_name)) = LOWER(TRIM(?))
+            AND LOWER(TRIM(upi_id))      = LOWER(TRIM(?))
+          ${orderClause}`,
+        [name, upi]
+      );
+      if (rows[0]) {
+        return {
+          ...rows[0],
+          order_no: rows[0].last_order_no,
+          matched_on: "name+upi_id",
+        };
+      }
+    }
+
+    return null;
   } catch (err) {
     logger.warn("findVerifiedSellerHistory failed", {
-      sellerUserId, error: err.message,
+      sellerUserId: uid,
+      sellerNickname: nick,
+      sellerName: name,
+      accountNo: account ? "present" : "(none)",
+      upiId: upi ? "present" : "(none)",
+      error: err.message,
     });
     return null;
   }
@@ -483,6 +633,7 @@ module.exports = {
   upsertAdFromOrder,
   upsertAdFromBinance,
   upsertOrderFromBinance,
+  upsertVerifiedSeller,
   findVerifiedSellerHistory,
   logChatMessage,
   BINANCE_STATUS_TO_STATE,

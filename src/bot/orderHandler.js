@@ -24,6 +24,7 @@ const {
   maskPAN,
   calculateTDS,
   matchNames,
+  tokenIntersectionMatch,
   formatINR,
   sleep,
 } = require('../utils/helpers');
@@ -69,23 +70,43 @@ class OrderHandler {
 
     const order = stateManager.get(orderNo);
 
-    // Returning-seller shortcut: if this Binance user has a prior order that
-    // the bot verified end-to-end, skip the welcome + PAN ask + consent. Use
-    // the previously-captured PAN and jump straight to the TDS summary +
-    // payment flow.
-    if (order.sellerUserId) {
-      const history = await orderDb.findVerifiedSellerHistory(order.sellerUserId);
-      if (history) {
-        logger.info('Returning seller detected — applying TDS shortcut', {
-          orderNo,
-          sellerUserId:    order.sellerUserId,
-          previousOrderNo: history.order_no,
-          previousPan:     maskPAN(history.pan),
-        });
-        await this._handleReturningSeller(orderNo, history);
-        return;
-      }
+    // Returning-seller shortcut: if this Binance seller has a prior order
+    // that the bot verified end-to-end, skip the welcome + PAN ask + consent.
+    //
+    // SAFETY: we never match on a single soft signal. Accepted proofs:
+    //   - Binance counterPartUserId exact match, OR
+    //   - Binance nickname + KYC name composite (survives method changes), OR
+    //   - KYC name + (bank account OR UPI) composite
+    // See findVerifiedSellerHistory() for the full safety rationale.
+    const history = await orderDb.findVerifiedSellerHistory({
+      sellerUserId:   order.sellerUserId,
+      sellerNickname: order.sellerNickname,
+      sellerName:     order.sellerName,
+      accountNo:      order.paymentDetails?.accountNo || null,
+      upiId:          order.paymentDetails?.upiId || null,
+    });
+    if (history) {
+      logger.info('Returning seller detected — applying TDS shortcut', {
+        orderNo,
+        sellerUserId:    order.sellerUserId || '(none)',
+        sellerNickname:  order.sellerNickname || '(none)',
+        sellerName:      order.sellerName || '(none)',
+        matchedOn:       history.matched_on,
+        previousOrderNo: history.order_no,
+        previousPan:     maskPAN(history.pan),
+      });
+      await this._handleReturningSeller(orderNo, history);
+      return;
     }
+
+    logger.info('No prior verified order — running first-time PAN flow', {
+      orderNo,
+      sellerUserId:   order.sellerUserId || '(none)',
+      sellerNickname: order.sellerNickname || '(none)',
+      sellerName:     order.sellerName || '(none)',
+      hasAccount:     !!order.paymentDetails?.accountNo,
+      hasUpi:         !!order.paymentDetails?.upiId,
+    });
 
     // First-time / unverified seller — run the normal welcome + PAN-request flow
     await this._send(orderNo, MESSAGES.WELCOME(order.sellerNickname, order.amount, order.asset));
@@ -476,10 +497,24 @@ class OrderHandler {
         return;
       }
 
-      // PAN valid — verify name match against BOTH Binance KYC and bank
-      // account holder name (Phase 2). If either differs, escalate with a
-      // specific mismatch message that names exactly which source diverged.
+      // PAN valid — verify the holder's identity using a two-step
+      // token-intersection check. A token here is any name part (first /
+      // middle / last). A step PASSES if ANY token of one side matches ANY
+      // token of the other side (case-insensitive, punctuation/honorific
+      // stripped). Both steps must pass to proceed.
+      //
+      //   Step 1: PAN name ↔ Binance KYC name
+      //   Step 2: PAN name ↔ Bank account holder name
+      //
+      // If either step fails the order is escalated with the standard
+      // NAME_MISMATCH template, listing which step(s) diverged.
       const order = stateManager.get(orderNo);
+
+      // Track whether we'll write this seller into the verified_sellers
+      // ledger. Defaults to true — only flipped off if name match failed
+      // in warn mode (don't promote soft-failed verifications to future
+      // returning-seller status).
+      let recordAsVerifiedSeller = true;
 
       if (result.name && config.surepass.nameMatchMode !== 'off') {
         // Refetch order detail if prefetch failed earlier
@@ -494,36 +529,54 @@ class OrderHandler {
         // Don't compare against the seller's nickname (it's a screen name)
         const kycUsable = kycName && kycName !== refreshed.sellerNickname;
 
-        const checks = [];
+        // Step 1: PAN ↔ KYC
+        let kycCheck = null;
         if (kycUsable) {
-          const r = matchNames(panName, kycName, config.surepass.nameMatchMode);
-          checks.push({ source: 'Binance KYC', label: 'binance_kyc',
-                        compareName: kycName, ...r });
-        }
-        if (accountName) {
-          const r = matchNames(panName, accountName, config.surepass.nameMatchMode);
-          checks.push({ source: 'Bank Holder', label: 'bank_account_holder',
-                        compareName: accountName, ...r });
+          kycCheck = tokenIntersectionMatch(panName, kycName);
+          logger.info('Name match Step 1 — PAN ↔ Binance KYC', {
+            orderNo,
+            panName,
+            kycName,
+            matched: kycCheck.matched,
+            overlap: kycCheck.overlap,
+            reason:  kycCheck.reason,
+          });
         }
 
-        if (checks.length === 0) {
+        // Step 2: PAN ↔ Bank account holder
+        let bankCheck = null;
+        if (accountName) {
+          bankCheck = tokenIntersectionMatch(panName, accountName);
+          logger.info('Name match Step 2 — PAN ↔ Bank Holder', {
+            orderNo,
+            panName,
+            accountName,
+            matched: bankCheck.matched,
+            overlap: bankCheck.overlap,
+            reason:  bankCheck.reason,
+          });
+        }
+
+        if (!kycCheck && !bankCheck) {
           logger.warn('Name match SKIPPED — no KYC or bank name available', {
             orderNo, panName,
           });
         } else {
-          checks.forEach((c) => {
-            logger.info('Name match check', {
-              orderNo,
-              panName,
-              compareName:   c.compareName,
-              compareSource: c.label,
-              matched:       c.matched,
-              kind:          c.kind,
-              reason:        c.reason || null,
+          const failed = [];
+          const passed = [];
+          if (kycCheck) {
+            (kycCheck.matched ? passed : failed).push({
+              source: 'Binance KYC', label: 'binance_kyc',
+              compareName: kycName, reason: kycCheck.reason,
             });
-          });
+          }
+          if (bankCheck) {
+            (bankCheck.matched ? passed : failed).push({
+              source: 'Bank Holder', label: 'bank_account_holder',
+              compareName: accountName, reason: bankCheck.reason,
+            });
+          }
 
-          const failed = checks.filter((c) => !c.matched);
           if (failed.length > 0) {
             const behavior = config.surepass.nameMismatchBehavior;
             const mismatchedSources = failed.map((c) => c.source).join(', ');
@@ -542,18 +595,21 @@ class OrderHandler {
                 mismatchedSources,
               }));
               await this._escalate(orderNo,
-                `Name mismatch: PAN="${panName}" vs [${failed.map((c) => `${c.label}="${c.compareName}"`).join(', ')}]`
+                `Name mismatch: PAN="${panName}" vs [${failed.map((c) => `${c.label}="${c.compareName}" (${c.reason})`).join(', ')}]`
               );
               return;
             }
             logger.warn('Name mismatch — proceeding (warn mode)', {
               orderNo, mismatchedSources,
             });
+            // Soft-failed verification — don't promote this seller's PAN
+            // into the verified_sellers ledger (no future shortcut).
+            recordAsVerifiedSeller = false;
           } else {
-            // All names matched — store positive status
+            // All available steps passed — store positive status
             orderDb.updateOrder(orderNo, {
               name_match_status:          'MATCH',
-              name_match_compare_source:  checks.map((c) => c.label).join(','),
+              name_match_compare_source:  passed.map((c) => c.label).join(','),
             });
           }
         }
@@ -561,6 +617,32 @@ class OrderHandler {
 
       // Calculate TDS, ask consent
       const tds = calculateTDS(order.amount, config.bot.tdsPercent);
+
+      // Record this seller in the verified_sellers ledger so future orders
+      // from the same identity can take the returning-seller shortcut.
+      // Skipped only when name match soft-failed in warn mode.
+      if (recordAsVerifiedSeller) {
+        const refreshed = stateManager.get(orderNo);
+        orderDb.upsertVerifiedSeller({
+          pan,
+          panName:        result.name || null,
+          sellerUserId:   refreshed.sellerUserId || null,
+          sellerNickname: refreshed.sellerNickname || null,
+          sellerName:     refreshed.sellerName || null,
+          accountNo:      refreshed.paymentDetails?.accountNo || null,
+          upiId:          refreshed.paymentDetails?.upiId || null,
+          ifscCode:       refreshed.paymentDetails?.ifscCode || null,
+          bankName:       refreshed.paymentDetails?.bankName || null,
+          accountName:    refreshed.paymentDetails?.accountName || null,
+          orderNo,
+        });
+        logger.info('Seller registered in verified_sellers ledger', {
+          orderNo,
+          pan:            maskPAN(pan),
+          sellerNickname: refreshed.sellerNickname || '(none)',
+          sellerName:     refreshed.sellerName || '(none)',
+        });
+      }
 
       stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
         pan, tds, panName: result.name || null,

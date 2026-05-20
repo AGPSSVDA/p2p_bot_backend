@@ -179,6 +179,44 @@ function matchNames(a, b, mode = 'subset') {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Token-intersection name match
+//
+//  Looser than matchNames(): passes if ANY name token (first / middle / last)
+//  in `a` matches ANY token in `b`. Honorifics + punctuation stripped; short
+//  initials kept. Used by the dual-source check (PAN ↔ KYC, then PAN ↔ bank
+//  holder) where we want to be tolerant of middle-name reordering / drops.
+// ─────────────────────────────────────────────────────────────────────────────
+function _tokenize(name) {
+  return _normalizeName(name)
+    .split(' ')
+    .filter(Boolean);
+}
+
+function tokenIntersectionMatch(a, b) {
+  const tokensA = _tokenize(a);
+  const tokensB = _tokenize(b);
+  if (!tokensA.length || !tokensB.length) {
+    return {
+      matched: false,
+      reason:  'one side empty',
+      overlap: [],
+      tokensA, tokensB,
+    };
+  }
+  const setA = new Set(tokensA);
+  const overlap = [...new Set(tokensB.filter(t => setA.has(t)))];
+  return {
+    matched: overlap.length > 0,
+    overlap,
+    tokensA,
+    tokensB,
+    reason: overlap.length
+      ? `matched on [${overlap.join(', ')}]`
+      : `no shared tokens between [${tokensA.join(' ')}] and [${tokensB.join(' ')}]`,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Retry wrapper
 // ─────────────────────────────────────────────────────────────────────────────
 async function withRetry(fn, retries = 3, delayMs = 3000, label = '') {
@@ -242,6 +280,6 @@ module.exports = {
   extractPAN, isValidPANFormat, maskPAN,
   calculateTDS,
   isProblemMessage, isAgreementMessage,
-  matchNames,
+  matchNames, tokenIntersectionMatch,
   withRetry, sleep, formatINR, uuidv4,
 };
