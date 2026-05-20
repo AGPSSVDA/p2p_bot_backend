@@ -41,7 +41,7 @@ const io = new SocketIOServer(server, {
 });
 
 app.use(cors({
-  origin: ["http://localhost:8080", "http://localhost:5000", "http://192.168.1.69:8080", "http://192.168.1.69:5000"],
+  origin: ["http://localhost:8080", "http://localhost:5000", "http://192.168.1.69:8080", "http://192.168.1.69:5000"," https://api.agpssvda.com"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
