@@ -8,8 +8,11 @@ const {
 const { chatService }    = require('../services/chatService');
 const { orderHandler }   = require('./orderHandler');
 const { stateManager, ORDER_STATE } = require('./stateManager');
+const binanceSync        = require('../services/binanceSyncService');
 const { config }         = require('../config/config');
 const logger             = require('../utils/logger');
+
+const TERMINAL_SYNC_INTERVAL_MS = 5 * 60 * 1000;   // every 5 minutes
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Order Poller — three jobs:
@@ -23,6 +26,7 @@ class OrderPoller {
     this.orderTimer      = null;
     this.chatTimer       = null;
     this.completionTimer = null;
+    this.terminalSyncTimer = null;
     this.running         = false;
   }
 
@@ -43,16 +47,27 @@ class OrderPoller {
       () => this._pollCompletion(), config.bot.completionPollInterval
     );
 
+    // Quiet reconciliation: every 5 min, pull recent terminal orders
+    // (3 = appealing, 4 = completed, 6/7 = cancelled) from Binance and
+    // upsert them so the DB never permanently loses a finished trade.
+    this.terminalSyncTimer = setInterval(
+      () => this._syncRecentTerminal(), TERMINAL_SYNC_INTERVAL_MS
+    );
+    // Fire once at startup to catch anything we missed while offline
+    setTimeout(() => this._syncRecentTerminal(), 15_000);
+
     logger.info('OrderPoller started', {
-      orderInterval:      config.bot.orderPollInterval,
-      completionInterval: config.bot.completionPollInterval,
+      orderInterval:        config.bot.orderPollInterval,
+      completionInterval:   config.bot.completionPollInterval,
+      terminalSyncInterval: TERMINAL_SYNC_INTERVAL_MS,
     });
   }
 
   stop() {
-    if (this.orderTimer)      clearInterval(this.orderTimer);
-    if (this.chatTimer)       clearInterval(this.chatTimer);
-    if (this.completionTimer) clearInterval(this.completionTimer);
+    if (this.orderTimer)         clearInterval(this.orderTimer);
+    if (this.chatTimer)          clearInterval(this.chatTimer);
+    if (this.completionTimer)    clearInterval(this.completionTimer);
+    if (this.terminalSyncTimer)  clearInterval(this.terminalSyncTimer);
     this.running = false;
     logger.info('OrderPoller stopped');
   }
@@ -134,6 +149,13 @@ class OrderPoller {
           const content = m.content || m.message || m.msg || '';
           if (!content && type === 'text') continue;
 
+          // Shared dedup: if the WSS already processed this msgId, skip
+          // the REST copy. Covers the WSS→REST race during reconnects.
+          const restMsgId = m.msgId || m.uuid || m.id;
+          if (chatService._alreadySeen(orderNo, restMsgId)) {
+            continue;
+          }
+
           await orderHandler._onMessage(orderNo, {
             type,
             content,
@@ -189,6 +211,25 @@ class OrderPoller {
     }
   }
 }
+
+// ── 4. Periodic terminal-order sync ─────────────────────────────────────────
+//   Fires every TERMINAL_SYNC_INTERVAL_MS. Pulls one page each of status
+//   3/4/6/7 from Binance and upserts into MySQL via binanceSync. Catches
+//   any order that completed/cancelled while the bot was offline or that
+//   the live poller missed because it was already past status 1.
+OrderPoller.prototype._syncRecentTerminal = async function () {
+  try {
+    const result = await binanceSync.quickSyncTerminal();
+    if (result.total > 0) {
+      logger.info('Periodic terminal sync upserted orders', {
+        total: result.total,
+        perStatus: result.perStatus,
+      });
+    }
+  } catch (err) {
+    logger.warn('Periodic terminal sync failed', { error: err.message });
+  }
+};
 
 const orderPoller = new OrderPoller();
 module.exports = { orderPoller };

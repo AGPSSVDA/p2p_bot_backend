@@ -6,16 +6,39 @@ async function getBotConfig() {
   return rows[0] || null;
 }
 
+// Tunable timer columns we accept on create/update. Each entry validates
+// the input and clamps it to a sane range so the bot can't be misconfigured
+// into states like "PAN timeout = 0".
+const TUNABLES = {
+  auto_cancel_buffer_ms: { min: 0,     max: 30 * 60 * 1000 },        // 0..30 min
+  pan_timeout_ms:        { min: 60_000, max: 24 * 60 * 60 * 1000 },  // 1 min..24 h
+  pan_reminder_ms:       { min: 0,     max: 24 * 60 * 60 * 1000 },   // 0..24 h
+};
+
+function coerceTunable(name, raw) {
+  const cfg = TUNABLES[name];
+  if (!cfg) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.min(cfg.max, Math.max(cfg.min, Math.round(n)));
+}
+
 // Create bot configuration
 async function createBotConfig(data) {
   const { bot_status, auto_payout, bot_name, logo } = data;
   const [result] = await pool.query(
-    "INSERT INTO bot_config (bot_status, auto_payout, bot_name, logo) VALUES (?, ?, ?, ?)",
+    `INSERT INTO bot_config
+       (bot_status, auto_payout, bot_name, logo,
+        auto_cancel_buffer_ms, pan_timeout_ms, pan_reminder_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       bot_status ? 1 : 0,
       auto_payout ? 1 : 0,
       bot_name || null,
-      logo || null
+      logo || null,
+      coerceTunable('auto_cancel_buffer_ms', data.auto_cancel_buffer_ms) ?? 60000,
+      coerceTunable('pan_timeout_ms',        data.pan_timeout_ms)        ?? 600000,
+      coerceTunable('pan_reminder_ms',       data.pan_reminder_ms)       ?? 300000,
     ]
   );
   const [rows] = await pool.query("SELECT * FROM bot_config WHERE id = ?", [result.insertId]);
@@ -42,6 +65,15 @@ async function updateBotConfig(id, data) {
   if (data.logo !== undefined) {
     fields.push("logo = ?");
     values.push(data.logo);
+  }
+  for (const name of Object.keys(TUNABLES)) {
+    if (data[name] !== undefined) {
+      const coerced = coerceTunable(name, data[name]);
+      if (coerced !== undefined) {
+        fields.push(`${name} = ?`);
+        values.push(coerced);
+      }
+    }
   }
 
   if (fields.length === 0) return null;

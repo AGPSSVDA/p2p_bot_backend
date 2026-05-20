@@ -28,10 +28,12 @@ const MESSAGES = {
 
   PAN_API_INVALID: (reason) => messageService.get("panApiInvalid", { reason }),
 
-  PAN_VERIFIED_TDS: (_pan, tds) =>
+  PAN_VERIFIED_TDS: (pan, tds, panName) =>
     messageService.get("panVerifiedTds", {
-      preTDS: inr(tds?.preTDS),
-      tds: inr(tds?.tds),
+      pan:     pan     || "—",
+      panName: panName || "—",
+      preTDS:  inr(tds?.preTDS),
+      tds:     inr(tds?.tds),
       postTDS: inr(tds?.postTDS),
     }),
 
@@ -65,7 +67,13 @@ const MESSAGES = {
 
   PAN_MAX_RETRIES: () => messageService.get("panMaxRetries"),
 
-  NAME_MISMATCH: () => messageService.get("nameMismatch"),
+  NAME_MISMATCH: (vars = {}) =>
+    messageService.get("nameMismatch", {
+      panName:            vars.panName            || "—",
+      kycName:            vars.kycName            || "—",
+      accountName:        vars.accountName        || "—",
+      mismatchedSources:  vars.mismatchedSources  || "—",
+    }),
 
   PAN_API_DOWN: () => messageService.get("panApiDown"),
 
@@ -84,6 +92,20 @@ const MESSAGES = {
 
   WAIT_RELEASE: (method) =>
     messageService.get("waitRelease", { method: method || "account" }),
+
+  // Returning-seller shortcut: PAN already verified in a prior trade, so the
+  // bot sends the three-block summary (Overview / Approval / Summary) instead
+  // of running the welcome + PAN-request + consent flow again.
+  // Returns the full ordered list of messages to send sequentially.
+  RETURNING_SELLER_TDS: ({ previousOrderNo, pan, panName, tds }) =>
+    messageService.getAll("returningSellerTdsApplied", {
+      previousOrderNo: previousOrderNo || "—",
+      pan:             pan || "—",
+      panName:         panName || "—",
+      preTDS:          inr(tds?.preTDS),
+      tds:             inr(tds?.tds),
+      postTDS:         inr(tds?.postTDS),
+    }),
 };
 
 module.exports = { MESSAGES };

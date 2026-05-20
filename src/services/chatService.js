@@ -35,6 +35,30 @@ class ChatService {
     this.reconnectAttempts = 0;
     this.openedAt          = null;
     this._firstFrameLogged = false;
+    // Inbound-frame dedup. Binance occasionally pushes the same seller
+    // message twice via WSS, and the fallback REST poller can race with
+    // WSS too. Tracking the last N msgIds per order prevents the handler
+    // from firing more than once for the same message.
+    this._seenInboundIds   = {};   // orderNo -> { ids: Set, order: [] }
+    this._SEEN_CAP_PER_ORDER = 200;
+  }
+
+  // Returns true if the message was already handled and should be skipped.
+  _alreadySeen(orderNo, msgId) {
+    if (!orderNo || !msgId) return false;
+    let entry = this._seenInboundIds[orderNo];
+    if (!entry) {
+      entry = this._seenInboundIds[orderNo] = { ids: new Set(), order: [] };
+    }
+    if (entry.ids.has(msgId)) return true;
+    entry.ids.add(msgId);
+    entry.order.push(msgId);
+    // Bounded sliding window — evict oldest when over cap
+    if (entry.order.length > this._SEEN_CAP_PER_ORDER) {
+      const evict = entry.order.shift();
+      entry.ids.delete(evict);
+    }
+    return false;
   }
 
   // ── Register a per-order message handler ──────────────────────────────────
@@ -245,12 +269,20 @@ class ChatService {
       const content = data.content || data.message || data.msg || '';
       const senderId = data.sendUserId || data.senderId || data.userId || '';
       if (!content) return;
+      if (this._alreadySeen(orderNo, msgId)) {
+        logger.debug('Duplicate inbound WSS frame — skipping', { orderNo, msgId });
+        return;
+      }
       logger.info('WSS text from seller', { orderNo, msgId, preview: String(content).substring(0, 60) });
       handler({ type: 'text', content, msgId, senderId, raw: data });
       return;
     }
 
     if (type === 'image' || type === 'video' || type === 'file') {
+      if (this._alreadySeen(orderNo, msgId)) {
+        logger.debug('Duplicate inbound WSS media frame — skipping', { orderNo, msgId, type });
+        return;
+      }
       logger.info(`WSS ${type} from seller`, { orderNo, msgId });
       handler({ type, content: data.imageUrl || data.url || data.content || '', msgId, raw: data });
       return;

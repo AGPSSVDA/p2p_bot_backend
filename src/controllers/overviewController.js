@@ -9,6 +9,7 @@ const ACTIVE_STATES = [
   "WAITING_TDS_CONSENT",
   "TDS_ACCEPTED",
   "PROCESSING_PAYMENT",
+  "AWAITING_MANUAL_PAYMENT",
   "PAYMENT_SENT",
   "WAITING_FOR_RELEASE",
 ];
@@ -34,7 +35,13 @@ async function getOverview(req, res) {
         SUM(CASE WHEN state = 'COMPLETED'
                   AND YEAR(created_at) = YEAR(CURDATE())
                   AND MONTH(created_at) = MONTH(CURDATE()) THEN amount ELSE 0 END) AS volume_month,
-        SUM(tds_amount) AS total_tds
+        SUM(tds_amount) AS total_tds,
+        SUM(CASE WHEN processed_by = 'BOT' THEN 1 ELSE 0 END) AS bot_processed,
+        SUM(CASE WHEN processed_by = 'MANUAL' THEN 1 ELSE 0 END) AS manual_processed,
+        SUM(CASE WHEN processed_by = 'BOT' AND state = 'COMPLETED' THEN 1 ELSE 0 END) AS bot_completed,
+        SUM(CASE WHEN processed_by = 'MANUAL' AND state = 'COMPLETED' THEN 1 ELSE 0 END) AS manual_completed,
+        SUM(CASE WHEN processed_by = 'BOT' AND state IN ('FAILED','ESCALATED','CANCELLED') THEN 1 ELSE 0 END) AS bot_failed,
+        SUM(CASE WHEN processed_by = 'MANUAL' AND state IN ('FAILED','ESCALATED','CANCELLED') THEN 1 ELSE 0 END) AS manual_failed
       FROM orders
     `);
     const t = totalsRow[0] || {};
@@ -80,6 +87,12 @@ async function getOverview(req, res) {
         total_payouts:     Number(payoutsRow[0]?.cnt) || 0,
         total_paid_out:    Number(payoutsRow[0]?.total) || 0,
         total_ads:         Number(adsRow[0]?.cnt) || 0,
+        bot_processed:     Number(t.bot_processed) || 0,
+        manual_processed:  Number(t.manual_processed) || 0,
+        bot_completed:     Number(t.bot_completed) || 0,
+        manual_completed:  Number(t.manual_completed) || 0,
+        bot_failed:        Number(t.bot_failed) || 0,
+        manual_failed:     Number(t.manual_failed) || 0,
         states_breakdown:  statesBreakdown,
         active_states:     ACTIVE_STATES,
         failure_states:    FAILURE_STATES,

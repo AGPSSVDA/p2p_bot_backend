@@ -1,5 +1,8 @@
 const { pool } = require("../config/mysql");
 const logger = require("../utils/logger");
+const { markOrderAsPaid } = require("../services/binanceService");
+const orderDb = require("../services/orderDbService");
+const { stateManager, ORDER_STATE } = require("../bot/stateManager");
 
 // ── GET /api/payments ────────────────────────────────────────────────────────
 //   Returns payouts plus summary tiles (success / pending / failed counts).
@@ -91,8 +94,13 @@ async function listPayments(req, res) {
 }
 
 // ── POST /api/payments/:id/approve ───────────────────────────────────────────
-//   Marks a PENDING payout as SUCCESS with the supplied UTR. Used when the
-//   operator releases payment manually via the Payments page (Phase 1).
+//   Manual-payment confirmation flow:
+//     1. Operator entered the UTR after paying the seller out-of-band
+//     2. Mark the payouts row SUCCESS with the supplied UTR
+//     3. Tell Binance the order is paid (markOrderAsPaid) so the seller can
+//        release the crypto
+//     4. Transition the order from AWAITING_MANUAL_PAYMENT → PAYMENT_SENT;
+//        the bot's completion poller picks it up from there.
 async function approvePayment(req, res) {
   try {
     const { id } = req.params;
@@ -101,21 +109,69 @@ async function approvePayment(req, res) {
       return res.status(400).json({ success: false, message: "UTR is required", data: null });
     }
 
-    const [result] = await pool.query(
-      "UPDATE payouts SET status = 'SUCCESS', utr_number = ? WHERE id = ? AND status = 'PENDING'",
-      [utr, id]
+    // 1. Look up the payout + linked order
+    const [payoutRows] = await pool.query(
+      "SELECT * FROM payouts WHERE id = ? AND status = 'PENDING'",
+      [id]
     );
-
-    if (result.affectedRows === 0) {
+    if (payoutRows.length === 0) {
       return res.status(404).json({
         success: false,
         message: "Payout not found or not in PENDING state",
         data: null,
       });
     }
+    const payout = payoutRows[0];
+    const orderNo = payout.order_id;
 
-    logger.info("Manual payment approved", { payoutId: id, utr });
-    res.json({ success: true, message: "Payment approved", data: { id, utr } });
+    // 2. Fetch the order's payment method id (payId) — needed by markOrderAsPaid
+    const [orderRows] = await pool.query(
+      "SELECT state, payment_method FROM orders WHERE order_no = ?",
+      [orderNo]
+    );
+    const order = orderRows[0];
+
+    // 3. Mark paid on Binance (non-fatal; if it fails we still record locally)
+    let binanceMarked = false;
+    let binanceError = null;
+    try {
+      await markOrderAsPaid(orderNo, null);
+      binanceMarked = true;
+      logger.info("Manual approve: order marked paid on Binance", { orderNo, payoutId: id });
+    } catch (err) {
+      binanceError = err.response?.data?.msg || err.message;
+      logger.error("Manual approve: markOrderAsPaid FAILED — recording locally only", {
+        orderNo, error: binanceError,
+      });
+    }
+
+    // 4. Update payouts row
+    await pool.query(
+      "UPDATE payouts SET status = 'SUCCESS', utr_number = ? WHERE id = ?",
+      [utr, id]
+    );
+
+    // 5. Transition the order's state if it's in the awaiting-manual stage.
+    //    For any other current state (e.g. bot already moved it on) leave alone.
+    if (order && order.state === "AWAITING_MANUAL_PAYMENT") {
+      await orderDb.setOrderState(orderNo, "AWAITING_MANUAL_PAYMENT", "PAYMENT_SENT");
+      await orderDb.updateOrder(orderNo, { utr_number: utr });
+
+      // Mirror to in-memory state if the bot is currently tracking the order
+      const live = stateManager.get(orderNo);
+      if (live) {
+        stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, { utr });
+      }
+    }
+
+    logger.info("Manual payment approved", { payoutId: id, orderNo, utr, binanceMarked });
+    res.json({
+      success: true,
+      message: binanceMarked
+        ? "Payment approved and order marked paid on Binance"
+        : `Payment approved (Binance mark-paid failed: ${binanceError})`,
+      data: { id, orderNo, utr, binanceMarked, binanceError },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message, data: null });
   }

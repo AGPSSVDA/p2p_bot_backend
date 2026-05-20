@@ -105,13 +105,15 @@ const TEMPLATE_DEFAULTS = [
   },
   {
     key: "panVerifiedTds",
-    description: "Sent when PAN is verified; shows pre/post-TDS breakdown ({preTDS}, {tds}, {postTDS})",
+    description: "Sent when PAN is verified. Placeholders: {pan}, {panName}, {preTDS}, {tds}, {postTDS}",
     sort_order: 7,
     messages: [
       {
         order: 1,
         text:
-          "Your PAN has been logged. Processing... 🔧\n\n" +
+          "✅ PAN verified successfully.\n\n" +
+          "Name on PAN     : {panName}\n" +
+          "PAN             : {pan}\n\n" +
           "Your order is being prepared. Please wait for an update. ⏳\n\n" +
           "Amount (Pre-TDS)  : ₹{preTDS}\n" +
           "TDS Amount [1.0%] : ₹{tds}\n" +
@@ -272,16 +274,19 @@ const TEMPLATE_DEFAULTS = [
   },
   {
     key: "nameMismatch",
-    description: "Sent when PAN name doesn't match KYC/bank name",
+    description: "Sent when PAN name doesn't match KYC/bank name. Placeholders: {panName}, {kycName}, {accountName}, {mismatchedSources}",
     sort_order: 18,
     messages: [
       {
         order: 1,
         text:
-          "❌ Name mismatch.\n\n" +
-          "The name on the PAN you provided does not match your registered " +
-          "account name. As a security measure, this order has been escalated " +
-          "for manual review. Our team will reach out to you shortly.",
+          "❌ Name mismatch detected.\n\n" +
+          "PAN Name        : {panName}\n" +
+          "Binance KYC     : {kycName}\n" +
+          "Bank Holder     : {accountName}\n\n" +
+          "Mismatch with   : {mismatchedSources}\n\n" +
+          "As a security measure, this order has been escalated for manual review. " +
+          "Our team will reach out to you shortly.",
       },
     ],
   },
@@ -392,6 +397,37 @@ const TEMPLATE_DEFAULTS = [
       },
     ],
   },
+  {
+    key: "returningSellerTdsApplied",
+    description:
+      "Returning seller — TDS applied automatically using previously-verified PAN. " +
+      "Placeholders: {previousOrderNo}, {pan}, {panName}, {preTDS}, {tds}, {postTDS}",
+    sort_order: 27,
+    messages: [
+      {
+        order: 1,
+        text:
+          "🔹 *TDS Deduction Overview:*\n" +
+          "As you agreed during your previous order (Order Number: {previousOrderNo}), we deduct 1% TDS on crypto transactions as mandated by Indian tax laws. " +
+          "Your PAN card number {pan}, which is securely saved with us, will be used to deposit this TDS to your PAN card.",
+      },
+      {
+        order: 2,
+        text:
+          "🔹 *TDS Deduction Approval:*\n" +
+          "✅ As you had previously approved the TDS deduction on future transactions during your earlier order with us, we have applied the TDS deduction to this transaction as well.",
+      },
+      {
+        order: 3,
+        text:
+          "🔹 *Your Transaction Summary:*\n" +
+          "🥳 Amount Credited to You: ₹{postTDS} (transferred to your bank account).\n" +
+          "📋 TDS Deducted: ₹{tds} (1% of the transaction value).\n" +
+          "📅 TDS Deposit Timeline: ₹{tds} will be deposited to your PAN within the prescribed timelines as per Indian tax laws.\n\n" +
+          "Thank you for your continued trust! 🙏",
+      },
+    ],
+  },
 ];
 
 // ── Migration helpers ───────────────────────────────────────────────────────
@@ -411,6 +447,24 @@ async function ensureColumns(conn, table, columns) {
       console.log(`   • migrated ${table}: added column ${col.name}`);
     }
   }
+}
+
+// Relaxes a NOT NULL column on a legacy table to allow NULL so new inserts
+// that don't supply it don't fail. No-op if the column doesn't exist or is
+// already nullable.
+async function relaxColumnToNullable(conn, table, columnName) {
+  const [rows] = await conn.query(
+    `SELECT COLUMN_TYPE, IS_NULLABLE
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, columnName]
+  );
+  if (rows.length === 0) return;
+  if (rows[0].IS_NULLABLE === 'YES') return;
+  await conn.query(
+    `ALTER TABLE \`${table}\` MODIFY COLUMN \`${columnName}\` ${rows[0].COLUMN_TYPE} NULL`
+  );
+  console.log(`   • migrated ${table}: relaxed ${columnName} to NULL`);
 }
 
 // Adds a secondary index if it doesn't already exist on the table.
@@ -535,10 +589,19 @@ async function initMysql() {
         auto_payout TINYINT(1) NOT NULL DEFAULT 0,
         bot_name VARCHAR(100) NULL,
         logo VARCHAR(500) NULL,
+        auto_cancel_buffer_ms INT NOT NULL DEFAULT 60000,
+        pan_timeout_ms INT NOT NULL DEFAULT 600000,
+        pan_reminder_ms INT NOT NULL DEFAULT 300000,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
+    // Migration: ensure new tunable columns exist on legacy bot_config rows.
+    await ensureColumns(connection, 'bot_config', [
+      { name: 'auto_cancel_buffer_ms', def: 'INT NOT NULL DEFAULT 60000' },
+      { name: 'pan_timeout_ms',        def: 'INT NOT NULL DEFAULT 600000' },
+      { name: 'pan_reminder_ms',       def: 'INT NOT NULL DEFAULT 300000' },
+    ]);
 
     // ── orders (DB-persisted lifecycle) ───────────────────────────────────────
     await connection.query(`
@@ -577,11 +640,13 @@ async function initMysql() {
         completed_at DATETIME NULL,
         cancelled_at DATETIME NULL,
         escalated_at DATETIME NULL,
+        processed_by VARCHAR(16) NOT NULL DEFAULT 'BOT',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_orders_state (state),
         INDEX idx_orders_created (created_at),
-        INDEX idx_orders_adv (adv_no)
+        INDEX idx_orders_adv (adv_no),
+        INDEX idx_orders_processed_by (processed_by)
       )
     `);
 
@@ -620,12 +685,34 @@ async function initMysql() {
       { name: 'completed_at',               def: 'DATETIME NULL' },
       { name: 'cancelled_at',               def: 'DATETIME NULL' },
       { name: 'escalated_at',               def: 'DATETIME NULL' },
+      // Provenance flag: BOT = handled end-to-end by the bot (chat, PAN, TDS,
+      // payment). MANUAL = order existed on Binance and was pulled in via the
+      // sync without the bot's live flow ever touching it.
+      { name: 'processed_by',               def: "VARCHAR(16) NOT NULL DEFAULT 'BOT'" },
       { name: 'created_at',                 def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
       { name: 'updated_at',                 def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP' },
     ]);
     await ensureIndex(connection, 'orders', 'idx_orders_state', 'state');
+    await ensureIndex(connection, 'orders', 'idx_orders_processed_by', 'processed_by');
     await ensureIndex(connection, 'orders', 'idx_orders_created', 'created_at');
     await ensureIndex(connection, 'orders', 'idx_orders_adv', 'adv_no');
+
+    // Relax any legacy NOT NULL columns that pre-date the current schema so
+    // new inserts (which don't know about them) don't fail with
+    // "Field 'X' doesn't have a default value".
+    for (const col of [
+      'order_id',          // legacy identifier — replaced by order_no
+      'binance_uid',
+      'status',            // legacy — replaced by `state`
+      'pan_attempts',      // legacy — replaced by `pan_retries`
+      'pan_hash',
+      'verified_pan_name',
+      'beneficiary_name',
+      'payment_account_info',
+      'name_match_score',
+    ]) {
+      await relaxColumnToNullable(connection, 'orders', col);
+    }
 
     // ── order_state_log ───────────────────────────────────────────────────────
     await connection.query(`

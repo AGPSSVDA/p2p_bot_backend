@@ -7,6 +7,7 @@ const orderDb                       = require('../services/orderDbService');
 const {
   ORDER_STATUS,
   CANCEL_REASON,
+  pickSellerCancelReason,
   getOrderDetail,
   getChatCredential,
   extractPaymentDetails,
@@ -15,6 +16,7 @@ const {
   cancelOrder,
   canCancelOrder,
 } = require('../services/binanceService');
+const botStatusService = require('../services/botStatusService');
 const {
   extractPAN,
   isProblemMessage,
@@ -60,19 +62,83 @@ class OrderHandler {
 
     await this._connectChat(orderNo);
 
-    // Prefetch order detail to capture seller's KYC name + bank details for
-    // PAN name-match later. Non-blocking — failure is logged but flow continues.
-    this._prefetchOrderDetail(orderNo).catch(() => {});
+    // Await prefetch so we have a reliable sellerUserId before deciding
+    // whether to run the returning-seller shortcut. _prefetchOrderDetail
+    // never throws — it logs failures and returns — so we can rely on it.
+    await this._prefetchOrderDetail(orderNo);
 
     const order = stateManager.get(orderNo);
 
-    // Req #1: configurable welcome + PAN-request message
+    // Returning-seller shortcut: if this Binance user has a prior order that
+    // the bot verified end-to-end, skip the welcome + PAN ask + consent. Use
+    // the previously-captured PAN and jump straight to the TDS summary +
+    // payment flow.
+    if (order.sellerUserId) {
+      const history = await orderDb.findVerifiedSellerHistory(order.sellerUserId);
+      if (history) {
+        logger.info('Returning seller detected — applying TDS shortcut', {
+          orderNo,
+          sellerUserId:    order.sellerUserId,
+          previousOrderNo: history.order_no,
+          previousPan:     maskPAN(history.pan),
+        });
+        await this._handleReturningSeller(orderNo, history);
+        return;
+      }
+    }
+
+    // First-time / unverified seller — run the normal welcome + PAN-request flow
     await this._send(orderNo, MESSAGES.WELCOME(order.sellerNickname, order.amount, order.asset));
     await sleep(1500);
     await this._send(orderNo, MESSAGES.PAN_REQUEST());
 
     stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN);
     this._startPANTimer(orderNo);
+  }
+
+  // ── Returning-seller shortcut ─────────────────────────────────────────────
+  //   Re-uses a previously-verified PAN. Sends the 3-block consolidated
+  //   message (Overview / Approval / Summary), then runs the normal payment
+  //   flow. No PAN ask, no consent prompt, no PAN-timeout timer.
+  async _handleReturningSeller(orderNo, history) {
+    const order = stateManager.get(orderNo);
+    if (!order) return;
+
+    const tds = calculateTDS(order.amount, config.bot.tdsPercent);
+
+    // Mark as PAN-verified using the historical PAN / name. Persists to DB
+    // via stateManager.set() so the Orders page shows the reused PAN too.
+    stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
+      pan:     history.pan,
+      panName: history.pan_name,
+      tds,
+    });
+    // Inherit the previous order's name-match status so the Orders detail
+    // drawer reflects that this is a trusted PAN reused from a prior verify.
+    orderDb.updateOrder(orderNo, {
+      name_match_status:          'MATCH',
+      name_match_compare_source:  'previous_order',
+    });
+
+    // Send the 3-block consolidated message (Overview / Approval / Summary)
+    const blocks = await MESSAGES.RETURNING_SELLER_TDS({
+      previousOrderNo: history.order_no,
+      pan:             history.pan,
+      panName:         history.pan_name,
+      tds,
+    });
+    for (const block of blocks) {
+      if (!block) continue;
+      await this._send(orderNo, block);
+      await sleep(1500);
+    }
+
+    // Auto-accept TDS consent (they already approved on the prior order)
+    stateManager.set(orderNo, ORDER_STATE.TDS_ACCEPTED);
+    await sleep(500);
+
+    // Run the existing payment flow
+    await this._processPaymentFlow(orderNo);
   }
 
   // ── Prefetch order detail for sellerName + payment info + deadlines ───────
@@ -126,9 +192,17 @@ class OrderHandler {
   }
 
   // ── Auto-cancel scheduling — fire `bufferMs` BEFORE Binance's deadline ────
-  _scheduleAutoCancel(orderNo) {
-    const buffer = config.bot.autoCancelBufferMs;
-    if (!buffer || buffer < 0) return;          // disabled
+  // Buffer is read from bot_config (set via the frontend dashboard) every
+  // time we schedule, so changing it in the UI takes effect immediately for
+  // any new order. Falls back to the static .env value if the DB read fails.
+  async _scheduleAutoCancel(orderNo) {
+    let buffer;
+    try {
+      buffer = await botStatusService.getAutoCancelBufferMs();
+    } catch (_) {
+      buffer = config.bot.autoCancelBufferMs;
+    }
+    if (buffer == null || buffer < 0) return;   // disabled
 
     const order = stateManager.get(orderNo);
     if (!order) return;
@@ -216,12 +290,16 @@ class OrderHandler {
       return;
     }
 
-    // "Due to seller" reason — seller-fault attribution, doesn't hurt our rate
-    const reasonCode = CANCEL_REASON.SELLER_CANNOT_RELEASE; // = 6
-    const additionalInfo = `No response from seller — ${reason || 'auto-cancel'}`;
+    // Pick a random seller-fault reason from the curated pool. All codes in
+    // the pool are "Due to seller" (3/4/6) so the bot's cancellation rate is
+    // never debited. Rotating the displayed reason makes consecutive cancels
+    // look less mechanical to the seller.
+    const picked = pickSellerCancelReason();
+    const reasonCode = picked.code;
+    const additionalInfo = String(picked.info || '').slice(0, 200);
 
     logger.warn('Auto-cancelling order on Binance (Due to seller flow)', {
-      orderNo, state: order.state, reason,
+      orderNo, state: order.state, trigger: reason,
       reasonCode, additionalInfo,
     });
 
@@ -347,6 +425,7 @@ class OrderHandler {
       case ORDER_STATE.PAN_VERIFIED:
       case ORDER_STATE.TDS_ACCEPTED:
       case ORDER_STATE.PROCESSING_PAYMENT:
+      case ORDER_STATE.AWAITING_MANUAL_PAYMENT:
       case ORDER_STATE.VALIDATING_PAN:
         await this._send(orderNo, MESSAGES.WAIT_PROCESSING());
         break;
@@ -397,53 +476,85 @@ class OrderHandler {
         return;
       }
 
-      // PAN valid — verify name match against Binance KYC / bank account
+      // PAN valid — verify name match against BOTH Binance KYC and bank
+      // account holder name (Phase 2). If either differs, escalate with a
+      // specific mismatch message that names exactly which source diverged.
       const order = stateManager.get(orderNo);
 
-      // Phase 2 only — Phase 1 (format-only) has no real name to compare
       if (result.name && config.surepass.nameMatchMode !== 'off') {
         // Refetch order detail if prefetch failed earlier
         if (!order.sellerName && !order.paymentDetails) {
           await this._prefetchOrderDetail(orderNo);
         }
         const refreshed = stateManager.get(orderNo);
-        const kycName  = (refreshed.sellerName || '').trim();
-        const bankName = refreshed.paymentDetails?.accountName?.trim() || '';
+        const kycName     = (refreshed.sellerName || '').trim();
+        const accountName = refreshed.paymentDetails?.accountName?.trim() || '';
+        const panName     = (result.name || '').trim();
 
-        let compareWith = '';
-        let compareSource = '';
-        if (kycName && kycName !== refreshed.sellerNickname) {
-          compareWith = kycName; compareSource = 'binance_kyc';
-        } else if (bankName) {
-          compareWith = bankName; compareSource = 'bank_account_holder';
+        // Don't compare against the seller's nickname (it's a screen name)
+        const kycUsable = kycName && kycName !== refreshed.sellerNickname;
+
+        const checks = [];
+        if (kycUsable) {
+          const r = matchNames(panName, kycName, config.surepass.nameMatchMode);
+          checks.push({ source: 'Binance KYC', label: 'binance_kyc',
+                        compareName: kycName, ...r });
+        }
+        if (accountName) {
+          const r = matchNames(panName, accountName, config.surepass.nameMatchMode);
+          checks.push({ source: 'Bank Holder', label: 'bank_account_holder',
+                        compareName: accountName, ...r });
         }
 
-        if (!compareWith) {
+        if (checks.length === 0) {
           logger.warn('Name match SKIPPED — no KYC or bank name available', {
-            orderNo, panName: result.name,
+            orderNo, panName,
           });
         } else {
-          const m = matchNames(result.name, compareWith, config.surepass.nameMatchMode);
-          logger.info('Name match check', {
-            orderNo,
-            panName:        result.name,
-            compareName:    compareWith,
-            compareSource,
-            matched:        m.matched,
-            kind:           m.kind,
-            reason:         m.reason || null,
+          checks.forEach((c) => {
+            logger.info('Name match check', {
+              orderNo,
+              panName,
+              compareName:   c.compareName,
+              compareSource: c.label,
+              matched:       c.matched,
+              kind:          c.kind,
+              reason:        c.reason || null,
+            });
           });
 
-          if (!m.matched) {
+          const failed = checks.filter((c) => !c.matched);
+          if (failed.length > 0) {
             const behavior = config.surepass.nameMismatchBehavior;
+            const mismatchedSources = failed.map((c) => c.source).join(', ');
+
+            // Persist mismatch on the order row for the frontend
+            orderDb.updateOrder(orderNo, {
+              name_match_status:          'MISMATCH',
+              name_match_compare_source:  failed.map((c) => c.label).join(','),
+            });
+
             if (behavior === 'block') {
-              await this._send(orderNo, MESSAGES.NAME_MISMATCH());
+              await this._send(orderNo, MESSAGES.NAME_MISMATCH({
+                panName,
+                kycName:     kycUsable ? kycName : '—',
+                accountName: accountName || '—',
+                mismatchedSources,
+              }));
               await this._escalate(orderNo,
-                `Name mismatch: PAN="${result.name}" vs ${compareSource}="${compareWith}"`
+                `Name mismatch: PAN="${panName}" vs [${failed.map((c) => `${c.label}="${c.compareName}"`).join(', ')}]`
               );
               return;
             }
-            logger.warn('Name mismatch — proceeding (warn mode)', { orderNo });
+            logger.warn('Name mismatch — proceeding (warn mode)', {
+              orderNo, mismatchedSources,
+            });
+          } else {
+            // All names matched — store positive status
+            orderDb.updateOrder(orderNo, {
+              name_match_status:          'MATCH',
+              name_match_compare_source:  checks.map((c) => c.label).join(','),
+            });
           }
         }
       }
@@ -455,7 +566,7 @@ class OrderHandler {
         pan, tds, panName: result.name || null,
       });
 
-      await this._send(orderNo, MESSAGES.PAN_VERIFIED_TDS(pan, tds));
+      await this._send(orderNo, MESSAGES.PAN_VERIFIED_TDS(pan, tds, result.name));
       await sleep(1500);
       await this._send(orderNo, MESSAGES.TDS_INFO(tds));
       await sleep(1500);
@@ -512,9 +623,12 @@ class OrderHandler {
       // Req #4: auto-pay via Razorpay (or manual alert in Phase 1)
       const result = await processPayment(payDetails, order.tds.postTDS, orderNo);
 
-      // Phase 1 — manual fallback
+      // Phase 1 — manual fallback. No money has actually been sent. Park the
+      // order in AWAITING_MANUAL_PAYMENT so:
+      //   - auto-cancel can still fire if the operator never approves
+      //   - the Payments page can flip it to PAYMENT_SENT on approval
       if (result.manual) {
-        stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_RELEASE);
+        stateManager.set(orderNo, ORDER_STATE.AWAITING_MANUAL_PAYMENT);
         orderDb.recordPayoutPending(stateManager.get(orderNo));
         await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_PENDING(order.tds, payDetails.methodName));
         logger.warn('Manual payment required', {
@@ -607,10 +721,19 @@ class OrderHandler {
   }
 
   // ── PAN timeout timer ─────────────────────────────────────────────────────
-  _startPANTimer(orderNo) {
-    const reminderMs    = config.bot.panReminderMs;
-    const lastWarningMs = Math.max(reminderMs + 60_000, config.bot.panTimeoutMs - 120_000);
-    const cancelMs      = config.bot.panTimeoutMs;
+  //   Reminder / last-warning / cancel timers — all delays come from
+  //   bot_config (dashboard-tunable) at the moment this fires, with .env
+  //   fallback if the DB read fails.
+  async _startPANTimer(orderNo) {
+    let reminderMs, cancelMs;
+    try {
+      reminderMs = await botStatusService.getPanReminderMs();
+      cancelMs   = await botStatusService.getPanTimeoutMs();
+    } catch (_) {
+      reminderMs = config.bot.panReminderMs;
+      cancelMs   = config.bot.panTimeoutMs;
+    }
+    const lastWarningMs = Math.max(reminderMs + 60_000, cancelMs - 120_000);
 
     setTimeout(async () => {
       const o = stateManager.get(orderNo);

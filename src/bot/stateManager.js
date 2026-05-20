@@ -5,19 +5,23 @@ const orderDb = require('../services/orderDbService');
 //  Order States — complete lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 const ORDER_STATE = {
-  NEW_ORDER:           'NEW_ORDER',
-  WAITING_FOR_PAN:     'WAITING_FOR_PAN',
-  VALIDATING_PAN:      'VALIDATING_PAN',
-  PAN_VERIFIED:        'PAN_VERIFIED',
-  WAITING_TDS_CONSENT: 'WAITING_TDS_CONSENT',
-  TDS_ACCEPTED:        'TDS_ACCEPTED',
-  PROCESSING_PAYMENT:  'PROCESSING_PAYMENT',
-  PAYMENT_SENT:        'PAYMENT_SENT',
-  WAITING_FOR_RELEASE: 'WAITING_FOR_RELEASE',
-  COMPLETED:           'COMPLETED',
-  ESCALATED:           'ESCALATED',
-  FAILED:              'FAILED',
-  CANCELLED:           'CANCELLED',
+  NEW_ORDER:               'NEW_ORDER',
+  WAITING_FOR_PAN:         'WAITING_FOR_PAN',
+  VALIDATING_PAN:          'VALIDATING_PAN',
+  PAN_VERIFIED:            'PAN_VERIFIED',
+  WAITING_TDS_CONSENT:     'WAITING_TDS_CONSENT',
+  TDS_ACCEPTED:            'TDS_ACCEPTED',
+  PROCESSING_PAYMENT:      'PROCESSING_PAYMENT',
+  // TDS accepted + payment details captured, but no money has been sent yet
+  // (Phase 1, or auto_payout = OFF). Admin must approve from the Payments
+  // page to move it to PAYMENT_SENT.
+  AWAITING_MANUAL_PAYMENT: 'AWAITING_MANUAL_PAYMENT',
+  PAYMENT_SENT:            'PAYMENT_SENT',
+  WAITING_FOR_RELEASE:     'WAITING_FOR_RELEASE',
+  COMPLETED:               'COMPLETED',
+  ESCALATED:               'ESCALATED',
+  FAILED:                  'FAILED',
+  CANCELLED:               'CANCELLED',
 };
 
 class StateManager {

@@ -60,6 +60,41 @@ async function getPendingOrders() {
   }, 3, 3000, 'getPendingOrders');
 }
 
+// ─── 1b. Generic list-by-status helper ───────────────────────────────────────
+//   Single page of orders matching any subset of order status codes
+//   (1 = wait payment, 2 = wait release, 3 = appealing, 4 = completed,
+//   6 = cancelled by user, 7 = cancelled by system). Use for backfill /
+//   completion reconciliation.
+async function getOrdersByStatus(statuses, { page = 1, rows = 50, tradeType = 'BUY' } = {}) {
+  if (!Array.isArray(statuses) || statuses.length === 0) {
+    statuses = [
+      ORDER_STATUS.WAIT_PAYMENT,
+      ORDER_STATUS.WAIT_RELEASE,
+      ORDER_STATUS.APPEALING,
+      ORDER_STATUS.COMPLETED,
+      ORDER_STATUS.CANCELLED,
+      ORDER_STATUS.SYS_CANCELLED,
+    ];
+  }
+  return withRetry(async () => {
+    const qs = buildSignedQuery({});
+    const body = {
+      orderStatusList: statuses.map(Number),
+      tradeType,
+      page,
+      rows,
+    };
+    const res = await axios.post(
+      `${url(config.binance.endpoints.listOrders)}?${qs}`,
+      body,
+      { headers: headers(), timeout: 15000 }
+    );
+    const data = res.data?.data || res.data;
+    const list = Array.isArray(data) ? data : (data?.orderList || data?.data || []);
+    return list;
+  }, 2, 3000, `getOrdersByStatus:${statuses.join(',')}:${page}`);
+}
+
 // ─── 2. Get full order detail + seller payment methods ───────────────────────
 async function getOrderDetail(orderNo) {
   return withRetry(async () => {
@@ -163,6 +198,32 @@ const CANCEL_REASON = {
   OTHER:                       5, // "Other" (use additionalInfo to describe)
   SELLER_CANNOT_RELEASE:       6, // "Seller cannot release"
 };
+
+// ─── Seller-fault cancel reasons (used by auto-cancel) ───────────────────────
+//   Only codes 3/4/6 attribute the cancellation to the seller's side, so the
+//   bot's cancellation rate is NOT impacted. The bot rotates randomly through
+//   these reasons so the seller sees a varied (more human-looking) reason
+//   each time instead of the same one every cancel.
+const SELLER_CANCEL_REASONS = [
+  {
+    code: CANCEL_REASON.SELLER_PAY_METHOD_ISSUE,            // 4
+    info: "Problem with seller's payment method result in unsuccessful payments",
+  },
+  {
+    code: CANCEL_REASON.SELLER_CANNOT_RELEASE,              // 6
+    info: "Seller cannot release the order due to network issue. The seller has refunded the amount.",
+  },
+  {
+    code: CANCEL_REASON.SELLER_CANNOT_RELEASE,              // 6
+    info: "No response from the seller",
+  },
+];
+
+// Pick a random seller-fault cancel reason. Returns { code, info }.
+function pickSellerCancelReason() {
+  const idx = Math.floor(Math.random() * SELLER_CANCEL_REASONS.length);
+  return SELLER_CANCEL_REASONS[idx];
+}
 
 // ─── Pre-check: is buyer allowed to cancel this order right now? ─────────────
 //   POST /sapi/v1/c2c/orderMatch/checkIfAllowedCancelOrder
@@ -322,6 +383,8 @@ async function getMyAds() {
 module.exports = {
   ORDER_STATUS,
   CANCEL_REASON,
+  SELLER_CANCEL_REASONS,
+  pickSellerCancelReason,
   getPendingOrders,
   getOrderDetail,
   getChatCredential,
@@ -333,4 +396,5 @@ module.exports = {
   sendChatMessageREST,
   extractPaymentDetails,
   getMyAds,
+  getOrdersByStatus,
 };

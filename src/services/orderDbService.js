@@ -1,5 +1,10 @@
 const { pool } = require("../config/mysql");
+const { config } = require("../config/config");
 const logger = require("../utils/logger");
+
+// Bot-configured TDS percentage (default 1%). Used to backfill TDS amounts
+// on synced COMPLETED orders that never went through the live PAN/TDS flow.
+const TDS_PCT = Number(config?.bot?.tdsPercent) || 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  orderDbService — DB-side mirror of in-memory order state
@@ -22,12 +27,15 @@ function safe(promise, label) {
 }
 
 // ── Upsert an order row when it's first detected ─────────────────────────────
+//   This is the BOT-driven path: stamps processed_by='BOT' on new rows AND
+//   on existing rows (e.g. a previously-synced MANUAL row gets promoted to
+//   BOT once the live flow starts handling it).
 async function upsertOrder(order) {
   const sql = `
     INSERT INTO orders (
       order_no, adv_no, trade_type, asset, fiat,
-      amount, crypto_amount, seller_nickname, seller_user_id, state
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      amount, crypto_amount, seller_nickname, seller_user_id, state, processed_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BOT')
     ON DUPLICATE KEY UPDATE
       adv_no = COALESCE(VALUES(adv_no), adv_no),
       asset = COALESCE(VALUES(asset), asset),
@@ -36,7 +44,8 @@ async function upsertOrder(order) {
       crypto_amount = COALESCE(VALUES(crypto_amount), crypto_amount),
       seller_nickname = COALESCE(VALUES(seller_nickname), seller_nickname),
       seller_user_id = COALESCE(VALUES(seller_user_id), seller_user_id),
-      state = VALUES(state)
+      state = VALUES(state),
+      processed_by = 'BOT'
   `;
   return safe(
     pool.query(sql, [
@@ -246,6 +255,43 @@ async function upsertAdFromBinance(ad) {
   );
 }
 
+// ── Find the most recent BOT-verified order for a seller's Binance userId ───
+// Used to detect returning sellers so the bot can skip the welcome / PAN ask
+// and apply the previously-verified PAN automatically.
+//
+// Filters:
+//   - seller_user_id matches
+//   - state = COMPLETED  (the prior trade actually settled)
+//   - pan IS NOT NULL    (PAN was actually captured)
+//   - processed_by = 'BOT'                  (bot actually ran the flow)
+//   - name_match_status = 'MATCH'           (we verified the PAN belonged
+//                                            to this Binance account)
+//
+// Returns the most recent matching row, or null if no prior verified order.
+async function findVerifiedSellerHistory(sellerUserId) {
+  if (!sellerUserId) return null;
+  try {
+    const [rows] = await pool.query(
+      `SELECT order_no, pan, pan_name, name_match_status, completed_at, created_at
+         FROM orders
+        WHERE seller_user_id = ?
+          AND state = 'COMPLETED'
+          AND pan IS NOT NULL
+          AND processed_by = 'BOT'
+          AND name_match_status = 'MATCH'
+        ORDER BY COALESCE(completed_at, created_at) DESC, id DESC
+        LIMIT 1`,
+      [String(sellerUserId)]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    logger.warn("findVerifiedSellerHistory failed", {
+      sellerUserId, error: err.message,
+    });
+    return null;
+  }
+}
+
 // ── Log each chat message (in or out) for an order ───────────────────────────
 async function logChatMessage({ orderNo, direction, sender, templateKey, text, sentStatus }) {
   return safe(
@@ -256,6 +302,171 @@ async function logChatMessage({ orderNo, direction, sender, templateKey, text, s
     ),
     `logChat:${orderNo}`
   );
+}
+
+// ── Binance status → bot state mapping (for sync) ────────────────────────────
+const BINANCE_STATUS_TO_STATE = {
+  1: "WAITING_FOR_PAN",       // wait for payment
+  2: "WAITING_FOR_RELEASE",   // wait for release (bot paid)
+  3: "ESCALATED",             // appealing
+  4: "COMPLETED",
+  6: "CANCELLED",             // cancelled by user
+  7: "CANCELLED",             // cancelled by system
+};
+const TERMINAL_STATES = new Set(["COMPLETED", "CANCELLED", "ESCALATED", "FAILED"]);
+
+// ── Upsert a raw Binance order row directly into MySQL ───────────────────────
+// Used by the periodic sync + the /api/admin/sync-binance-orders endpoint
+// to backfill orders the bot's live poller never saw (e.g. orders already
+// past status 1 when the bot booted, or terminal orders the bot missed).
+//
+// State precedence rules:
+//   - If incoming is terminal (COMPLETED / CANCELLED / ESCALATED) →
+//     force the row's state to the terminal one and set the matching
+//     timestamp column.
+//   - If incoming is in-flight (1, 2) →
+//     INSERT IGNORE: never overwrite an existing in-memory bot state.
+async function upsertOrderFromBinance(raw) {
+  const orderNo = raw.orderNumber || raw.adOrderNo || raw.orderNo;
+  if (!orderNo) return { skipped: true };
+
+  const statusCode = Number(raw.orderStatus);
+  const targetState = BINANCE_STATUS_TO_STATE[statusCode] || "NEW_ORDER";
+  const isTerminal = TERMINAL_STATES.has(targetState);
+
+  const finishMs = Number(raw.finishTime) || Number(raw.updateTime) || null;
+  const completedAt = statusCode === 4 ? tsOrNull(finishMs || Date.now()) : null;
+  const cancelledAt = statusCode === 6 || statusCode === 7
+    ? tsOrNull(finishMs || Date.now()) : null;
+  const escalatedAt = statusCode === 3 ? tsOrNull(finishMs || Date.now()) : null;
+
+  const confirmPayEnd = tsOrNull(raw.confirmPayEndTime);
+  const notifyPayEnd = tsOrNull(raw.notifyPayEndTime);
+
+  // For COMPLETED orders, pre-compute TDS so it persists in the orders row.
+  // For bot-handled orders the COALESCE clauses below will preserve the
+  // existing (more accurate) values; for sync-only rows this fills them in.
+  const orderAmount = Number(raw.totalPrice || raw.amount || 0);
+  const isCompleted = statusCode === 4;
+  const preTds  = isCompleted ? +orderAmount.toFixed(2) : null;
+  const tdsAmt  = isCompleted ? +(orderAmount * (TDS_PCT / 100)).toFixed(2) : null;
+  const postTds = isCompleted ? +(orderAmount - (tdsAmt || 0)).toFixed(2) : null;
+
+  if (isTerminal) {
+    // Force terminal state on existing rows; insert new ones with all metadata.
+    // processed_by: new rows from sync get 'MANUAL'; existing BOT rows keep
+    // their 'BOT' marker (the bot is still credited with handling it).
+    const sql = `
+      INSERT INTO orders (
+        order_no, adv_no, trade_type, asset, fiat,
+        amount, crypto_amount, seller_nickname, seller_user_id,
+        state, completed_at, cancelled_at, escalated_at,
+        confirm_pay_end_time, notify_pay_end_time,
+        pre_tds_amount, tds_amount, post_tds_amount,
+        processed_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL')
+      ON DUPLICATE KEY UPDATE
+        adv_no = COALESCE(VALUES(adv_no), adv_no),
+        asset = COALESCE(VALUES(asset), asset),
+        fiat = COALESCE(VALUES(fiat), fiat),
+        amount = COALESCE(VALUES(amount), amount),
+        crypto_amount = COALESCE(VALUES(crypto_amount), crypto_amount),
+        seller_nickname = COALESCE(VALUES(seller_nickname), seller_nickname),
+        seller_user_id = COALESCE(VALUES(seller_user_id), seller_user_id),
+        state = VALUES(state),
+        completed_at = COALESCE(VALUES(completed_at), completed_at),
+        cancelled_at = COALESCE(VALUES(cancelled_at), cancelled_at),
+        escalated_at = COALESCE(VALUES(escalated_at), escalated_at),
+        confirm_pay_end_time = COALESCE(VALUES(confirm_pay_end_time), confirm_pay_end_time),
+        notify_pay_end_time = COALESCE(VALUES(notify_pay_end_time), notify_pay_end_time),
+        pre_tds_amount = COALESCE(pre_tds_amount, VALUES(pre_tds_amount)),
+        tds_amount = COALESCE(tds_amount, VALUES(tds_amount)),
+        post_tds_amount = COALESCE(post_tds_amount, VALUES(post_tds_amount)),
+        processed_by = processed_by
+    `;
+    await safe(
+      pool.query(sql, [
+        orderNo,
+        raw.adOrderNo || raw.advNo || null,
+        "BUY",
+        raw.asset || null,
+        raw.fiat || null,
+        orderAmount,
+        raw.amount || raw.cryptoAmount || 0,
+        raw.counterPartNickName || raw.sellerNickname || null,
+        raw.counterPartUserId || raw.sellerUserId || null,
+        targetState,
+        completedAt,
+        cancelledAt,
+        escalatedAt,
+        confirmPayEnd,
+        notifyPayEnd,
+        preTds,
+        tdsAmt,
+        postTds,
+      ]),
+      `upsertFromBinance(terminal):${orderNo}`
+    );
+
+    // Also mirror to the `payouts` table so the Payments page picks up
+    // historical completed orders too. Use INSERT IGNORE so we don't clobber
+    // rows the bot's live payment flow has already recorded.
+    if (isCompleted) {
+      await safe(
+        pool.query(
+          `INSERT IGNORE INTO payouts (
+             order_id, pan_name, seller_pan,
+             total_order_amount, tds_amount, amount,
+             payment_method, status, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'SUCCESS', ?)`,
+          [
+            orderNo,
+            raw.counterPartNickName || raw.sellerNickname || null,
+            null,
+            preTds,
+            tdsAmt,
+            postTds,
+            null,
+            completedAt || new Date(),
+          ]
+        ),
+        `payoutMirror:${orderNo}`
+      );
+    }
+  } else {
+    // In-flight (status 1 or 2). Insert if missing, never clobber existing.
+    // Mark new rows as MANUAL — if the bot later picks it up, upsertOrder()
+    // will promote processed_by back to 'BOT'.
+    const sql = `
+      INSERT IGNORE INTO orders (
+        order_no, adv_no, trade_type, asset, fiat,
+        amount, crypto_amount, seller_nickname, seller_user_id,
+        state, confirm_pay_end_time, notify_pay_end_time, processed_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL')
+    `;
+    await safe(
+      pool.query(sql, [
+        orderNo,
+        raw.adOrderNo || raw.advNo || null,
+        "BUY",
+        raw.asset || null,
+        raw.fiat || null,
+        raw.totalPrice || raw.amount || 0,
+        raw.amount || raw.cryptoAmount || 0,
+        raw.counterPartNickName || raw.sellerNickname || null,
+        raw.counterPartUserId || raw.sellerUserId || null,
+        targetState,
+        confirmPayEnd,
+        notifyPayEnd,
+      ]),
+      `upsertFromBinance(active):${orderNo}`
+    );
+  }
+
+  // Also upsert the ad row so the Ads page picks it up
+  await upsertAdFromOrder(raw);
+
+  return { orderNo, statusCode, targetState, isTerminal };
 }
 
 module.exports = {
@@ -271,5 +482,8 @@ module.exports = {
   recordPayoutPending,
   upsertAdFromOrder,
   upsertAdFromBinance,
+  upsertOrderFromBinance,
+  findVerifiedSellerHistory,
   logChatMessage,
+  BINANCE_STATUS_TO_STATE,
 };

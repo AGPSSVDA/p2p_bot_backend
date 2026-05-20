@@ -61,6 +61,15 @@ router.get("/:orderNo/live", getLiveDetail);
 
 /**
  * @swagger
+ * /api/orders/binance/{orderNo}:
+ *   get:
+ *     tags: [Orders]
+ *     summary: Alias of /api/orders/{orderNo}/live — direct Binance passthrough
+ */
+router.get("/binance/:orderNo", getLiveDetail);
+
+/**
+ * @swagger
  * /api/orders/{orderNo}:
  *   get:
  *     tags: [Orders]

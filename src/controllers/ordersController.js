@@ -59,6 +59,13 @@ async function listOrders(req, res) {
       where.push("created_at <= ?");
       params.push(req.query.to);
     }
+    if (req.query.processed_by) {
+      const list = String(req.query.processed_by).split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+      if (list.length) {
+        where.push(`processed_by IN (${list.map(() => "?").join(",")})`);
+        params.push(...list);
+      }
+    }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -107,6 +114,7 @@ async function listOrders(req, res) {
       completed_at: r.completed_at,
       cancelled_at: r.cancelled_at,
       escalated_at: r.escalated_at,
+      processed_by: r.processed_by || 'BOT',
       created_at: r.created_at,
       updated_at: r.updated_at,
       is_live: stateManager.has(r.order_no),
@@ -257,6 +265,7 @@ function getStateEnum(req, res) {
         "WAITING_TDS_CONSENT",
         "TDS_ACCEPTED",
         "PROCESSING_PAYMENT",
+        "AWAITING_MANUAL_PAYMENT",
         "PAYMENT_SENT",
         "WAITING_FOR_RELEASE",
         "COMPLETED",

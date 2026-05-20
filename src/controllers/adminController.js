@@ -1,6 +1,7 @@
 const { pool } = require("../config/mysql");
 const messageService = require("../services/messageService");
 const botStatusService = require("../services/botStatusService");
+const binanceSync = require("../services/binanceSyncService");
 const logger = require("../utils/logger");
 
 // Tables that are safe to truncate (do NOT include users — would lock you out)
@@ -74,4 +75,33 @@ async function health(req, res) {
   }
 }
 
-module.exports = { reset, health };
+// ── POST /api/admin/sync-binance-orders ──────────────────────────────────────
+//   Body: { statuses?: number[], maxPages?: number, rowsPerPage?: number }
+//   Defaults to all statuses (1,2,3,4,6,7), maxPages=10, rowsPerPage=50.
+//   Idempotent — calling it twice produces the same DB state.
+async function syncBinanceOrders(req, res) {
+  try {
+    const statuses = Array.isArray(req.body.statuses) && req.body.statuses.length
+      ? req.body.statuses
+      : undefined;
+    const maxPages = Math.min(Math.max(parseInt(req.body.maxPages, 10) || 10, 1), 100);
+    const rowsPerPage = Math.min(Math.max(parseInt(req.body.rowsPerPage, 10) || 50, 10), 100);
+
+    logger.warn("Admin SYNC binance-orders started", {
+      user: req.user?.email, statuses, maxPages, rowsPerPage,
+    });
+
+    const result = await binanceSync.sync(statuses, { maxPages, rowsPerPage });
+
+    res.json({
+      success: true,
+      message: `Synced ${result.total} order(s) from Binance`,
+      data: result,
+    });
+  } catch (err) {
+    logger.error("Admin SYNC failed", { error: err.message });
+    res.status(500).json({ success: false, message: err.message, data: null });
+  }
+}
+
+module.exports = { reset, health, syncBinanceOrders };
