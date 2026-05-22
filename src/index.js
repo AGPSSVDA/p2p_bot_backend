@@ -25,6 +25,7 @@ const adsRoutes = require("./routes/adsRoutes");
 const paymentsRoutes = require("./routes/paymentsRoutes");
 const tdsRoutes = require("./routes/tdsRoutes");
 const adminRoutes = require("./routes/adminRoutes");
+const { handleWebhook: cashfreeWebhook } = require("./controllers/cashfreeWebhookController");
 const { initMysql } = require("./config/mysql");
 const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
@@ -46,6 +47,17 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
 }));
+
+// ── Cashfree webhook — MUST be mounted BEFORE express.json() so we can
+//    verify the HMAC signature against the raw request body. Cashfree sends
+//    application/json, and once express.json() parses it the original bytes
+//    are gone (different whitespace / key order makes re-serialization a
+//    different hash). express.raw on this single route preserves the body.
+app.post(
+  "/api/cashfree/webhook",
+  express.raw({ type: "*/*", limit: "1mb" }),
+  cashfreeWebhook
+);
 
 // ── Middleware ──
 app.use(express.json());

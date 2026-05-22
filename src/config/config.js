@@ -53,6 +53,20 @@ const config = {
     baseUrl:       'https://api.razorpay.com/v1',
   },
 
+  cashfree: {
+    clientId:            process.env.CF_CLIENT_ID,
+    clientSecret:        process.env.CF_CLIENT_SECRET,
+    env:                 process.env.CF_ENV || 'SANDBOX',
+    apiVersion:          process.env.CF_API_VERSION || '2024-01-01',
+    defaultFundsourceId: process.env.CF_DEFAULT_FUNDSOURCE_ID || '',
+    defaultRemark:       process.env.DEFAULT_REMARK || 'P2P payout',
+    get baseUrl() {
+      return String(this.env).toUpperCase() === 'PROD'
+        ? 'https://api.cashfree.com/payout'
+        : 'https://sandbox.cashfree.com/payout';
+    },
+  },
+
   bot: {
     orderPollInterval:      parseInt(process.env.ORDER_POLL_INTERVAL,      10) || 8000,
     completionPollInterval: parseInt(process.env.COMPLETION_POLL_INTERVAL, 10) || 15000,
@@ -107,8 +121,8 @@ function validateConfig() {
     config.surepass.token && !config.surepass.token.startsWith('your_')
   );
   config.features.autoPayment = !!(
-    config.razorpay.keyId && !config.razorpay.keyId.startsWith('your_') &&
-    config.razorpay.keySecret && config.razorpay.accountNumber
+    config.cashfree.clientId && !config.cashfree.clientId.startsWith('your_') &&
+    config.cashfree.clientSecret
   );
 
   console.log('\n╔══════════════════════════════════════════════╗');
@@ -116,7 +130,7 @@ function validateConfig() {
   console.log('╠══════════════════════════════════════════════╣');
   console.log('║  Binance SAPI v7.4   : ✅ ENABLED             ║');
   console.log(`║  PAN Verification    : ${config.features.panVerification ? '✅ ENABLED (Surepass)  ' : '⏸️  SKIPPED (Phase 2)  '}  ║`);
-  console.log(`║  Auto Payment        : ${config.features.autoPayment     ? '✅ ENABLED (Razorpay)  ' : '⏸️  SKIPPED (Phase 3)  '}  ║`);
+  console.log(`║  Auto Payment        : ${config.features.autoPayment     ? `✅ ENABLED (Cashfree ${config.cashfree.env}) ` : '⏸️  SKIPPED (Phase 3)  '} ║`);
   console.log('╚══════════════════════════════════════════════╝\n');
 }
 

@@ -283,7 +283,48 @@ class OrderHandler {
     const order = stateManager.get(orderNo);
     if (!order) return;
 
-    // CRITICAL: never cancel after we've paid or are mid-payment
+    // Bot kill-switch — when the operator toggled bot OFF from the dashboard,
+    // NO Binance API call should fire. The poller / state machine still run
+    // and tracking persists, but auto-cancel and the goodbye chat are muted.
+    try {
+      const enabled = await botStatusService.isBotEnabled();
+      if (!enabled) {
+        logger.info('Auto-cancel skipped — bot is OFF', {
+          orderNo, state: order.state, trigger: reason,
+        });
+        return;
+      }
+    } catch (_) { /* fail-open: keep current behaviour if DB hiccup */ }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // STRICT NO-CANCEL ZONE (per business rule — no loophole)
+    //
+    // Auto-cancel must NEVER fire once we've sent the seller money. The two
+    // critical states this protects:
+    //
+    //   • PAYMENT_SENT       — Cashfree paid + markOrderAsPaid called on
+    //                           Binance. If we cancel here, we've paid the
+    //                           seller but lose our claim on the crypto.
+    //   • WAITING_FOR_RELEASE — same, just one state later.
+    //
+    // Also blocked:
+    //   • PROCESSING_PAYMENT  — Cashfree call is in-flight (can take up to
+    //                           ~75s polling). Cancelling now would race
+    //                           with Cashfree's pending transfer and could
+    //                           still result in seller getting paid AND the
+    //                           order being cancelled.
+    //   • COMPLETED           — already done; cancelling is destructive.
+    //   • CANCELLED           — idempotent; nothing to do.
+    //
+    // States where auto-cancel SHOULD fire (per dashboard timing):
+    //   NEW_ORDER, WAITING_FOR_PAN, VALIDATING_PAN, PAN_VERIFIED,
+    //   WAITING_TDS_CONSENT, TDS_ACCEPTED, AWAITING_MANUAL_PAYMENT,
+    //   ESCALATED, FAILED.
+    //
+    // Note: AWAITING_MANUAL_PAYMENT is intentionally NOT in the unsafe list.
+    // In that state, the operator has been told to pay but hasn't yet (no
+    // markOrderAsPaid call), so cancelling is safe — no money has left.
+    // ──────────────────────────────────────────────────────────────────────
     const unsafe = [
       ORDER_STATE.PROCESSING_PAYMENT,
       ORDER_STATE.PAYMENT_SENT,
@@ -292,8 +333,22 @@ class OrderHandler {
       ORDER_STATE.CANCELLED,
     ];
     if (unsafe.includes(order.state)) {
-      logger.warn('Auto-cancel skipped — past safe point', {
+      logger.warn('Auto-cancel skipped — past safe point (post-payment)', {
         orderNo, state: order.state, reason,
+      });
+      return;
+    }
+
+    // Belt-and-suspenders data guard. Even if the state somehow isn't in
+    // the unsafe list above, the presence of a payout id or a real (non-
+    // PEND-) UTR means Cashfree has paid and/or markOrderAsPaid has been
+    // called for this order — never cancel in that case.
+    const realUtr = order.utr && !String(order.utr).startsWith('PEND-');
+    if (order.payoutId || realUtr) {
+      logger.warn('Auto-cancel skipped — payout already initiated (data guard)', {
+        orderNo, state: order.state, reason,
+        payoutId: order.payoutId || null,
+        utr:      order.utr || null,
       });
       return;
     }
@@ -510,12 +565,6 @@ class OrderHandler {
       // NAME_MISMATCH template, listing which step(s) diverged.
       const order = stateManager.get(orderNo);
 
-      // Track whether we'll write this seller into the verified_sellers
-      // ledger. Defaults to true — only flipped off if name match failed
-      // in warn mode (don't promote soft-failed verifications to future
-      // returning-seller status).
-      let recordAsVerifiedSeller = true;
-
       if (result.name && config.surepass.nameMatchMode !== 'off') {
         // Refetch order detail if prefetch failed earlier
         if (!order.sellerName && !order.paymentDetails) {
@@ -602,9 +651,9 @@ class OrderHandler {
             logger.warn('Name mismatch — proceeding (warn mode)', {
               orderNo, mismatchedSources,
             });
-            // Soft-failed verification — don't promote this seller's PAN
-            // into the verified_sellers ledger (no future shortcut).
-            recordAsVerifiedSeller = false;
+            // Soft-failed verification: name_match_status stays 'MISMATCH'
+            // in the orders row, which blocks the post-completion promotion
+            // to verified_sellers automatically (gate is on MATCH only).
           } else {
             // All available steps passed — store positive status
             orderDb.updateOrder(orderNo, {
@@ -615,34 +664,13 @@ class OrderHandler {
         }
       }
 
-      // Calculate TDS, ask consent
+      // Calculate TDS, ask consent.
+      // NOTE: we no longer promote the seller to verified_sellers HERE.
+      // Promotion is deferred to orderHandler.complete() so it only fires
+      // once the order has actually settled (state = COMPLETED). That way
+      // a PAN captured for an order that ends up cancelled / escalated /
+      // stuck mid-flow never becomes a future shortcut trigger.
       const tds = calculateTDS(order.amount, config.bot.tdsPercent);
-
-      // Record this seller in the verified_sellers ledger so future orders
-      // from the same identity can take the returning-seller shortcut.
-      // Skipped only when name match soft-failed in warn mode.
-      if (recordAsVerifiedSeller) {
-        const refreshed = stateManager.get(orderNo);
-        orderDb.upsertVerifiedSeller({
-          pan,
-          panName:        result.name || null,
-          sellerUserId:   refreshed.sellerUserId || null,
-          sellerNickname: refreshed.sellerNickname || null,
-          sellerName:     refreshed.sellerName || null,
-          accountNo:      refreshed.paymentDetails?.accountNo || null,
-          upiId:          refreshed.paymentDetails?.upiId || null,
-          ifscCode:       refreshed.paymentDetails?.ifscCode || null,
-          bankName:       refreshed.paymentDetails?.bankName || null,
-          accountName:    refreshed.paymentDetails?.accountName || null,
-          orderNo,
-        });
-        logger.info('Seller registered in verified_sellers ledger', {
-          orderNo,
-          pan:            maskPAN(pan),
-          sellerNickname: refreshed.sellerNickname || '(none)',
-          sellerName:     refreshed.sellerName || '(none)',
-        });
-      }
 
       stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
         pan, tds, panName: result.name || null,
@@ -650,8 +678,17 @@ class OrderHandler {
 
       await this._send(orderNo, MESSAGES.PAN_VERIFIED_TDS(pan, tds, result.name));
       await sleep(1500);
-      await this._send(orderNo, MESSAGES.TDS_INFO(tds));
-      await sleep(1500);
+
+      // tdsInfo is multi-block: send each variation the admin added in
+      // the Chat Templates page (every block gets {tds}/{quarter}/etc.
+      // substituted from the same vars map).
+      const tdsInfoBlocks = await MESSAGES.TDS_INFO(tds);
+      for (const block of tdsInfoBlocks) {
+        if (!block) continue;
+        await this._send(orderNo, block);
+        await sleep(1200);
+      }
+
       await this._send(orderNo, MESSAGES.TDS_CONSENT(tds));
 
       stateManager.set(orderNo, ORDER_STATE.WAITING_TDS_CONSENT);
@@ -705,16 +742,37 @@ class OrderHandler {
       // Req #4: auto-pay via Razorpay (or manual alert in Phase 1)
       const result = await processPayment(payDetails, order.tds.postTDS, orderNo);
 
-      // Phase 1 — manual fallback. No money has actually been sent. Park the
-      // order in AWAITING_MANUAL_PAYMENT so:
-      //   - auto-cancel can still fire if the operator never approves
-      //   - the Payments page can flip it to PAYMENT_SENT on approval
+      // Manual fallback. Park the order in AWAITING_MANUAL_PAYMENT and
+      // tell the seller. The Payments page flips it to PAYMENT_SENT when
+      // the operator approves. AWAITING_MANUAL_PAYMENT is in the auto-
+      // cancel "unsafe" list so the timer won't cancel the order during
+      // the operator's pay-out window.
       if (result.manual) {
         stateManager.set(orderNo, ORDER_STATE.AWAITING_MANUAL_PAYMENT);
         orderDb.recordPayoutPending(stateManager.get(orderNo));
-        await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_PENDING(order.tds, payDetails.methodName));
+
+        // Pick the right message based on WHY auto-payment was skipped:
+        //   above_limit  → amount exceeds the auto-pay cap
+        //   upi_only     → seller gave UPI only (Cashfree wallet can't pay UPI)
+        //   else         → generic "payment is being prepared"
+        if (result.reason === 'above_limit') {
+          await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_ABOVE_LIMIT({
+            amount: order.tds.postTDS,
+            limit:  result.cap || config.bot.maxPaymentAmount,
+            method: payDetails.methodName,
+          }));
+        } else if (result.reason === 'upi_only') {
+          await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_UPI({
+            upi:     payDetails.upiId,
+            postTDS: order.tds.postTDS,
+          }));
+        } else {
+          await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_PENDING(order.tds, payDetails.methodName));
+        }
+
         logger.warn('Manual payment required', {
           orderNo,
+          reason:      result.reason || 'unspecified',
           amount:      order.tds.postTDS,
           method:      payDetails.methodName,
           upi:         payDetails.upiId,
@@ -725,11 +783,15 @@ class OrderHandler {
         return;
       }
 
-      // Phase 3 — auto payment succeeded
+      // Auto-payment succeeded. Mark state, persist payout, then ensure
+      // the auto-cancel timer never fires for this order again (belt and
+      // suspenders — the unsafe-state guard already blocks it, but freeing
+      // the timer is cleaner).
       stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, {
         payoutId: result.payoutId,
         utr:      result.utr,
       });
+      this._clearCancelTimer(orderNo);
       orderDb.recordPayoutSuccess(
         stateManager.get(orderNo),
         result.payoutId,
@@ -737,9 +799,13 @@ class OrderHandler {
         result.mode
       );
 
-      // Mark order as paid on Binance — bot is buyer (Req #5: seller releases later)
+      // Mark order as paid on Binance immediately — triggers Binance's own
+      // "buyer has marked the order as paid" system message in the chat
+      // (the red-circled one in the seller's screenshot). UTR is passed via
+      // payInfo so it shows on Binance's seller-side UI as the payment proof.
+      // Bot is buyer; seller releases crypto next.
       try {
-        await markOrderAsPaid(orderNo, payDetails.payId);
+        await markOrderAsPaid(orderNo, payDetails.payId, result.utr);
       } catch (err) {
         logger.error('markOrderAsPaid failed (payout already sent)', {
           orderNo, error: err.message,
@@ -871,7 +937,18 @@ class OrderHandler {
     if (order.state === ORDER_STATE.COMPLETED) return;
 
     stateManager.set(orderNo, ORDER_STATE.COMPLETED);
-    await this._send(orderNo, MESSAGES.THANK_YOU(order.asset, order.cryptoAmount, orderNo));
+
+    // Send all thank-you blocks the admin configured (up to 5 variations
+    // in the Chat Templates page). Old behaviour was just texts[0]; now
+    // every step_order entry fires sequentially with a small delay so they
+    // arrive as separate chat messages instead of one merged one.
+    const blocks = await MESSAGES.THANK_YOU(order.asset, order.cryptoAmount, orderNo);
+    for (const block of blocks) {
+      if (!block) continue;
+      await this._send(orderNo, block);
+      await sleep(1200);
+    }
+
     this._clearCancelTimer(orderNo);
     chatService.disconnect(orderNo);
 
@@ -879,6 +956,14 @@ class OrderHandler {
       orderNo,
       crypto: `${order.cryptoAmount} ${order.asset}`,
     });
+
+    // Now that the order has actually settled, promote this seller into
+    // the verified_sellers ledger so future orders from the same identity
+    // can take the returning-seller TDS shortcut. Gated internally on:
+    //   state = COMPLETED, pan IS NOT NULL, processed_by = 'BOT',
+    //   name_match_status = 'MATCH'.
+    // Fire-and-forget — DB hiccup must not break the live flow.
+    orderDb.promoteToVerifiedIfEligible(orderNo);
   }
 }
 

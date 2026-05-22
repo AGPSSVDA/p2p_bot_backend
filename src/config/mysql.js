@@ -187,17 +187,18 @@ const TEMPLATE_DEFAULTS = [
   },
   {
     key: "paymentSent",
-    description: "Sent after auto-payout succeeds ({method}, {utr}, {tan})",
+    description: "Sent after auto-payout succeeds ({method}, {utr}, {tds}, {postTDS}, {tan})",
     sort_order: 12,
     messages: [
       {
         order: 1,
         text:
           "{method} done — UTR: {utr}\n\n" +
+          "Amount paid: ₹{postTDS} (Post-TDS)\n" +
+          "TDS deducted (1%): ₹{tds}\n\n" +
           "You'll receive payment in the next 2–20 minutes.\n" +
           "Kindly *release* the order once you receive it. 🙏\n\n" +
-          "As mentioned, 1% TDS was deducted and will be deposited on your PAN — " +
-          "you can claim it back when you file ITR.\n\n" +
+          "The ₹{tds} TDS will be deposited on your PAN — you can claim it back when you file ITR.\n\n" +
           "Our TAN: {tan}\n\n" +
           "(Automated response — payment screenshot can't be shared)",
       },
@@ -215,6 +216,45 @@ const TEMPLATE_DEFAULTS = [
           "Amount: ₹{postTDS} (Post-TDS)\n" +
           "Method: {method}\n\n" +
           "You'll receive payment shortly. Please release the crypto once you receive it. 🙏",
+      },
+    ],
+  },
+  {
+    key: "manualPaymentAboveLimit",
+    description:
+      "Sent when payout amount exceeds the auto-pay cap. Buyer team will pay " +
+      "manually. Placeholders: {amount}, {limit}, {method}",
+    sort_order: 13,
+    messages: [
+      {
+        order: 1,
+        text:
+          "ℹ️ Payment Notice\n\n" +
+          "This order amount ₹{amount} exceeds our automated payout limit of ₹{limit}.\n" +
+          "Amounts above this limit are processed *manually* by our buyer team.\n\n" +
+          "Method: {method}\n\n" +
+          "You will receive the payment shortly. Please wait — our team is on it and will release the funds to your account.\n" +
+          "Kindly *release* the crypto once you receive the payment. 🙏",
+      },
+    ],
+  },
+  {
+    key: "manualPaymentUpi",
+    description:
+      "Sent when seller's only payment method is UPI. Auto-payout requires " +
+      "a bank account, so the buyer team pays manually. " +
+      "Placeholders: {upi}, {postTDS}",
+    sort_order: 14,
+    messages: [
+      {
+        order: 1,
+        text:
+          "ℹ️ Payment Notice\n\n" +
+          "You have shared a *UPI ID* ({upi}) as your payment method.\n\n" +
+          "Our automated payout system processes bank-account transfers (IMPS/NEFT) only — UPI payouts will be handled *manually* by our buyer team.\n\n" +
+          "Amount: ₹{postTDS} (Post-TDS)\n\n" +
+          "You will receive the payment shortly. Please wait — our team is processing it and will release the funds to your UPI shortly.\n" +
+          "Kindly *release* the crypto once you receive the payment. 🙏",
       },
     ],
   },
@@ -816,9 +856,10 @@ async function initMysql() {
       { name: 'last_verified_at',    def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP' },
     ]);
 
-    // Backfill verified_sellers from existing orders that already have a
-    // PAN captured by the bot. Idempotent (INSERT IGNORE on PAN unique key)
-    // so it's safe to run on every boot — picks up any new orders too.
+    // Backfill verified_sellers from existing orders. Strict filters so
+    // only orders that ACTUALLY settled (state = COMPLETED) and whose PAN
+    // name matched are promoted. Idempotent (INSERT IGNORE on PAN unique
+    // key) — safe to run on every boot.
     try {
       const [bf] = await connection.query(`
         INSERT IGNORE INTO verified_sellers (
@@ -846,11 +887,12 @@ async function initMysql() {
         FROM orders o
         WHERE o.pan IS NOT NULL
           AND o.processed_by = 'BOT'
-          AND (o.name_match_status = 'MATCH' OR o.name_match_status IS NULL)
+          AND o.state = 'COMPLETED'
+          AND o.name_match_status = 'MATCH'
         GROUP BY o.pan
       `);
       if (bf?.affectedRows > 0) {
-        console.log(`✅ Backfilled ${bf.affectedRows} verified seller(s) from orders.`);
+        console.log(`✅ Backfilled ${bf.affectedRows} verified seller(s) from completed orders.`);
       }
     } catch (err) {
       console.warn("⚠️ verified_sellers backfill warning:", err.message);
@@ -883,11 +925,15 @@ async function initMysql() {
 
     // ── RESET (one-shot via .env flag) ────────────────────────────────────────
     // Set RESET_DATA_ON_BOOT=true in .env, restart once, then set it back to
-    // false. Truncates all transactional + template + bot_config tables and
-    // re-seeds defaults. Login users are intentionally preserved.
+    // false. Truncates only TRANSACTIONAL tables:
+    //   order_messages, order_state_log, orders, ads, payouts,
+    //   verified_sellers, bot_config
+    // Chat-message templates (template_groups + template_messages) are
+    // INTENTIONALLY PRESERVED so admin customisations survive a wipe.
+    // Users table is also preserved so you don't lose dashboard login.
     const resetFlag = String(process.env.RESET_DATA_ON_BOOT || "").toLowerCase() === "true";
     if (resetFlag) {
-      console.log("⚠️  RESET_DATA_ON_BOOT=true — wiping transactional tables...");
+      console.log("⚠️  RESET_DATA_ON_BOOT=true — wiping transactional tables (templates preserved)...");
       await connection.query("SET FOREIGN_KEY_CHECKS = 0");
       const wipeTables = [
         "order_messages",
@@ -895,16 +941,20 @@ async function initMysql() {
         "orders",
         "ads",
         "payouts",
-        "template_messages",
-        "template_groups",
+        "verified_sellers",
         "bot_config",
       ];
       for (const t of wipeTables) {
-        await connection.query(`TRUNCATE TABLE ${t}`);
-        console.log(`   • truncated ${t}`);
+        try {
+          await connection.query(`TRUNCATE TABLE \`${t}\``);
+          console.log(`   • truncated ${t}`);
+        } catch (err) {
+          // Table might not exist on a partial install — log + continue
+          console.warn(`   • skip ${t}: ${err.message}`);
+        }
       }
       await connection.query("SET FOREIGN_KEY_CHECKS = 1");
-      console.log("✅ Wipe complete.");
+      console.log("✅ Wipe complete. template_groups + template_messages were NOT touched.");
     }
 
     // ── Seed templates (idempotent: only inserts keys not already present) ────

@@ -115,18 +115,37 @@ function isProblemMessage(text) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Agreement detector for TDS consent
 // ─────────────────────────────────────────────────────────────────────────────
+// Strict TDS-consent matcher. Per business rule, the bot ONLY proceeds when
+// the seller types the exact phrase "I AGREE" (any case). Previous looser
+// matching ("yes", "ok", standalone "agree") was a false-positive risk —
+// messages like "not agree", "don't agree", "no" or just "yes" would all
+// sneak through the old standalone-"agree" / "yes" branches.
+//
+// Rules:
+//   1. Normalise the text (lowercase, strip emojis/punctuation, collapse
+//      whitespace).
+//   2. Reject outright if any negation token appears anywhere in the text.
+//   3. Accept only if the normalised text contains the exact phrase
+//      "i agree" (with optional trailing 'd' / 's'). The whole-word
+//      boundary check rules out things like "disagree".
 function isAgreementMessage(text) {
-  const lower = (text || '').toLowerCase().trim();
-  if (!lower) return false;
-  if (/\bi\s*agree\b/i.test(lower))      return true;
-  if (/\bagree(d)?\b/i.test(lower))      return true;
-  if (/\byes\b/i.test(lower))            return true;
-  if (/\bok(ay)?\b/i.test(lower))        return true;
-  if (/\bproceed\b/i.test(lower))        return true;
-  if (/\bहां\b|\bहाँ\b/.test(text))      return true;
-  if (/\bhaan\b|\bha\s*ji\b|\bhanji\b/i.test(lower)) return true;
-  if (/^👍|🔥|✅/.test(text || ''))      return true;
-  return false;
+  if (!text) return false;
+
+  const norm = String(text)
+    .toLowerCase()
+    .replace(/[^\w\s']/g, ' ')   // strip emojis / punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!norm) return false;
+
+  // Hard reject — any negation token kills the match
+  if (/\b(not|no|nope|nah|don'?t|do\s+not|cannot|can'?t|never|disagree|reject|deny|wrong|refuse)\b/.test(norm)) {
+    return false;
+  }
+
+  // Must contain the exact phrase "i agree" (case-insensitive, whitespace-
+  // tolerant, accepts "i agreed" / "i agrees" variants too)
+  return /\bi\s+agree(d|s)?\b/.test(norm);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

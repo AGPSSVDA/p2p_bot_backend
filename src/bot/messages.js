@@ -37,8 +37,11 @@ const MESSAGES = {
       postTDS: inr(tds?.postTDS),
     }),
 
+  // Returns the FULL array of "tds info" blocks so admin-added variations
+  // (step_order 2, 3, …) all get sent — each block has its own placeholder
+  // substitution from the same vars map, so {tds} in every block resolves.
   TDS_INFO: (tds) =>
-    messageService.get("tdsInfo", messageService.tdsInfoVars(tds)),
+    messageService.getAll("tdsInfo", messageService.tdsInfoVars(tds)),
 
   TDS_CONSENT: (tds) =>
     messageService.get("tdsConsent", {
@@ -50,13 +53,33 @@ const MESSAGES = {
 
   CONSENT_RECEIVED: () => messageService.get("consentReceived"),
 
-  PAYMENT_SENT: (_tds, method, utr, tan) =>
-    messageService.get("paymentSent", { method, utr, tan }),
+  PAYMENT_SENT: (tds, method, utr, tan) =>
+    messageService.get("paymentSent", {
+      method,
+      utr,
+      tan,
+      tds:     inr(tds?.tds),
+      postTDS: inr(tds?.postTDS),
+      preTDS:  inr(tds?.preTDS),
+    }),
 
   MANUAL_PAYMENT_PENDING: (tds, method) =>
     messageService.get("manualPaymentPending", {
       postTDS: inr(tds?.postTDS),
       method,
+    }),
+
+  MANUAL_PAYMENT_ABOVE_LIMIT: ({ amount, limit, method }) =>
+    messageService.get("manualPaymentAboveLimit", {
+      amount: inr(amount),
+      limit:  inr(limit),
+      method: method || "—",
+    }),
+
+  MANUAL_PAYMENT_UPI: ({ upi, postTDS }) =>
+    messageService.get("manualPaymentUpi", {
+      upi:     upi || "—",
+      postTDS: inr(postTDS),
     }),
 
   PAN_REMINDER: () => messageService.get("panReminder"),
@@ -85,8 +108,11 @@ const MESSAGES = {
 
   PAYMENT_FAILED: () => messageService.get("paymentFailed"),
 
+  // Returns the FULL array of "thank you" blocks (one chat send per block).
+  // Admin can add up to 5 variations from the Chat Templates page and all
+  // are sent in step_order with a short delay between each.
   THANK_YOU: (asset, cryptoAmount, orderNo) =>
-    messageService.get("thankYou", { asset, cryptoAmount, orderNo }),
+    messageService.getAll("thankYou", { asset, cryptoAmount, orderNo }),
 
   WAIT_PROCESSING: () => messageService.get("waitProcessing"),
 

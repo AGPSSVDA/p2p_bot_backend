@@ -131,13 +131,18 @@ async function approvePayment(req, res) {
     );
     const order = orderRows[0];
 
-    // 3. Mark paid on Binance (non-fatal; if it fails we still record locally)
+    // 3. Mark paid on Binance with the operator-supplied UTR — fires the
+    //    Binance system "marked the order as paid" message in the chat and
+    //    passes the UTR via payInfo so it's visible on the seller's UI.
+    //    Non-fatal: if Binance rejects, we still record locally and continue.
     let binanceMarked = false;
     let binanceError = null;
     try {
-      await markOrderAsPaid(orderNo, null);
+      await markOrderAsPaid(orderNo, null, utr);
       binanceMarked = true;
-      logger.info("Manual approve: order marked paid on Binance", { orderNo, payoutId: id });
+      logger.info("Manual approve: order marked paid on Binance", {
+        orderNo, payoutId: id, utr,
+      });
     } catch (err) {
       binanceError = err.response?.data?.msg || err.message;
       logger.error("Manual approve: markOrderAsPaid FAILED — recording locally only", {

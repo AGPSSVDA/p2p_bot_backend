@@ -300,6 +300,63 @@ async function upsertVerifiedSeller(data) {
   );
 }
 
+// ── Promote a settled order into verified_sellers (if eligible) ─────────────
+// Called only AFTER an order has reached state = COMPLETED. Re-reads the
+// canonical orders row to confirm all eligibility filters at that moment:
+//
+//   - state            = COMPLETED   (the trade actually settled — release
+//                                       happened — implicit trust)
+//   - pan              IS NOT NULL   (PAN was captured during the flow)
+//   - processed_by     = 'BOT'       (bot ran the live verification)
+//   - name_match_status= 'MATCH'     (PAN name matched KYC / bank holder)
+//
+// Returns true if a verified_sellers row was inserted/refreshed, false if
+// the order didn't qualify, null on error.
+async function promoteToVerifiedIfEligible(orderNo) {
+  if (!orderNo) return false;
+  try {
+    const [rows] = await pool.query(
+      `SELECT order_no, state, pan, pan_name, processed_by, name_match_status,
+              seller_user_id, seller_nickname, seller_name,
+              account_no, upi_id, ifsc_code, bank_name, account_name
+         FROM orders WHERE order_no = ? LIMIT 1`,
+      [orderNo]
+    );
+    const o = rows[0];
+    if (!o) return false;
+    if (o.state !== "COMPLETED")           return false;
+    if (!o.pan)                            return false;
+    if (o.processed_by !== "BOT")          return false;
+    if (o.name_match_status !== "MATCH")   return false;
+
+    await upsertVerifiedSeller({
+      pan:            o.pan,
+      panName:        o.pan_name,
+      sellerUserId:   o.seller_user_id,
+      sellerNickname: o.seller_nickname,
+      sellerName:     o.seller_name,
+      accountNo:      o.account_no,
+      upiId:          o.upi_id,
+      ifscCode:       o.ifsc_code,
+      bankName:       o.bank_name,
+      accountName:    o.account_name,
+      orderNo:        o.order_no,
+    });
+    logger.info("Seller promoted to verified_sellers (order completed)", {
+      orderNo: o.order_no,
+      pan: `${o.pan.slice(0, 3)}XX${o.pan.slice(5, 9)}X`,
+      sellerNickname: o.seller_nickname || "(none)",
+      sellerName: o.seller_name || "(none)",
+    });
+    return true;
+  } catch (err) {
+    logger.warn("promoteToVerifiedIfEligible failed", {
+      orderNo, error: err.message,
+    });
+    return null;
+  }
+}
+
 // ── Find a verified seller from the verified_sellers ledger ────────────────
 // Reads from the canonical verified_sellers table (not the orders table),
 // so the lookup is independent of whether any individual prior order
@@ -582,6 +639,12 @@ async function upsertOrderFromBinance(raw) {
         ),
         `payoutMirror:${orderNo}`
       );
+
+      // Promote to verified_sellers if this order qualifies — i.e. it has
+      // a captured PAN from a prior bot run AND name match passed. The
+      // helper internally re-reads the row and gates on all filters, so
+      // sync of an unrelated (MANUAL) order never leaks into the ledger.
+      await promoteToVerifiedIfEligible(orderNo);
     }
   } else {
     // In-flight (status 1 or 2). Insert if missing, never clobber existing.
@@ -634,6 +697,7 @@ module.exports = {
   upsertAdFromBinance,
   upsertOrderFromBinance,
   upsertVerifiedSeller,
+  promoteToVerifiedIfEligible,
   findVerifiedSellerHistory,
   logChatMessage,
   BINANCE_STATUS_TO_STATE,

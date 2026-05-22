@@ -174,17 +174,30 @@ async function markMessagesRead(orderNo) {
 }
 
 // ─── 6. Mark order as paid (buyer side) ──────────────────────────────────────
-async function markOrderAsPaid(orderNo, payId) {
+//   Triggers Binance's own system message on the chat — something like
+//   "<bot-nickname> (real name: <kyc>) has marked the order as paid. Please
+//   verify the payment in your account before releasing the asset."
+//   Calling this is what turns the order from status 1 (Wait for Payment) to
+//   status 2 (Wait for Release) on Binance's side.
+//
+//   Optional payInfo carries the UTR / bank reference so it's visible to the
+//   seller on Binance's own UI as the buyer's payment proof. v7.4 accepts it
+//   as a free-form string; if Binance ignores it the call still succeeds.
+async function markOrderAsPaid(orderNo, payId, utr) {
   return withRetry(async () => {
-    const qs  = buildSignedQuery({});
-    const body = payId ? { orderNumber: orderNo, payId } : { orderNumber: orderNo };
+    const qs   = buildSignedQuery({});
+    const body = { orderNumber: orderNo };
+    if (payId) body.payId   = payId;
+    if (utr)   body.payInfo = `UTR: ${String(utr).slice(0, 60)}`;
     const res = await axios.post(
       `${url(config.binance.endpoints.markPaid)}?${qs}`,
       body,
       { headers: headers(), timeout: 12000 }
     );
 
-    logger.info('Order marked as paid on Binance', { orderNo, payId });
+    logger.info('Order marked as paid on Binance', {
+      orderNo, payId, utr: utr || null,
+    });
     return res.data;
   }, 3, 3000, `markOrderAsPaid:${orderNo}`);
 }
