@@ -17,6 +17,7 @@ const {
   canCancelOrder,
 } = require('../services/binanceService');
 const botStatusService = require('../services/botStatusService');
+const cashfreeVerificationService = require('../services/cashfreeVerificationService');
 const {
   extractPAN,
   isProblemMessage,
@@ -141,16 +142,61 @@ class OrderHandler {
       name_match_compare_source:  'previous_order',
     });
 
-    // Send the 3-block consolidated message (Overview / Approval / Summary)
-    const blocks = await MESSAGES.RETURNING_SELLER_TDS({
+    // Send the multi-block consolidated message (Overview / Approval / Summary).
+    // Identity fields come from the verified_sellers ledger (history) for the
+    // PRIOR order, with safe fallbacks. `previousOrderNo` is the seller's
+    // last completed order (so the seller sees a familiar order # they
+    // recognise from before).
+    const kycName =
+      (history.seller_name || '').trim() ||
+      (history.pan_name    || '').trim() ||
+      (order.sellerName    || '').trim() ||
+      (order.sellerNickname|| '').trim();
+
+    const tplVars = {
       previousOrderNo: history.order_no,
       pan:             history.pan,
       panName:         history.pan_name,
+      kycName,
+      sellerNickname:  history.seller_nickname || order.sellerNickname || null,
       tds,
+    };
+
+    logger.info('Returning-seller TDS template — substitution vars', {
+      orderNo,
+      previousOrderNo: tplVars.previousOrderNo || '(none)',
+      kycName:         tplVars.kycName         || '(none)',
+      pan:             tplVars.pan ? maskPAN(tplVars.pan) : '(none)',
+      panName:         tplVars.panName         || '(none)',
+      sellerNickname:  tplVars.sellerNickname  || '(none)',
     });
-    for (const block of blocks) {
-      if (!block) continue;
-      await this._send(orderNo, block);
+
+    const blocks = await MESSAGES.RETURNING_SELLER_TDS(tplVars);
+    logger.info('Returning-seller TDS — block count from DB', {
+      orderNo,
+      blockCount: blocks.length,
+      blockPreviews: blocks.map((b, i) => ({
+        idx:    i + 1,
+        empty:  !b,
+        length: b ? b.length : 0,
+        head:   b ? b.substring(0, 80) : '(empty)',
+      })),
+    });
+    // Send each block sequentially. Each send is _sendReliable so a single
+    // queued/dropped delivery is retried — important here because missing
+    // block 2 ("Hi {kycName}" + previous order #) breaks the narrative.
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      if (!block) {
+        logger.warn('Returning-seller TDS — empty block in template, skipping', {
+          orderNo, blockIndex: i + 1,
+        });
+        continue;
+      }
+      const ok = await this._sendReliable(orderNo, block);
+      logger.info('Returning-seller TDS — block delivery result', {
+        orderNo, blockIndex: i + 1, length: block.length, delivered: ok,
+      });
       await sleep(1500);
     }
 
@@ -398,6 +444,7 @@ class OrderHandler {
     }
 
     this._clearCancelTimer(orderNo);
+    this._clearPANTimers(orderNo);
     chatService.disconnect(orderNo);
   }
 
@@ -538,6 +585,7 @@ class OrderHandler {
         });
 
         if (retries >= config.bot.maxPanRetries) {
+          this._clearPANTimers(orderNo);
           await this._send(orderNo, MESSAGES.PAN_MAX_RETRIES());
           await this._escalate(orderNo, `Max PAN retries (${retries})`);
         } else {
@@ -572,8 +620,69 @@ class OrderHandler {
         }
         const refreshed = stateManager.get(orderNo);
         const kycName     = (refreshed.sellerName || '').trim();
-        const accountName = refreshed.paymentDetails?.accountName?.trim() || '';
         const panName     = (result.name || '').trim();
+
+        // Resolve the BANK holder name authoritatively. Preferred source is
+        // Cashfree's penny-drop verification — it returns the name on file
+        // at the seller's bank, which is more reliable than the seller-
+        // supplied account-holder name Binance ships in the order detail.
+        // Fall back to the Binance-provided name if Cashfree fails (e.g.
+        // Verifications product not enabled, IFSC malformed, network).
+        const acc  = refreshed.paymentDetails?.accountNo;
+        const ifsc = refreshed.paymentDetails?.ifscCode;
+        const binanceProvidedName = refreshed.paymentDetails?.accountName?.trim() || '';
+
+        let accountName       = binanceProvidedName;
+        let accountNameSource = 'binance_order_detail';
+        let cashfreeVerify    = null;
+
+        // Operator-controlled toggle (Overview → Cashfree Bank Verify).
+        // OFF (default) → use Binance-provided account holder name only.
+        // ON            → call Cashfree penny-drop for the bank-side name,
+        //                 fall back to Binance-provided on any failure.
+        let pennyDropEnabled = false;
+        try {
+          pennyDropEnabled = await botStatusService.isCashfreeBankVerifyEnabled();
+        } catch (_) { /* default OFF on DB hiccup */ }
+
+        if (pennyDropEnabled && acc && ifsc) {
+          cashfreeVerify = await cashfreeVerificationService.verifyBankAccount({
+            accountNumber: acc,
+            ifsc,
+            name:          panName,
+            orderNo,
+          });
+          if (cashfreeVerify.ok && cashfreeVerify.nameAtBank) {
+            accountName       = cashfreeVerify.nameAtBank.trim();
+            accountNameSource = 'cashfree_penny_drop';
+            logger.info('Account holder name overridden by Cashfree penny-drop', {
+              orderNo,
+              cashfreeNameAtBank: cashfreeVerify.nameAtBank,
+              binanceProvidedName,
+              bankName:           cashfreeVerify.bankName || '(n/a)',
+              accountStatus:      cashfreeVerify.accountStatus || '(n/a)',
+              cashfreeMatchHint:  cashfreeVerify.nameMatchResult || '(n/a)',
+            });
+          } else {
+            logger.warn('Cashfree penny-drop unavailable — falling back to Binance-provided account name', {
+              orderNo,
+              reason:              cashfreeVerify.reason || 'unknown',
+              binanceProvidedName: binanceProvidedName || '(none)',
+            });
+          }
+        } else if (!pennyDropEnabled) {
+          logger.info('Cashfree penny-drop toggle is OFF — using Binance-provided account name', {
+            orderNo,
+            binanceProvidedName: binanceProvidedName || '(none)',
+          });
+        } else {
+          logger.info('Skipping Cashfree penny-drop — no account+ifsc on order', {
+            orderNo,
+            hasAccount: !!acc,
+            hasIfsc:    !!ifsc,
+            hasUpi:     !!refreshed.paymentDetails?.upiId,
+          });
+        }
 
         // Don't compare against the seller's nickname (it's a screen name)
         const kycUsable = kycName && kycName !== refreshed.sellerNickname;
@@ -593,6 +702,7 @@ class OrderHandler {
         }
 
         // Step 2: PAN ↔ Bank account holder
+        // Source: Cashfree penny-drop when available, else Binance order detail.
         let bankCheck = null;
         if (accountName) {
           bankCheck = tokenIntersectionMatch(panName, accountName);
@@ -600,6 +710,7 @@ class OrderHandler {
             orderNo,
             panName,
             accountName,
+            source:  accountNameSource,
             matched: bankCheck.matched,
             overlap: bankCheck.overlap,
             reason:  bankCheck.reason,
@@ -637,15 +748,35 @@ class OrderHandler {
             });
 
             if (behavior === 'block') {
+              // Send the mismatch message and ASK FOR A NEW PAN. The bot
+              // stays responsive — it doesn't escalate unless the seller
+              // burns through maxPanRetries first. Same retry mechanic the
+              // PAN-format / Surepass-invalid branches above use.
               await this._send(orderNo, MESSAGES.NAME_MISMATCH({
                 panName,
                 kycName:     kycUsable ? kycName : '—',
                 accountName: accountName || '—',
                 mismatchedSources,
               }));
-              await this._escalate(orderNo,
-                `Name mismatch: PAN="${panName}" vs [${failed.map((c) => `${c.label}="${c.compareName}" (${c.reason})`).join(', ')}]`
-              );
+
+              const retries = stateManager.incPanRetry(orderNo);
+              if (retries >= config.bot.maxPanRetries) {
+                this._clearPANTimers(orderNo);
+                await this._send(orderNo, MESSAGES.PAN_MAX_RETRIES());
+                await this._escalate(orderNo,
+                  `Name mismatch + max retries (${retries}): PAN="${panName}" vs [${failed.map((c) => `${c.label}="${c.compareName}" (${c.reason})`).join(', ')}]`
+                );
+              } else {
+                // Reset to WAITING_FOR_PAN so the next incoming message
+                // routes back into _handlePANReply.
+                stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN);
+                logger.info('Name mismatch — asking seller for correct PAN', {
+                  orderNo,
+                  retries,
+                  maxRetries: config.bot.maxPanRetries,
+                  mismatchedSources,
+                });
+              }
               return;
             }
             logger.warn('Name mismatch — proceeding (warn mode)', {
@@ -672,6 +803,11 @@ class OrderHandler {
       // stuck mid-flow never becomes a future shortcut trigger.
       const tds = calculateTDS(order.amount, config.bot.tdsPercent);
 
+      // PAN accepted — kill the reminder / last-warning / PAN-cancel timers
+      // BEFORE any further async work. Otherwise a slow payment flow can
+      // still race against a pending warning timer.
+      this._clearPANTimers(orderNo);
+
       stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
         pan, tds, panName: result.name || null,
       });
@@ -681,11 +817,13 @@ class OrderHandler {
 
       // tdsInfo is multi-block: send each variation the admin added in
       // the Chat Templates page (every block gets {tds}/{quarter}/etc.
-      // substituted from the same vars map).
+      // substituted from the same vars map). Use _sendReliable so a
+      // transient WSS hiccup doesn't drop a block mid-sequence.
       const tdsInfoBlocks = await MESSAGES.TDS_INFO(tds);
-      for (const block of tdsInfoBlocks) {
+      for (let i = 0; i < tdsInfoBlocks.length; i++) {
+        const block = tdsInfoBlocks[i];
         if (!block) continue;
-        await this._send(orderNo, block);
+        await this._sendReliable(orderNo, block);
         await sleep(1200);
       }
 
@@ -856,6 +994,7 @@ class OrderHandler {
       logger.warn('Order cancelled remotely', { orderNo, code });
       stateManager.set(orderNo, ORDER_STATE.CANCELLED);
       this._clearCancelTimer(orderNo);
+      this._clearPANTimers(orderNo);
       // Send a polite goodbye before disconnecting (chat may still be live)
       await this._send(orderNo, MESSAGES.ORDER_CANCELLED_REMOTE());
       chatService.disconnect(orderNo);
@@ -872,6 +1011,12 @@ class OrderHandler {
   //   Reminder / last-warning / cancel timers — all delays come from
   //   bot_config (dashboard-tunable) at the moment this fires, with .env
   //   fallback if the DB read fails.
+  //
+  //   The handles are stored in this._panTimers[orderNo] so _clearPANTimers()
+  //   can kill them the moment the seller's PAN is accepted. We don't rely on
+  //   the in-callback state guard alone — once we leave WAITING_FOR_PAN the
+  //   timers are CANCELLED, so an unrelated payment-fail (or any other later
+  //   chat send) can never race into a "send your PAN now" warning.
   async _startPANTimer(orderNo) {
     let reminderMs, cancelMs;
     try {
@@ -883,26 +1028,42 @@ class OrderHandler {
     }
     const lastWarningMs = Math.max(reminderMs + 60_000, cancelMs - 120_000);
 
-    setTimeout(async () => {
+    if (!this._panTimers) this._panTimers = {};
+    this._clearPANTimers(orderNo);   // defensive
+
+    const reminderTimer = setTimeout(async () => {
       const o = stateManager.get(orderNo);
       if (!o || o.state !== ORDER_STATE.WAITING_FOR_PAN) return;
       stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN, { reminderSent: true });
       await this._send(orderNo, MESSAGES.PAN_REMINDER());
     }, reminderMs);
 
-    setTimeout(async () => {
+    const lastWarningTimer = setTimeout(async () => {
       const o = stateManager.get(orderNo);
       if (!o || o.state !== ORDER_STATE.WAITING_FOR_PAN) return;
       stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN, { lastWarningSent: true });
       await this._send(orderNo, MESSAGES.PAN_LAST_WARNING());
     }, lastWarningMs);
 
-    setTimeout(async () => {
+    const cancelTimer = setTimeout(async () => {
       const o = stateManager.get(orderNo);
       if (!o || o.state !== ORDER_STATE.WAITING_FOR_PAN) return;
       // Real Binance cancel — _autoCancel handles message + state + disconnect
       await this._autoCancel(orderNo, 'PAN timeout');
     }, cancelMs);
+
+    this._panTimers[orderNo] = [reminderTimer, lastWarningTimer, cancelTimer];
+  }
+
+  // ── Clear all PAN-stage timers for an order ──────────────────────────────
+  //   Must be called the moment we leave WAITING_FOR_PAN for good (PAN
+  //   verified, escalated, cancelled, completed). NOT called on a PAN-invalid
+  //   retry — there we deliberately stay in WAITING_FOR_PAN and the timer
+  //   should keep counting against the deadline the seller has already burned.
+  _clearPANTimers(orderNo) {
+    if (!this._panTimers || !this._panTimers[orderNo]) return;
+    for (const t of this._panTimers[orderNo]) clearTimeout(t);
+    delete this._panTimers[orderNo];
   }
 
   // ── Escalate ──────────────────────────────────────────────────────────────
@@ -911,23 +1072,69 @@ class OrderHandler {
     stateManager.set(orderNo, ORDER_STATE.ESCALATED);
     await this._send(orderNo, MESSAGES.ESCALATED());
     this._clearCancelTimer(orderNo);
+    this._clearPANTimers(orderNo);
     chatService.disconnect(orderNo);
   }
 
   // ── Send chat message helper ──────────────────────────────────────────────
   //  Accepts a string OR Promise<string> so callers can pass MESSAGES.X()
   //  directly (they're DB-backed and async now).
+  //
+  //  Returns true ONLY when chatService confirms the message actually went
+  //  out over the live WSS. A queued/dropped send returns false so the
+  //  caller can decide to retry — important for the multi-block templates
+  //  (returning-seller, tdsInfo, thankYou) where missing a block in the
+  //  middle of the sequence breaks the conversation.
   async _send(orderNo, textOrPromise) {
+    let text;
     try {
-      const text = textOrPromise && typeof textOrPromise.then === 'function'
+      text = textOrPromise && typeof textOrPromise.then === 'function'
         ? await textOrPromise
         : textOrPromise;
-      if (!text) return;
-      await chatService.sendMessage(orderNo, text);
+      if (!text) return false;
+      const res = await chatService.sendMessage(orderNo, text);
       orderDb.logChatMessage({ orderNo, direction: 'OUT', sender: 'bot', text });
+      if (res && res.ok) return true;
+      logger.warn('Chat send did not confirm — message may be queued or dropped', {
+        orderNo,
+        via:     res?.via || 'unknown',
+        preview: String(text).substring(0, 60),
+      });
+      return false;
     } catch (err) {
-      logger.error('Failed to send chat message', { orderNo, error: err.message });
+      logger.error('Failed to send chat message', {
+        orderNo, error: err.message,
+        preview: text ? String(text).substring(0, 60) : '(none)',
+      });
+      return false;
     }
+  }
+
+  // ── Robust send with retry — used for critical multi-block templates ─────
+  //  Tries up to `attempts` times, with a `delayMs` pause between tries, so
+  //  a transient WSS closure (e.g. just after the previous block) doesn't
+  //  leave a hole in the middle of a template sequence.
+  async _sendReliable(orderNo, textOrPromise, attempts = 3, delayMs = 1500) {
+    const text = textOrPromise && typeof textOrPromise.then === 'function'
+      ? await textOrPromise
+      : textOrPromise;
+    if (!text) return false;
+    for (let i = 1; i <= attempts; i++) {
+      const ok = await this._send(orderNo, text);
+      if (ok) return true;
+      if (i < attempts) {
+        logger.warn('Retrying chat send', {
+          orderNo, attempt: i, attempts,
+          preview: String(text).substring(0, 60),
+        });
+        await sleep(delayMs);
+      }
+    }
+    logger.error('Chat send failed after all retries', {
+      orderNo, attempts,
+      preview: String(text).substring(0, 60),
+    });
+    return false;
   }
 
   // ── Trade complete — Req #6: configurable thank-you ───────────────────────
@@ -943,13 +1150,15 @@ class OrderHandler {
     // every step_order entry fires sequentially with a small delay so they
     // arrive as separate chat messages instead of one merged one.
     const blocks = await MESSAGES.THANK_YOU(order.asset, order.cryptoAmount, orderNo);
-    for (const block of blocks) {
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
       if (!block) continue;
-      await this._send(orderNo, block);
+      await this._sendReliable(orderNo, block);
       await sleep(1200);
     }
 
     this._clearCancelTimer(orderNo);
+    this._clearPANTimers(orderNo);
     chatService.disconnect(orderNo);
 
     logger.info('Order completed! 🎉', {

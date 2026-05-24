@@ -120,14 +120,25 @@ const MESSAGES = {
     messageService.get("waitRelease", { method: method || "account" }),
 
   // Returning-seller shortcut: PAN already verified in a prior trade, so the
-  // bot sends the three-block summary (Overview / Approval / Summary) instead
+  // bot sends the multi-block summary (Overview / Approval / Summary) instead
   // of running the welcome + PAN-request + consent flow again.
-  // Returns the full ordered list of messages to send sequentially.
-  RETURNING_SELLER_TDS: ({ previousOrderNo, pan, panName, tds }) =>
+  //
+  // Vars available in every block (all editable in Chat Templates UI):
+  //   {kycName}          — seller's Binance KYC name (greeting)
+  //   {sellerNickname}   — seller's Binance public handle
+  //   {previousOrderNo}  — order number of their prior completed order
+  //   {pan}              — verified PAN on file
+  //   {panName}          — name on the PAN (from Surepass)
+  //   {preTDS} {tds} {postTDS} — rupee amounts for the current order
+  RETURNING_SELLER_TDS: ({
+    previousOrderNo, pan, panName, kycName, sellerNickname, tds,
+  }) =>
     messageService.getAll("returningSellerTdsApplied", {
       previousOrderNo: previousOrderNo || "—",
       pan:             pan || "—",
       panName:         panName || "—",
+      kycName:         kycName || panName || sellerNickname || "Customer",
+      sellerNickname:  sellerNickname || "—",
       preTDS:          inr(tds?.preTDS),
       tds:             inr(tds?.tds),
       postTDS:         inr(tds?.postTDS),

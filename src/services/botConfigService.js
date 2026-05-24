@@ -13,6 +13,15 @@ const TUNABLES = {
   auto_cancel_buffer_ms: { min: 0,     max: 30 * 60 * 1000 },        // 0..30 min
   pan_timeout_ms:        { min: 60_000, max: 24 * 60 * 60 * 1000 },  // 1 min..24 h
   pan_reminder_ms:       { min: 0,     max: 24 * 60 * 60 * 1000 },   // 0..24 h
+  // Payment-mode tier thresholds. Rupee amounts, integer.
+  //   amount < imps_max_amount               → IMPS
+  //   imps_max_amount ≤ amount < neft_max_amount → NEFT
+  //   amount ≥ neft_max_amount               → RTGS
+  //   imps_daily_cap = max IMPS total in a rolling 24h window. If exceeded,
+  //                    IMPS-tier orders fall back to NEFT.
+  imps_max_amount:       { min: 0, max: 10_000_000 },   // 0..₹1 crore
+  neft_max_amount:       { min: 0, max: 10_000_000 },   // 0..₹1 crore
+  imps_daily_cap:        { min: 0, max: 50_000_000 },   // 0..₹5 crore
 };
 
 function coerceTunable(name, raw) {
@@ -57,6 +66,10 @@ async function updateBotConfig(id, data) {
   if (data.auto_payout !== undefined) {
     fields.push("auto_payout = ?");
     values.push(data.auto_payout ? 1 : 0);
+  }
+  if (data.cashfree_bank_verify_enabled !== undefined) {
+    fields.push("cashfree_bank_verify_enabled = ?");
+    values.push(data.cashfree_bank_verify_enabled ? 1 : 0);
   }
   if (data.bot_name !== undefined) {
     fields.push("bot_name = ?");

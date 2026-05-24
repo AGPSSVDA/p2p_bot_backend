@@ -193,9 +193,11 @@ const TEMPLATE_DEFAULTS = [
       {
         order: 1,
         text:
-          "{method} done — UTR: {utr}\n\n" +
-          "Amount paid: ₹{postTDS} (Post-TDS)\n" +
-          "TDS deducted (1%): ₹{tds}\n\n" +
+          "✅ *Payment Successful!*\n\n" +
+          "📌 *Payment Method:* {method}\n" +
+          "🔢 *UTR Number:* {utr}\n\n" +
+          "💰 Amount Paid: ₹{postTDS} (Post-TDS)\n" +
+          "📋 TDS Deducted (1%): ₹{tds}\n\n" +
           "You'll receive payment in the next 2–20 minutes.\n" +
           "Kindly *release* the order once you receive it. 🙏\n\n" +
           "The ₹{tds} TDS will be deposited on your PAN — you can claim it back when you file ITR.\n\n" +
@@ -314,7 +316,7 @@ const TEMPLATE_DEFAULTS = [
   },
   {
     key: "nameMismatch",
-    description: "Sent when PAN name doesn't match KYC/bank name. Placeholders: {panName}, {kycName}, {accountName}, {mismatchedSources}",
+    description: "Sent when PAN name doesn't match KYC/bank name. Bot asks for a corrected PAN (does NOT escalate). Placeholders: {panName}, {kycName}, {accountName}, {mismatchedSources}",
     sort_order: 18,
     messages: [
       {
@@ -325,8 +327,9 @@ const TEMPLATE_DEFAULTS = [
           "Binance KYC     : {kycName}\n" +
           "Bank Holder     : {accountName}\n\n" +
           "Mismatch with   : {mismatchedSources}\n\n" +
-          "As a security measure, this order has been escalated for manual review. " +
-          "Our team will reach out to you shortly.",
+          "Please *re-check* and share your *correct* PAN — the name on it must " +
+          "match your Binance KYC name or your bank account holder name.\n\n" +
+          "Format: ABCDE-1234-F",
       },
     ],
   },
@@ -441,7 +444,7 @@ const TEMPLATE_DEFAULTS = [
     key: "returningSellerTdsApplied",
     description:
       "Returning seller — TDS applied automatically using previously-verified PAN. " +
-      "Placeholders: {previousOrderNo}, {pan}, {panName}, {preTDS}, {tds}, {postTDS}",
+      "Placeholders: {kycName}, {sellerNickname}, {previousOrderNo}, {pan}, {panName}, {preTDS}, {tds}, {postTDS}",
     sort_order: 27,
     messages: [
       {
@@ -632,15 +635,23 @@ async function initMysql() {
         auto_cancel_buffer_ms INT NOT NULL DEFAULT 60000,
         pan_timeout_ms INT NOT NULL DEFAULT 600000,
         pan_reminder_ms INT NOT NULL DEFAULT 300000,
+        cashfree_bank_verify_enabled TINYINT(1) NOT NULL DEFAULT 0,
+        imps_max_amount INT NOT NULL DEFAULT 100000,
+        neft_max_amount INT NOT NULL DEFAULT 200000,
+        imps_daily_cap INT NOT NULL DEFAULT 500000,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
     // Migration: ensure new tunable columns exist on legacy bot_config rows.
     await ensureColumns(connection, 'bot_config', [
-      { name: 'auto_cancel_buffer_ms', def: 'INT NOT NULL DEFAULT 60000' },
-      { name: 'pan_timeout_ms',        def: 'INT NOT NULL DEFAULT 600000' },
-      { name: 'pan_reminder_ms',       def: 'INT NOT NULL DEFAULT 300000' },
+      { name: 'auto_cancel_buffer_ms',        def: 'INT NOT NULL DEFAULT 60000' },
+      { name: 'pan_timeout_ms',               def: 'INT NOT NULL DEFAULT 600000' },
+      { name: 'pan_reminder_ms',              def: 'INT NOT NULL DEFAULT 300000' },
+      { name: 'cashfree_bank_verify_enabled', def: 'TINYINT(1) NOT NULL DEFAULT 0' },
+      { name: 'imps_max_amount',              def: 'INT NOT NULL DEFAULT 100000' },
+      { name: 'neft_max_amount',              def: 'INT NOT NULL DEFAULT 200000' },
+      { name: 'imps_daily_cap',               def: 'INT NOT NULL DEFAULT 500000' },
     ]);
 
     // ── orders (DB-persisted lifecycle) ───────────────────────────────────────

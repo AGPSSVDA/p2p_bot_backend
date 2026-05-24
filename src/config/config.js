@@ -59,11 +59,18 @@ const config = {
     env:                 process.env.CF_ENV || 'SANDBOX',
     apiVersion:          process.env.CF_API_VERSION || '2024-01-01',
     defaultFundsourceId: process.env.CF_DEFAULT_FUNDSOURCE_ID || '',
-    defaultRemark:       process.env.DEFAULT_REMARK || 'P2P payout',
     get baseUrl() {
       return String(this.env).toUpperCase() === 'PROD'
         ? 'https://api.cashfree.com/payout'
         : 'https://sandbox.cashfree.com/payout';
+    },
+    // Cashfree's Verifications product (penny-drop bank-account verification).
+    // Requires the Verifications suite to be enabled on the Cashfree account;
+    // the same client_id / client_secret authenticate against it.
+    get verificationBaseUrl() {
+      return String(this.env).toUpperCase() === 'PROD'
+        ? 'https://api.cashfree.com/verification'
+        : 'https://sandbox.cashfree.com/verification';
     },
   },
 

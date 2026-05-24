@@ -499,6 +499,28 @@ async function findVerifiedSellerHistory({
   }
 }
 
+// ── Sum of SUCCESSFUL IMPS payouts in the last 24h (rolling) ────────────────
+// Used by the dynamic transfer-mode chooser: if today's running IMPS total
+// is over the per-day cap (set on bot_config), the bot routes the order to
+// NEFT instead. Counter basis is the post-TDS amount actually sent (the
+// `amount` column on the payouts row), matching what the bank's IMPS counter
+// sees.
+async function getImpsAmountLast24h() {
+  try {
+    const [rows] = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total
+         FROM payouts
+        WHERE status = 'SUCCESS'
+          AND UPPER(payment_method) = 'IMPS'
+          AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)`
+    );
+    return Number(rows?.[0]?.total) || 0;
+  } catch (err) {
+    logger.warn("getImpsAmountLast24h failed", { error: err.message });
+    return 0;
+  }
+}
+
 // ── Log each chat message (in or out) for an order ───────────────────────────
 async function logChatMessage({ orderNo, direction, sender, templateKey, text, sentStatus }) {
   return safe(
@@ -699,6 +721,7 @@ module.exports = {
   upsertVerifiedSeller,
   promoteToVerifiedIfEligible,
   findVerifiedSellerHistory,
+  getImpsAmountLast24h,
   logChatMessage,
   BINANCE_STATUS_TO_STATE,
 };

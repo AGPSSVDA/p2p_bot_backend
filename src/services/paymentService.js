@@ -154,6 +154,53 @@ function manual(reason, amountINR, payDetails, extras = {}) {
   };
 }
 
+// ── Dynamic transfer-mode chooser ────────────────────────────────────────────
+//   amount < imps_max_amount                       → IMPS
+//   imps_max_amount ≤ amount < neft_max_amount     → NEFT
+//   amount ≥ neft_max_amount                       → RTGS
+//
+//   PLUS: if today's IMPS total (rolling 24h, post-TDS amounts only) would
+//   exceed imps_daily_cap when this transfer is added, the IMPS-tier order
+//   falls back to NEFT (per business rule).
+//
+//   Returns { mode: 'imps'|'neft'|'rtgs', reason, snapshot }
+async function chooseTransferMode(amountINR) {
+  const limits      = await botStatusService.getPaymentLimits();
+  const impsUsed24h = await orderDbService.getImpsAmountLast24h();
+
+  let mode;
+  let reason;
+  if (amountINR < limits.impsMaxAmount) {
+    // IMPS tier — but only if today's IMPS quota has room
+    if (impsUsed24h + amountINR <= limits.impsDailyCap) {
+      mode   = 'imps';
+      reason = 'amount_below_imps_max';
+    } else {
+      mode   = 'neft';
+      reason = 'imps_daily_cap_exhausted';
+    }
+  } else if (amountINR < limits.neftMaxAmount) {
+    mode   = 'neft';
+    reason = 'amount_in_neft_band';
+  } else {
+    mode   = 'rtgs';
+    reason = 'amount_above_neft_max';
+  }
+
+  return {
+    mode,
+    reason,
+    snapshot: {
+      amountINR,
+      impsMaxAmount: limits.impsMaxAmount,
+      neftMaxAmount: limits.neftMaxAmount,
+      impsDailyCap:  limits.impsDailyCap,
+      impsUsedToday: impsUsed24h,
+      impsRemainingToday: Math.max(0, limits.impsDailyCap - impsUsed24h),
+    },
+  };
+}
+
 async function processPayment(payDetails, amountINR, orderNo) {
   // Gate 1 — credentials present?
   if (!config.features.autoPayment) {
@@ -286,20 +333,23 @@ async function processPayment(payDetails, amountINR, orderNo) {
   }
 
   // ── Initiate transfer ────────────────────────────────────────────────────
-  // Cashfree rejects most punctuation in transfer_remarks — sanitize.
-  const safeRemark = `${config.cashfree.defaultRemark} ${orderNo}`
-    .replace(/[^A-Za-z0-9 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 100) || 'payout';
+  // transfer_remarks is omitted intentionally — not needed for our use case.
+  // transfer_mode is decided dynamically per amount + dashboard limits +
+  // rolling 24h IMPS daily usage. See chooseTransferMode() above.
+  const modeDecision = await chooseTransferMode(amountINR);
+  logger.info('Transfer mode chosen', {
+    orderNo,
+    chosenMode: modeDecision.mode,
+    reason:     modeDecision.reason,
+    ...modeDecision.snapshot,
+  });
 
   const transferPayload = {
     transfer_id,
     transfer_amount:   Number(amountINR),
     transfer_currency: 'INR',
-    transfer_mode:     'imps',
+    transfer_mode:     modeDecision.mode,
     beneficiary_details: { beneficiary_id: effectiveBeneficiaryId },
-    transfer_remarks:  safeRemark,
     ...(config.cashfree.defaultFundsourceId
       ? { fundsource_id: config.cashfree.defaultFundsourceId }
       : {}),
@@ -367,7 +417,7 @@ async function processPayment(payDetails, amountINR, orderNo) {
   return {
     payoutId: last.cf_transfer_id ? String(last.cf_transfer_id) : transfer_id,
     status:   finalStatus || 'PENDING',
-    mode:     'IMPS',
+    mode:     modeDecision.mode.toUpperCase(),   // IMPS / NEFT / RTGS
     amount:   amountINR,
     utr:      last.transfer_utr || `PEND-${transfer_id}`,
   };

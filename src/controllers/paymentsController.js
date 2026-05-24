@@ -2,6 +2,7 @@ const { pool } = require("../config/mysql");
 const logger = require("../utils/logger");
 const { markOrderAsPaid } = require("../services/binanceService");
 const orderDb = require("../services/orderDbService");
+const botStatusService = require("../services/botStatusService");
 const { stateManager, ORDER_STATE } = require("../bot/stateManager");
 
 // ── GET /api/payments ────────────────────────────────────────────────────────
@@ -69,6 +70,13 @@ async function listPayments(req, res) {
       "SELECT auto_payout FROM bot_config ORDER BY id ASC LIMIT 1"
     );
 
+    // Payment-mode tier thresholds + rolling 24h IMPS usage. Frontend uses
+    // these to render the Payment Limits card on the Payments page.
+    const [limits, impsUsed24h] = await Promise.all([
+      botStatusService.getPaymentLimits(),
+      orderDb.getImpsAmountLast24h(),
+    ]);
+
     res.json({
       success: true,
       message: "Payments retrieved successfully",
@@ -84,6 +92,13 @@ async function listPayments(req, res) {
           failed:  Number(s.failed_count)  || 0,
           success_amount: Number(s.success_amount) || 0,
           pending_amount: Number(s.pending_amount) || 0,
+        },
+        paymentLimits: {
+          imps_max_amount: limits.impsMaxAmount,
+          neft_max_amount: limits.neftMaxAmount,
+          imps_daily_cap:  limits.impsDailyCap,
+          imps_used_24h:   impsUsed24h,
+          imps_remaining_24h: Math.max(0, limits.impsDailyCap - impsUsed24h),
         },
         payments,
       },

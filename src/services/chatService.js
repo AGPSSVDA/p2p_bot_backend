@@ -189,14 +189,19 @@ class ChatService {
     }
 
     // Other server-side errors (e.g. content filter rejections) — log loudly so
-    // we can spot which outbound message Binance dropped.
+    // we can spot which outbound message Binance dropped. Correlate by uuid
+    // back to the exact outbound text we sent (kept in this._sentTexts).
     if (data.type === 'error') {
-      logger.error('Binance returned ERROR frame (likely content-filter or per-msg rejection)', {
-        content:    String(data.content || '').substring(0, 200),
-        uuid:       data.uuid,
-        topicId:    data.topicId,
-        orderNo:    data.orderNo,
-        rawPreview: JSON.stringify(data).substring(0, 300),
+      const original = data.uuid && this._sentTexts?.get(data.uuid);
+      logger.error('Binance returned ERROR frame — outbound message was REJECTED', {
+        binanceErrorContent: String(data.content || '').substring(0, 200),
+        rejectedUuid:        data.uuid,
+        topicId:             data.topicId,
+        orderNo:             data.orderNo || original?.orderNo,
+        rejectedTextFull:    original?.text || '(uuid not found in sent cache)',
+        rejectedTextLength:  original?.text ? original.text.length : 0,
+        sentAt:              original?.sentAt ? new Date(original.sentAt).toISOString() : null,
+        rawFrame:            JSON.stringify(data).substring(0, 500),
       });
       // Don't ban WSS for these — just log. Sender keeps retrying with different text.
       return;
@@ -326,7 +331,13 @@ class ChatService {
     }, delay);
   }
 
-  // ── Send chat message — WSS-only, queued if not open ──────────────────────
+  // ── Send chat message — WSS-only, brief wait then queue if still closed ──
+  //  Tries the fast path. If WSS isn't OPEN, waits up to WAIT_OPEN_MS for
+  //  it to come up before falling back to the queue. This makes multi-block
+  //  template sends (returning-seller, tdsInfo, thankYou) much more reliable
+  //  — instead of returning queued and letting the caller race against the
+  //  reconnect flush (which can drop messages or send duplicates), we block
+  //  the caller for a short, bounded window.
   async sendMessage(orderNo, text) {
     if (this._wssBanned) {
       logger.error('Message dropped — WSS is banned due to ILLEGAL_PARAM', { orderNo });
@@ -346,6 +357,22 @@ class ChatService {
       }
     } catch (e) { /* fail-open */ }
 
+    // Wait up to WAIT_OPEN_MS for WSS to come OPEN if currently down. Kicks
+    // an ensureConnected() if no socket exists at all. Short-circuits the
+    // moment the socket flips to OPEN.
+    const WAIT_OPEN_MS = 3000;
+    const POLL_MS = 100;
+    if (this.ws?.readyState !== WebSocket.OPEN) {
+      if (!this.ws && !this.connecting) {
+        this.ensureConnected(orderNo).catch(() => {});
+      }
+      const deadline = Date.now() + WAIT_OPEN_MS;
+      while (Date.now() < deadline) {
+        if (this.ws?.readyState === WebSocket.OPEN) break;
+        await new Promise((r) => setTimeout(r, POLL_MS));
+      }
+    }
+
     // Fast path
     if (this.ws?.readyState === WebSocket.OPEN) {
       try {
@@ -359,7 +386,7 @@ class ChatService {
 
     if (!this.sendQueues[orderNo]) this.sendQueues[orderNo] = [];
     this.sendQueues[orderNo].push(text);
-    logger.info('Message queued — WSS not open', {
+    logger.warn('Message queued — WSS not open after wait', {
       orderNo,
       readyState: this.ws?.readyState,
       queueLen:   this.sendQueues[orderNo].length,
@@ -379,6 +406,15 @@ class ChatService {
     const uuid = uuidv4();
     if (!this._sentUuids) this._sentUuids = new Set();
     this._sentUuids.add(uuid);
+    // Keep a uuid → original text map so a later "error" frame from Binance
+    // can be correlated back to the exact message that triggered it. Bounded
+    // to last 200 outbound messages so memory doesn't grow unbounded.
+    if (!this._sentTexts) this._sentTexts = new Map();
+    this._sentTexts.set(uuid, { orderNo, text, sentAt: Date.now() });
+    if (this._sentTexts.size > 200) {
+      const firstKey = this._sentTexts.keys().next().value;
+      this._sentTexts.delete(firstKey);
+    }
     return {
       type:       'text',
       content:    text,
@@ -391,14 +427,24 @@ class ChatService {
     };
   }
 
-  _flushSendQueue(orderNo) {
+  // Drain the per-order queue with spacing between sends. A rapid back-to-back
+  // burst (the old behaviour) was getting some messages silently dropped by
+  // Binance once the queue had > 2 entries — the spaced flush avoids that.
+  async _flushSendQueue(orderNo) {
     const q = this.sendQueues[orderNo];
     if (!q || q.length === 0) return;
     if (this.ws?.readyState !== WebSocket.OPEN) return;
 
     const total = q.length;
     let sent = 0;
+    const SPACING_MS = 800;
     while (q.length) {
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        logger.warn('Queue flush stopped — WSS closed mid-flush', {
+          orderNo, sent, remaining: q.length,
+        });
+        break;
+      }
       const text = q.shift();
       try {
         this.ws.send(JSON.stringify(this._buildOutgoingMsg(orderNo, text)));
@@ -408,6 +454,7 @@ class ChatService {
         logger.warn('Queue flush stopped', { orderNo, error: err.message });
         break;
       }
+      if (q.length) await new Promise((r) => setTimeout(r, SPACING_MS));
     }
     if (sent > 0) logger.info('Send queue flushed', { orderNo, sent, total });
   }

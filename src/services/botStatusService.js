@@ -24,6 +24,10 @@ const DEFAULTS = {
   auto_cancel_buffer_ms: 60000,
   pan_timeout_ms: 600000,
   pan_reminder_ms: 300000,
+  cashfree_bank_verify_enabled: 0,
+  imps_max_amount: 100000,   // ₹1 lakh — below this, prefer IMPS
+  neft_max_amount: 200000,   // ₹2 lakh — above this, force RTGS
+  imps_daily_cap:  500000,   // ₹5 lakh — total IMPS sent in last 24h
 };
 
 async function refresh() {
@@ -32,7 +36,9 @@ async function refresh() {
     try {
       const [rows] = await pool.query(
         `SELECT bot_status, auto_payout,
-                auto_cancel_buffer_ms, pan_timeout_ms, pan_reminder_ms
+                auto_cancel_buffer_ms, pan_timeout_ms, pan_reminder_ms,
+                cashfree_bank_verify_enabled,
+                imps_max_amount, neft_max_amount, imps_daily_cap
          FROM bot_config ORDER BY id ASC LIMIT 1`
       );
       cachedStatus = rows[0] ? { ...DEFAULTS, ...rows[0] } : { ...DEFAULTS };
@@ -85,6 +91,26 @@ async function getPanReminderMs() {
   return Number.isFinite(v) ? v : DEFAULTS.pan_reminder_ms;
 }
 
+async function isCashfreeBankVerifyEnabled() {
+  const s = await getStatus();
+  return Number(s?.cashfree_bank_verify_enabled) === 1;
+}
+
+// Returns the three payment-mode tier thresholds as raw rupee amounts.
+// Caller is responsible for handling them as integers (no decimal paisa).
+async function getPaymentLimits() {
+  const s = await getStatus();
+  const num = (v, fallback) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
+  return {
+    impsMaxAmount: num(s?.imps_max_amount, DEFAULTS.imps_max_amount),
+    neftMaxAmount: num(s?.neft_max_amount, DEFAULTS.neft_max_amount),
+    impsDailyCap:  num(s?.imps_daily_cap,  DEFAULTS.imps_daily_cap),
+  };
+}
+
 function invalidate() {
   cachedStatus = null;
   cachedAt = 0;
@@ -97,5 +123,7 @@ module.exports = {
   getAutoCancelBufferMs,
   getPanTimeoutMs,
   getPanReminderMs,
+  isCashfreeBankVerifyEnabled,
+  getPaymentLimits,
   invalidate,
 };
