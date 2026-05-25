@@ -41,6 +41,16 @@ class ChatService {
     // from firing more than once for the same message.
     this._seenInboundIds   = {};   // orderNo -> { ids: Set, order: [] }
     this._SEEN_CAP_PER_ORDER = 200;
+    // ── Background mode (real-time new-order detection) ──
+    // When enabled, the WSS stays open even with zero registered handlers,
+    // and any frame for an unhandled orderNo invokes _newOrderCallback so
+    // the bot can pick up new orders the moment they arrive instead of
+    // waiting for the next REST poll cycle.
+    this._backgroundMode    = false;
+    this._newOrderCallback  = null;
+    this._seenNewOrders     = new Set();    // orderNos already signalled
+    this._SEEN_NEW_ORDER_CAP = 500;
+    this._credentialRefreshTimer = null;
   }
 
   // Returns true if the message was already handled and should be skipped.
@@ -83,6 +93,13 @@ class ChatService {
     if (this.connecting) return;
     if (!seedOrderNo) {
       seedOrderNo = Object.keys(this.handlers)[0];
+    }
+    // In background mode the WSS must come up even before any order has been
+    // registered — that's the whole point of real-time new-order detection.
+    // getChatCredential ignores the orderNo parameter (listenKey is per-USER)
+    // so any non-empty string works as a seed.
+    if (!seedOrderNo && this._backgroundMode) {
+      seedOrderNo = '_bootstrap_';
     }
     if (!seedOrderNo) {
       logger.warn('ensureConnected called with no seed orderNo and no handlers');
@@ -237,7 +254,32 @@ class ChatService {
 
     const handler = this.handlers[orderNo];
     if (!handler) {
-      logger.debug('WSS frame for unhandled order', { orderNo, type: data.type });
+      // No handler yet — this could be a NEW order arriving in real time.
+      // Signal the new-order callback (registered by orderPoller). The
+      // callback fetches the order detail, validates it's WAIT_PAYMENT, and
+      // kicks off orderHandler.start() — bypassing the REST poll lag.
+      //
+      // Deduped by orderNo so a noisy seller (multiple chats / status pushes
+      // for the same order) doesn't trigger the callback repeatedly. The
+      // orderHandler.start() guard catches the race too, but checking here
+      // avoids the redundant REST round-trip.
+      if (this._newOrderCallback && !this._seenNewOrders.has(orderNo)) {
+        this._seenNewOrders.add(orderNo);
+        if (this._seenNewOrders.size > this._SEEN_NEW_ORDER_CAP) {
+          const first = this._seenNewOrders.values().next().value;
+          this._seenNewOrders.delete(first);
+        }
+        logger.info('WSS frame for unknown order — signalling new-order callback', {
+          orderNo, type: data.type,
+        });
+        Promise.resolve(this._newOrderCallback(orderNo, data)).catch((err) => {
+          logger.error('New-order callback threw', {
+            orderNo, error: err.message,
+          });
+        });
+      } else {
+        logger.debug('WSS frame for unhandled order', { orderNo, type: data.type });
+      }
       return;
     }
 
@@ -299,7 +341,9 @@ class ChatService {
   // ── Reconnect with capped backoff ─────────────────────────────────────────
   _scheduleReconnect() {
     if (this.reconnectTimer) return;
-    if (Object.keys(this.handlers).length === 0) {
+    // In background mode keep the WSS alive even with zero handlers so we
+    // can still receive new-order pushes.
+    if (Object.keys(this.handlers).length === 0 && !this._backgroundMode) {
       logger.info('No handlers — skipping reconnect');
       return;
     }
@@ -320,7 +364,7 @@ class ChatService {
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      const seed = Object.keys(this.handlers)[0];
+      const seed = Object.keys(this.handlers)[0] || (this._backgroundMode ? '_bootstrap_' : null);
       if (!seed) return;
       try {
         await this.ensureConnected(seed);
@@ -476,10 +520,41 @@ class ChatService {
 
   disconnect(orderNo) {
     this.unregister(orderNo);
-    if (Object.keys(this.handlers).length === 0) {
+    // In background mode we keep the shared WSS alive even with zero active
+    // orders — needed so a brand-new order can be detected via push before
+    // the next REST poll cycle.
+    if (Object.keys(this.handlers).length === 0 && !this._backgroundMode) {
       // Last handler — fully close
       this._closeFully();
     }
+  }
+
+  // ── Real-time new-order detection ─────────────────────────────────────────
+  //   startBackground() keeps the WSS alive at all times so a fresh order
+  //   arriving on Binance pushes an event to us instantly. The new-order
+  //   callback (registered by orderPoller) is fired with the orderNo of any
+  //   frame for an order we don't yet have a handler for.
+  async startBackground() {
+    this._backgroundMode = true;
+    await this.ensureConnected('_bootstrap_');
+
+    // Proactively refresh the listenKey/credential every 50 minutes. Binance
+    // listenKeys are ~60 min lived; closing the socket and letting the
+    // existing reconnect path fetch a fresh credential is simpler than a
+    // dedicated keepalive endpoint, and means the same code path is exercised.
+    if (this._credentialRefreshTimer) clearInterval(this._credentialRefreshTimer);
+    this._credentialRefreshTimer = setInterval(() => {
+      logger.info('Proactive WSS credential refresh — closing socket so reconnect picks up a fresh listenKey');
+      if (this.ws) {
+        try { this.ws.close(); } catch (_) {}
+      }
+    }, 50 * 60 * 1000);
+  }
+
+  onNewOrder(callback) {
+    if (typeof callback !== 'function') return;
+    this._newOrderCallback = callback;
+    logger.info('Real-time new-order callback registered');
   }
 
   _closeFully() {
@@ -491,6 +566,10 @@ class ChatService {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    if (this._credentialRefreshTimer) {
+      clearInterval(this._credentialRefreshTimer);
+      this._credentialRefreshTimer = null;
+    }
     if (this.ws) {
       try { this.ws.close(); } catch (e) {}
       this.ws = null;
@@ -498,6 +577,7 @@ class ChatService {
     this.handlers = {};
     this.sendQueues = {};
     this.reconnectAttempts = 0;
+    this._backgroundMode = false;
     logger.info('Chat WSS fully closed');
   }
 

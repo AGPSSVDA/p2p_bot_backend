@@ -531,7 +531,21 @@ class OrderHandler {
       text,
     });
 
-    if (isProblemMessage(text)) {
+    // Problem-keyword escalation ("cancel", "fraud", "scam", etc.) is
+    // SKIPPED while we're waiting for the seller's TDS consent. Per business
+    // rule, the only message that should advance the flow here is "I AGREE"
+    // — anything else (including "cancel", "no", typos) must keep nudging
+    // them with the retry template. If we escalated on "cancel" we'd
+    // disconnect the chat and the seller would never see another reply.
+    //
+    // Same logic for WAITING_FOR_PAN: the seller can keep retrying their PAN
+    // (or send unrelated text) without burning out the chat. The PAN-retry
+    // counter is what eventually escalates a bad-faith seller, not chat text.
+    const consentStates = [
+      ORDER_STATE.WAITING_TDS_CONSENT,
+      ORDER_STATE.WAITING_FOR_PAN,
+    ];
+    if (!consentStates.includes(order.state) && isProblemMessage(text)) {
       await this._escalate(orderNo, `Problem keyword: "${text.substring(0, 80)}"`);
       return;
     }
