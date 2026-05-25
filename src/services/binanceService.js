@@ -315,13 +315,23 @@ function extractPaymentDetails(orderDetail) {
     throw new Error('No payment methods available on order');
   }
 
-  // Prefer UPI > IMPS > NEFT > others (faster settlement)
+  // Pick the seller's payment method, preferring bank transfer over UPI so
+  // Cashfree auto-payout can handle it (UPI payouts are platform-disabled).
+  // Bank-transfer methods include: "Bank Transfer (India)", "IMPS", "IMPS - PAN",
+  // "NEFT", "RTGS". UPI is last so it only wins if no bank account is offered.
+  //
+  // Score reflects auto-payability + speed:
+  //   3 — explicit IMPS-tagged bank methods (fastest, supported by Cashfree)
+  //   2 — generic bank transfer (IMPS/NEFT/RTGS picked dynamically by amount)
+  //   1 — UPI (manual fallback)
+  //   0 — anything else
   const score = (m) => {
-    const id   = (m.tradeMethodIdentifier || m.identifier || '').toUpperCase();
-    const name = (m.tradeMethodName || m.tradeMethodShortName || '').toUpperCase();
-    if (id.includes('UPI')  || name.includes('UPI'))  return 3;
-    if (id.includes('IMPS') || name.includes('IMPS')) return 2;
-    if (id.includes('NEFT') || name.includes('NEFT')) return 1;
+    const id   = String(m.tradeMethodIdentifier || m.identifier || '').toUpperCase();
+    const name = String(m.tradeMethodName || m.tradeMethodShortName || '').toUpperCase();
+    const combined = `${id} ${name}`;
+    if (/\bIMPS\b/.test(combined))                  return 3;
+    if (/\bBANK\b|\bNEFT\b|\bRTGS\b/.test(combined)) return 2;
+    if (/\bUPI\b|\bVPA\b/.test(combined))            return 1;
     return 0;
   };
   const ranked = [...methods].sort((a, b) => score(b) - score(a));
@@ -329,31 +339,95 @@ function extractPaymentDetails(orderDetail) {
 
   const fieldList = method.fieldList || method.fields || [];
 
-  const getField = (names) => {
-    const lower = names.map(n => n.toLowerCase());
-    const f = fieldList.find(f =>
-      lower.some(n => (f.fieldName || f.name || '').toLowerCase().includes(n))
-    );
-    return f?.fieldValue || f?.value || null;
+  // Robust field lookup that ranks candidates and picks the best one.
+  // The old substring-match was matching "Account holder name" when asked
+  // for "account number" (because both contain "acc"), so the seller's
+  // NAME ended up in the accountNo field and Cashfree auto-payment was
+  // rejected as bad_account.
+  //
+  // patterns: ordered list of {regex, score}. Highest scoring field wins.
+  // Negative `excludeRe` removes false positives.
+  const matchField = (patterns, excludeRe = null) => {
+    let best = null;
+    let bestScore = -1;
+    for (const f of fieldList) {
+      const fname = String(f.fieldName || f.name || '').toLowerCase().trim();
+      if (!fname) continue;
+      if (excludeRe && excludeRe.test(fname)) continue;
+      const value = f.fieldValue || f.value;
+      if (!value) continue;
+      for (const { regex, score } of patterns) {
+        if (regex.test(fname) && score > bestScore) {
+          best = value;
+          bestScore = score;
+          break;
+        }
+      }
+    }
+    return best;
   };
 
-  const upiId = getField(['upi id', 'vpa', 'upi']);
+  // ── Account number — must NOT match "account holder name" or "account name"
+  const accountNo = matchField(
+    [
+      { regex: /^bank\s*account\s*(number|no)\b/, score: 5 },
+      { regex: /^account\s*(number|no)\b/,         score: 4 },
+      { regex: /\baccount\s*(number|no)\b/,        score: 3 },
+      { regex: /\bbank\s*account\b/,               score: 2 },
+      { regex: /\bacc(ount)?\s*#?\s*no?\b/,        score: 1 },
+    ],
+    /name|holder/   // never accept name-like fields
+  );
+
+  // ── IFSC — fairly unambiguous, just match the token
+  const ifscCode = matchField([
+    { regex: /\bifsc\b/, score: 1 },
+  ]);
+
+  // ── Bank name — must NOT match "bank account ..."
+  const bankName = matchField(
+    [
+      { regex: /\bbank\s*name\b/,   score: 3 },
+      { regex: /^bank\b\s*$/,       score: 2 },
+      { regex: /\bbank\b/,          score: 1 },
+    ],
+    /account|number|ifsc|branch/
+  );
+
+  // ── Account-holder name — must NOT match "account number" / "bank name"
+  const accountName = matchField(
+    [
+      { regex: /\b(account\s*)?holder\s*name\b/,    score: 5 },
+      { regex: /\bbeneficiary\s*name\b/,            score: 5 },
+      { regex: /\baccount\s*name\b/,                score: 4 },
+      { regex: /^name\b\s*$/,                       score: 3 },
+      { regex: /\bfull\s*name\b/,                   score: 3 },
+      { regex: /\bname\b/,                          score: 1 },
+    ],
+    /number|ifsc|bank\s*name|branch|address/
+  );
+
+  // ── UPI / VPA — distinct namespace, simple match
+  const upiId = matchField([
+    { regex: /\bupi\s*id\b/, score: 3 },
+    { regex: /\bvpa\b/,      score: 2 },
+    { regex: /\bupi\b/,      score: 1 },
+  ]);
 
   return {
     payId:       method.id || method.payId || method.tradeMethodIdentifier,
     methodName:  method.tradeMethodName || method.tradeMethodShortName || method.name || 'UNKNOWN',
     methodId:    method.tradeMethodIdentifier || method.identifier || '',
     upiId,
-    accountNo:   getField(['account number', 'account no', 'acc']),
-    ifscCode:    getField(['ifsc']),
-    bankName:    getField(['bank name', 'bank']),
-    accountName:
-      getField(['name', 'account name']) ||
-      orderDetail.payerNickname ||
-      orderDetail.sellerNickname ||
-      'Seller',
+    accountNo,
+    ifscCode,
+    bankName,
+    accountName: accountName ||
+                 orderDetail.payerNickname ||
+                 orderDetail.sellerNickname ||
+                 'Seller',
     raw:         fieldList,
-    isUPI:       !!upiId,
+    isUPI:       !!upiId && !(accountNo && ifscCode),  // UPI mode only if no bank
   };
 }
 
