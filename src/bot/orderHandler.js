@@ -532,20 +532,38 @@ class OrderHandler {
     });
 
     // Problem-keyword escalation ("cancel", "fraud", "scam", etc.) is
-    // SKIPPED while we're waiting for the seller's TDS consent. Per business
-    // rule, the only message that should advance the flow here is "I AGREE"
-    // — anything else (including "cancel", "no", typos) must keep nudging
-    // them with the retry template. If we escalated on "cancel" we'd
-    // disconnect the chat and the seller would never see another reply.
+    // SKIPPED in nearly every state. Per business rule:
     //
-    // Same logic for WAITING_FOR_PAN: the seller can keep retrying their PAN
-    // (or send unrelated text) without burning out the chat. The PAN-retry
-    // counter is what eventually escalates a bad-faith seller, not chat text.
-    const consentStates = [
-      ORDER_STATE.WAITING_TDS_CONSENT,
+    //   • WAITING_FOR_PAN / WAITING_TDS_CONSENT — the only advance trigger
+    //     is a valid PAN or "I AGREE". Anything else, including "cancel",
+    //     just keeps nudging with the retry template.
+    //
+    //   • PROCESSING_PAYMENT / AWAITING_MANUAL_PAYMENT / PAYMENT_SENT /
+    //     WAITING_FOR_RELEASE — the payment is in flight or already settled
+    //     on the bot side. Escalating here disconnects the chat, marks the
+    //     order ESCALATED, and the completion poller no longer watches it
+    //     — so the THANK_YOU never lands and the order stays ESCALATED
+    //     even after the seller releases crypto. Never escalate post-pay.
+    //
+    //   • PAN_VERIFIED / TDS_ACCEPTED / VALIDATING_PAN — transient, the
+    //     state machine is mid-step. WAIT_PROCESSING reply is enough.
+    //
+    // The only remaining states where the keyword check is meaningful are
+    // NEW_ORDER (very early) and ESCALATED/FAILED (already terminal, the
+    // _onMessage early-return skips terminal states anyway). So in practice
+    // we only fire isProblemMessage in NEW_ORDER — and that's a rare race.
+    const noEscalateStates = [
       ORDER_STATE.WAITING_FOR_PAN,
+      ORDER_STATE.WAITING_TDS_CONSENT,
+      ORDER_STATE.VALIDATING_PAN,
+      ORDER_STATE.PAN_VERIFIED,
+      ORDER_STATE.TDS_ACCEPTED,
+      ORDER_STATE.PROCESSING_PAYMENT,
+      ORDER_STATE.AWAITING_MANUAL_PAYMENT,
+      ORDER_STATE.PAYMENT_SENT,
+      ORDER_STATE.WAITING_FOR_RELEASE,
     ];
-    if (!consentStates.includes(order.state) && isProblemMessage(text)) {
+    if (!noEscalateStates.includes(order.state) && isProblemMessage(text)) {
       await this._escalate(orderNo, `Problem keyword: "${text.substring(0, 80)}"`);
       return;
     }

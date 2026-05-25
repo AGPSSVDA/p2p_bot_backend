@@ -176,6 +176,12 @@ class OrderPoller {
   // ── 3. Completion polling (Req #6) ────────────────────────────────────────
   //   For orders bot has paid for, check if seller has released crypto.
   //   Fires the thank-you message when status flips to COMPLETED.
+  //
+  //   ALSO watches ESCALATED orders that have a payoutId — defensive
+  //   recovery. If something escalated an order AFTER we'd already sent
+  //   payment (e.g. a stale keyword check, an admin click, a transient
+  //   bug), we still need to detect the seller's crypto release so the
+  //   order doesn't sit in ESCALATED forever and THANK_YOU still fires.
   async _pollCompletion() {
     const watchStates = [
       ORDER_STATE.WAITING_FOR_RELEASE,
@@ -183,7 +189,15 @@ class OrderPoller {
     ];
 
     const watching = Object.values(stateManager.orders)
-      .filter(o => watchStates.includes(o.state));
+      .filter(o =>
+        watchStates.includes(o.state) ||
+        // Escalated AFTER payment was sent — keep watching for completion.
+        // Either payoutId (Cashfree auto-pay) OR a real (non-PEND-) UTR
+        // (manual approval) proves money has left, so the seller MAY still
+        // release crypto and we must catch the COMPLETED transition.
+        (o.state === ORDER_STATE.ESCALATED &&
+         (o.payoutId || (o.utr && !String(o.utr).startsWith('PEND-'))))
+      );
 
     for (const order of watching) {
       const { orderNo } = order;
