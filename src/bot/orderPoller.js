@@ -34,25 +34,6 @@ class OrderPoller {
     if (this.running) return;
     this.running = true;
 
-    // ── Real-time new-order detection via WSS push ──────────────────────
-    //   The shared chat WSS is bound to the bot user's listenKey, which
-    //   receives push events for ALL orders the user is involved in (not
-    //   just orders with an active chat handler). Registering a new-order
-    //   callback lets us fire orderHandler.start() the moment Binance
-    //   pushes the first frame for a new order — bypassing the up-to-N
-    //   second REST poll lag.
-    //
-    //   The polling loop below stays in place as a fallback:
-    //     • catches orders the WSS missed during a reconnect window
-    //     • catches orders that existed before the bot started
-    //     • runs even if Binance hasn't pushed any event for the order yet
-    //       (some new orders may not push an immediate event)
-    this._initRealtimeOrderDetection().catch((err) => {
-      logger.warn('Real-time order detection setup failed — polling only', {
-        error: err.message,
-      });
-    });
-
     this.orderTimer = setInterval(
       () => this._pollOrders(), config.bot.orderPollInterval
     );
@@ -80,59 +61,6 @@ class OrderPoller {
       completionInterval:   config.bot.completionPollInterval,
       terminalSyncInterval: TERMINAL_SYNC_INTERVAL_MS,
     });
-  }
-
-  // ── Register WSS new-order callback + open background WSS ────────────────
-  //   Called once at bot startup. The callback fires for any WSS frame
-  //   referencing an orderNo we don't yet have a handler for. We then
-  //   fetch the order detail (REST), validate it's WAIT_PAYMENT (status 1),
-  //   and call orderHandler.start() — which is idempotent (stateManager.has
-  //   guard) so a race with the REST poller is harmless.
-  async _initRealtimeOrderDetection() {
-    chatService.onNewOrder(async (orderNo, frame) => {
-      try {
-        if (!orderNo) return;
-        if (stateManager.has(orderNo)) return;
-
-        const detail = await getOrderDetail(orderNo);
-        const status = Number(detail.orderStatus);
-
-        if (status !== ORDER_STATUS.WAIT_PAYMENT) {
-          logger.debug('WSS new-order signal — not WAIT_PAYMENT, ignoring', {
-            orderNo, status, frameType: frame?.type,
-          });
-          return;
-        }
-
-        // Re-check after the REST round-trip in case the poller raced us
-        if (stateManager.has(orderNo)) return;
-
-        logger.info('🚀 New order detected via WSS push (real-time)', {
-          orderNo,
-          amount: detail.totalPrice,
-          asset:  detail.asset,
-          frameType: frame?.type,
-        });
-
-        await orderHandler.start({
-          orderNumber:         orderNo,
-          adOrderNo:           detail.adOrderNo,
-          counterPartNickName: detail.counterPartNickName,
-          counterPartUserId:   detail.counterPartUserId,
-          totalPrice:          detail.totalPrice,
-          amount:              detail.amount,
-          asset:               detail.asset,
-          fiat:                detail.fiat,
-        });
-      } catch (err) {
-        logger.error('Real-time new-order handler failed — REST poller will catch it', {
-          orderNo, error: err.message,
-        });
-      }
-    });
-
-    await chatService.startBackground();
-    logger.info('✅ Real-time new-order detection via WSS enabled');
   }
 
   stop() {
