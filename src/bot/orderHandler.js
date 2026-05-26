@@ -1197,35 +1197,47 @@ class OrderHandler {
 
     await this._sendReliable(orderNo, MESSAGES.PAYMENT_FAILED());
 
+    // We DELIBERATELY skip canCancelOrder here. After markOrderAsPaid (which
+    // we called when the pending branch fired in _processPaymentFlow), the
+    // Binance order is in status 2 (PAID) and canCancelOrder will return
+    // false — but the cancelOrder endpoint MAY still accept a "Due to
+    // seller" reason code (Binance reserves code 6 for "seller cannot
+    // release" specifically for post-payment scenarios). Always attempt
+    // the real cancel and let Binance be the source of truth.
+    let cancelled = false;
     try {
-      const allowed = await canCancelOrder(orderNo);
-      if (allowed) {
-        const picked = pickSellerCancelReason();
-        await cancelOrder(orderNo, picked.code,
-          `Cashfree payout failed: ${String(reason || '').slice(0, 150)}`
-        );
-        stateManager.set(orderNo, ORDER_STATE.CANCELLED, {
-          cancel_reason: `Cashfree payout failed: ${reason || 'n/a'}`,
-        });
-        logger.warn('Order cancelled on Binance after Cashfree pending → fail', {
-          orderNo, reason,
-        });
-      } else {
-        // Seller likely already released crypto — we can no longer cancel.
-        // Mark FAILED locally so the operator sees this needs attention.
-        stateManager.set(orderNo, ORDER_STATE.FAILED, {
-          cancel_reason: `Cashfree payout failed but Binance refused cancel: ${reason || 'n/a'}`,
-        });
-        logger.error('Cashfree fail but Binance won\'t cancel — manual intervention required', {
-          orderNo, reason,
-        });
-      }
+      const picked = pickSellerCancelReason();
+      await cancelOrder(orderNo, picked.code,
+        `Cashfree payout failed: ${String(reason || '').slice(0, 150)}`
+      );
+      cancelled = true;
+      stateManager.set(orderNo, ORDER_STATE.CANCELLED, {
+        cancel_reason: `Cashfree payout failed: ${reason || 'n/a'}`,
+      });
+      logger.warn('Order cancelled on Binance after Cashfree pending → fail', {
+        orderNo, reason, reasonCode: picked.code,
+      });
     } catch (cancelErr) {
-      logger.error('Cancel attempt after Cashfree fail threw', {
-        orderNo, error: cancelErr.message, reason,
+      // Binance refused the cancel — most likely because the seller already
+      // released crypto, or the order moved into appeal. Mark FAILED locally
+      // and emit a critical log so the operator can manually appeal/refund
+      // via Binance dashboard.
+      logger.error('Cancel attempt after Cashfree pending → fail FAILED — operator must appeal manually', {
+        orderNo,
+        error:  cancelErr.message,
+        reason,
+        action: 'Open Binance merchant dashboard → Orders → this order → Appeal',
       });
       stateManager.set(orderNo, ORDER_STATE.FAILED, {
-        cancel_reason: `Cashfree payout failed: ${reason || 'n/a'} (cancel attempt also threw: ${cancelErr.message})`,
+        cancel_reason: `Cashfree payout failed: ${reason || 'n/a'} (cancel rejected: ${cancelErr.message})`,
+      });
+    }
+
+    if (!cancelled) {
+      logger.error('💥 CRITICAL: Order in FAILED with payment already markPaid on Binance', {
+        orderNo,
+        reason,
+        next: 'Operator must raise appeal on Binance dashboard to recover',
       });
     }
 
