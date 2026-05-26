@@ -953,13 +953,68 @@ class OrderHandler {
         return;
       }
 
-      // Auto-payment succeeded. Mark state, persist payout, then ensure
-      // the auto-cancel timer never fires for this order again (belt and
-      // suspenders — the unsafe-state guard already blocks it, but freeing
-      // the timer is cleaner).
+      // ── PENDING branch ─────────────────────────────────────────────────
+      // Cashfree accepted the transfer but the bank hasn't confirmed yet.
+      // Per business rule:
+      //   1. markOrderAsPaid on Binance now (so Binance doesn't auto-cancel)
+      //   2. Send the PAYMENT_PROCESSING template (NOT PAYMENT_SENT with a
+      //      junk PEND- UTR like before)
+      //   3. Park the order in WAITING_FOR_RELEASE with paymentPending: true
+      //      + a PEND-<transferId> placeholder UTR (used by the webhook to
+      //      look up the order)
+      //   4. Cashfree's webhook (cashfreeWebhookController) will later call
+      //      finalizePayoutSuccess() or finalizePayoutFailed() depending on
+      //      the bank's final response — that's where the real UTR /
+      //      cancel-on-failure logic lives.
+      if (result.pending) {
+        const placeholderUtr = `PEND-${result.transferId || result.payoutId}`;
+
+        stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, {
+          payoutId:        result.payoutId,
+          utr:             placeholderUtr,
+          paymentPending:  true,
+          paymentMode:     result.mode,
+        });
+        this._clearCancelTimer(orderNo);
+        orderDb.recordPayoutPending(stateManager.get(orderNo));
+
+        // Mark paid on Binance immediately so the buyer's-side auto-cancel
+        // doesn't fire while we wait for Cashfree to settle. We pass the
+        // PEND- placeholder as payInfo; Binance just shows whatever string
+        // we send as payment proof.
+        try {
+          await markOrderAsPaid(orderNo, payDetails.payId, placeholderUtr);
+        } catch (err) {
+          logger.error('markOrderAsPaid failed during pending payout', {
+            orderNo, error: err.message,
+          });
+        }
+
+        await this._send(orderNo,
+          MESSAGES.PAYMENT_PROCESSING(order.tds, result.mode)
+        );
+
+        stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_RELEASE, {
+          paymentPending: true,
+        });
+
+        logger.info('Payment PENDING — awaiting Cashfree webhook', {
+          orderNo,
+          transferId: result.transferId || result.payoutId,
+          mode:       result.mode,
+          amount:     order.tds.postTDS,
+        });
+        return;
+      }
+
+      // Auto-payment succeeded immediately. Mark state, persist payout,
+      // then ensure the auto-cancel timer never fires for this order again
+      // (belt and suspenders — the unsafe-state guard already blocks it,
+      // but freeing the timer is cleaner).
       stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, {
         payoutId: result.payoutId,
         utr:      result.utr,
+        paymentPending: false,
       });
       this._clearCancelTimer(orderNo);
       orderDb.recordPayoutSuccess(
@@ -1005,7 +1060,157 @@ class OrderHandler {
       logger.error('Payment flow error', { orderNo, error: err.message });
       stateManager.set(orderNo, ORDER_STATE.FAILED);
       await this._send(orderNo, MESSAGES.PAYMENT_FAILED());
+
+      // Cashfree returned a HARD failure (FAILED / REJECTED / REVERSED) on
+      // the initial poll → cancel the order on Binance per business rule.
+      // Safe here because we never called markOrderAsPaid in this branch.
+      try {
+        const allowed = await canCancelOrder(orderNo);
+        if (allowed) {
+          const picked = pickSellerCancelReason();
+          await cancelOrder(orderNo, picked.code, String(picked.info || '').slice(0, 200));
+          stateManager.set(orderNo, ORDER_STATE.CANCELLED);
+          logger.warn('Order cancelled on Binance after Cashfree hard fail', {
+            orderNo, reason: err.message,
+          });
+        } else {
+          logger.warn('Cashfree hard fail but Binance says cancel not allowed', {
+            orderNo, reason: err.message,
+          });
+        }
+      } catch (cancelErr) {
+        logger.error('Cancel-on-Cashfree-fail attempt failed', {
+          orderNo, error: cancelErr.message,
+        });
+      }
     }
+  }
+
+  // ── Finalize a PENDING payout when Cashfree's webhook confirms SUCCESS ──
+  //   Called by cashfreeWebhookController. Idempotent — skips if we've
+  //   already finalized (utr no longer starts with PEND-) or if the order
+  //   is already in a terminal state.
+  //
+  //   Steps:
+  //     1. Update orders/payouts rows with the real UTR
+  //     2. Send the full PAYMENT_SENT template with the real UTR
+  //     3. Leave state as WAITING_FOR_RELEASE — seller still needs to
+  //        release crypto. COMPLETED transition is driven by Binance's
+  //        order_status push as usual.
+  async finalizePayoutSuccess(orderNo, realUtr, mode) {
+    const order = stateManager.get(orderNo);
+    if (!order) {
+      logger.warn('finalizePayoutSuccess: order not in stateManager (already gone?)', {
+        orderNo, realUtr,
+      });
+      return;
+    }
+    // Idempotency: already finalized?
+    if (order.utr && !String(order.utr).startsWith('PEND-')) {
+      logger.info('finalizePayoutSuccess: already finalized — skipping', {
+        orderNo, existingUtr: order.utr,
+      });
+      return;
+    }
+    // Skip if state has already moved to a terminal we don't want to disturb
+    const terminal = [
+      ORDER_STATE.COMPLETED, ORDER_STATE.CANCELLED,
+      ORDER_STATE.FAILED,    ORDER_STATE.ESCALATED,
+    ];
+    if (terminal.includes(order.state)) {
+      logger.info('finalizePayoutSuccess: order already terminal — only updating UTR', {
+        orderNo, state: order.state, realUtr,
+      });
+      stateManager.set(orderNo, order.state, {
+        utr: realUtr, paymentPending: false,
+      });
+      return;
+    }
+
+    stateManager.set(orderNo, order.state, {
+      utr:            realUtr,
+      paymentPending: false,
+    });
+
+    const effectiveMode = mode || order.paymentMode || 'IMPS';
+
+    await this._sendReliable(orderNo,
+      MESSAGES.PAYMENT_SENT(
+        order.tds,
+        effectiveMode,
+        realUtr,
+        config.bot.tan
+      )
+    );
+
+    logger.info('Pending payout FINALIZED as SUCCESS', {
+      orderNo,
+      realUtr,
+      mode: effectiveMode,
+    });
+  }
+
+  // ── Finalize a PENDING payout when Cashfree's webhook reports FAILURE ───
+  //   Called by cashfreeWebhookController. Per business rule:
+  //     1. Send PAYMENT_FAILED template (so the seller knows what happened)
+  //     2. Attempt to cancel the order on Binance — Binance may reject
+  //        this if the seller already released crypto, in which case the
+  //        cancel attempt is logged and the order is moved to FAILED.
+  //
+  //   Idempotent — skips if the order is already in FAILED/CANCELLED.
+  async finalizePayoutFailed(orderNo, reason) {
+    const order = stateManager.get(orderNo);
+    if (!order) {
+      logger.warn('finalizePayoutFailed: order not in stateManager', { orderNo });
+      return;
+    }
+    if (order.state === ORDER_STATE.CANCELLED || order.state === ORDER_STATE.FAILED) {
+      logger.info('finalizePayoutFailed: already terminal — skipping', {
+        orderNo, state: order.state,
+      });
+      return;
+    }
+
+    logger.error('Pending payout FINALIZED as FAILED — cancelling Binance order', {
+      orderNo, reason,
+    });
+
+    await this._sendReliable(orderNo, MESSAGES.PAYMENT_FAILED());
+
+    try {
+      const allowed = await canCancelOrder(orderNo);
+      if (allowed) {
+        const picked = pickSellerCancelReason();
+        await cancelOrder(orderNo, picked.code,
+          `Cashfree payout failed: ${String(reason || '').slice(0, 150)}`
+        );
+        stateManager.set(orderNo, ORDER_STATE.CANCELLED, {
+          cancel_reason: `Cashfree payout failed: ${reason || 'n/a'}`,
+        });
+        logger.warn('Order cancelled on Binance after Cashfree pending → fail', {
+          orderNo, reason,
+        });
+      } else {
+        // Seller likely already released crypto — we can no longer cancel.
+        // Mark FAILED locally so the operator sees this needs attention.
+        stateManager.set(orderNo, ORDER_STATE.FAILED, {
+          cancel_reason: `Cashfree payout failed but Binance refused cancel: ${reason || 'n/a'}`,
+        });
+        logger.error('Cashfree fail but Binance won\'t cancel — manual intervention required', {
+          orderNo, reason,
+        });
+      }
+    } catch (cancelErr) {
+      logger.error('Cancel attempt after Cashfree fail threw', {
+        orderNo, error: cancelErr.message, reason,
+      });
+      stateManager.set(orderNo, ORDER_STATE.FAILED, {
+        cancel_reason: `Cashfree payout failed: ${reason || 'n/a'} (cancel attempt also threw: ${cancelErr.message})`,
+      });
+    }
+
+    this._clearCancelTimer(orderNo);
+    this._clearPANTimers(orderNo);
   }
 
   // ── Order status change handler — Req #6 ──────────────────────────────────

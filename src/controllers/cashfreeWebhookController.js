@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const { pool } = require("../config/mysql");
 const { config } = require("../config/config");
 const { stateManager, ORDER_STATE } = require("../bot/stateManager");
+const { orderHandler } = require("../bot/orderHandler");
 const logger = require("../utils/logger");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,47 +169,48 @@ async function handleWebhook(req, res) {
       [payoutStatus, evt.transfer_utr || null, orderNo]
     );
 
-    // On hard failure, move the order to FAILED (only if still mid-flow).
-    // SUCCESS doesn't move the state — the order stays in WAITING_FOR_RELEASE
-    // until the seller releases crypto on Binance.
-    if (payoutStatus === "FAILED") {
-      const safeToFailStates = [
-        ORDER_STATE.PROCESSING_PAYMENT,
-        ORDER_STATE.PAYMENT_SENT,
-        ORDER_STATE.WAITING_FOR_RELEASE,
-        ORDER_STATE.AWAITING_MANUAL_PAYMENT,
-      ];
-      if (safeToFailStates.includes(order.state)) {
+    // ── Bot-side finalization ────────────────────────────────────────────
+    // After DB is updated, drive the chat / state transitions through the
+    // orderHandler so the seller sees the right message at the right time:
+    //
+    //   payoutStatus = SUCCESS → orderHandler.finalizePayoutSuccess()
+    //     • idempotency-guarded (skips if utr already real / state terminal)
+    //     • sends the full PAYMENT_SENT template with the REAL UTR
+    //     • leaves order in WAITING_FOR_RELEASE — Binance order_status push
+    //       still drives the eventual COMPLETED transition.
+    //
+    //   payoutStatus = FAILED → orderHandler.finalizePayoutFailed()
+    //     • sends PAYMENT_FAILED template
+    //     • attempts to cancel the order on Binance (may be refused if the
+    //       seller already released crypto — in that case state → FAILED
+    //       and the operator must intervene).
+    //
+    // Wrapped in try/catch so a bot-side hiccup never poisons the 200 OK
+    // we owe Cashfree.
+    try {
+      if (payoutStatus === "SUCCESS" && evt.transfer_utr) {
+        await orderHandler.finalizePayoutSuccess(
+          orderNo,
+          evt.transfer_utr,
+          null     // mode is held in stateManager from the original processPayment
+        );
+      } else if (payoutStatus === "FAILED") {
+        await orderHandler.finalizePayoutFailed(
+          orderNo,
+          evt.failure_reason || evt.status || "Cashfree reported failure"
+        );
+      } else if (evt.transfer_utr) {
+        // PENDING webhook with a UTR — just mirror the UTR into memory so a
+        // subsequent SUCCESS webhook can correlate cleanly. No chat send.
         const live = stateManager.get(orderNo);
-        if (live) {
-          stateManager.set(orderNo, ORDER_STATE.FAILED, {
-            cancel_reason: `Cashfree payout ${evt.status}: ${evt.failure_reason || "n/a"}`,
-          });
-        } else {
-          await pool.query(
-            `UPDATE orders
-                SET state = 'FAILED',
-                    cancel_reason = ?
-              WHERE order_no = ?`,
-            [
-              `Cashfree payout ${evt.status}: ${evt.failure_reason || "n/a"}`,
-              orderNo,
-            ]
-          );
+        if (live && (!live.utr || String(live.utr).startsWith("PEND-"))) {
+          stateManager.set(orderNo, live.state, { utr: evt.transfer_utr });
         }
-        logger.error("Cashfree payout FAILED — order moved to FAILED state", {
-          orderNo, transfer_id: evt.transfer_id, reason: evt.failure_reason,
-        });
       }
-    }
-
-    // Mirror UTR into the in-memory state if the bot is still tracking
-    // this order — keeps things consistent if the bot sends any later chat.
-    if (evt.transfer_utr) {
-      const live = stateManager.get(orderNo);
-      if (live && !live.utr) {
-        stateManager.set(orderNo, live.state, { utr: evt.transfer_utr });
-      }
+    } catch (bizErr) {
+      logger.error("orderHandler finalize threw — DB updates already applied", {
+        orderNo, payoutStatus, error: bizErr.message,
+      });
     }
 
     logger.info("Cashfree webhook applied", {

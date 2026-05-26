@@ -207,6 +207,28 @@ const TEMPLATE_DEFAULTS = [
     ],
   },
   {
+    key: "paymentProcessing",
+    description:
+      "Sent when Cashfree accepted the transfer but the partner bank hasn't " +
+      "confirmed settlement yet. The real UTR will follow in a paymentSent " +
+      "message once Cashfree's webhook confirms success. Placeholders: " +
+      "{method}, {postTDS}, {tds}",
+    sort_order: 13,
+    messages: [
+      {
+        order: 1,
+        text:
+          "⏳ *Payment is processing — please wait*\n\n" +
+          "📌 *Payment Method:* {method}\n" +
+          "💰 Amount: ₹{postTDS} (Post-TDS)\n" +
+          "📋 TDS Deducted (1%): ₹{tds}\n\n" +
+          "Your payment is being processed by the bank. The UTR number will be shared shortly once the transfer completes.\n\n" +
+          "Please do *not* cancel the order — we'll update you as soon as the bank confirms. 🙏\n\n" +
+          "(Automated response — payment screenshot can't be shared)",
+      },
+    ],
+  },
+  {
     key: "manualPaymentPending",
     description: "Phase 1 manual payout placeholder ({postTDS}, {method})",
     sort_order: 13,

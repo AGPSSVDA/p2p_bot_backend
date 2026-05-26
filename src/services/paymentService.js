@@ -405,21 +405,50 @@ async function processPayment(payDetails, amountINR, orderNo) {
     throw new Error('Cashfree transfer REVERSED — bank reversed the credit');
   }
 
-  logger.info('Cashfree payout settled', {
+  const isTerminalSuccess = (finalStatus === 'SUCCESS' || finalStatus === 'COMPLETED')
+                            || !!last.transfer_utr;
+
+  logger.info('Cashfree payout poll completed', {
     orderNo,
     transfer_id,
     cf_transfer_id: last.cf_transfer_id || null,
     status:         finalStatus || 'PENDING',
     utr:            last.transfer_utr || '(no UTR yet)',
     amount:         formatINR(amountINR),
+    pending:        !isTerminalSuccess,
   });
 
+  if (isTerminalSuccess) {
+    // Immediate-success path — the caller marks paid + sends PAYMENT_SENT
+    // template with the real UTR. No webhook follow-up needed for the chat.
+    return {
+      payoutId: last.cf_transfer_id ? String(last.cf_transfer_id) : transfer_id,
+      status:   finalStatus || 'SUCCESS',
+      mode:     modeDecision.mode.toUpperCase(),   // IMPS / NEFT / RTGS
+      amount:   amountINR,
+      utr:      last.transfer_utr,
+      pending:  false,
+    };
+  }
+
+  // ── Pending path ──────────────────────────────────────────────────────────
+  // Cashfree accepted the transfer but the partner bank hasn't confirmed
+  // settlement within the 75-sec poll window. We DO NOT fake a UTR or treat
+  // this as success. The caller should:
+  //   1. markOrderAsPaid on Binance (so Binance doesn't auto-cancel us)
+  //   2. Send the "payment is processing — please wait" template
+  //   3. Park the order in WAITING_FOR_RELEASE with paymentPending: true
+  //   4. Let Cashfree's webhook (cashfreeWebhookController) drive the final
+  //      transition: SUCCESS → send real UTR + PAYMENT_SENT template;
+  //      FAILED  → cancel order on Binance + PAYMENT_FAILED template.
   return {
-    payoutId: last.cf_transfer_id ? String(last.cf_transfer_id) : transfer_id,
-    status:   finalStatus || 'PENDING',
-    mode:     modeDecision.mode.toUpperCase(),   // IMPS / NEFT / RTGS
-    amount:   amountINR,
-    utr:      last.transfer_utr || `PEND-${transfer_id}`,
+    payoutId:   transfer_id,            // our deterministic id; cf id arrives via webhook
+    transferId: transfer_id,
+    status:     'PENDING',
+    mode:       modeDecision.mode.toUpperCase(),
+    amount:     amountINR,
+    utr:        null,
+    pending:    true,
   };
 }
 
