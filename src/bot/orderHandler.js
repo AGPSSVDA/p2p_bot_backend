@@ -587,7 +587,27 @@ class OrderHandler {
 
       case ORDER_STATE.PAYMENT_SENT:
       case ORDER_STATE.WAITING_FOR_RELEASE:
-        await this._send(orderNo, MESSAGES.WAIT_RELEASE(order.payMethod));
+        // If Cashfree hasn't confirmed the bank settlement yet
+        // (paymentPending flag set when we entered the pending branch of
+        // _processPaymentFlow), the seller MUST see "payment is processing"
+        // not "payment has already been sent" — the latter is misleading
+        // and gets the seller angry (per real complaints: "i didn't receive
+        // the money" / "noo it's not done" / "I'll report you" while the
+        // bot keeps insisting payment is done).
+        //
+        // Once Cashfree's webhook calls finalizePayoutSuccess(), the flag
+        // is cleared and subsequent seller messages get the standard
+        // WAIT_RELEASE template with the real UTR already in chat history.
+        if (order.paymentPending) {
+          await this._send(orderNo,
+            MESSAGES.PAYMENT_PROCESSING(
+              order.tds,
+              order.paymentMode || order.payMethod
+            )
+          );
+        } else {
+          await this._send(orderNo, MESSAGES.WAIT_RELEASE(order.payMethod));
+        }
         break;
 
       default:
