@@ -4,6 +4,7 @@ const {
   createTemplate,
   getTemplates,
   getTemplateByKey,
+  getTemplateVariables,
   updateTemplate,
   deleteTemplate,
   deleteTemplateGroup
@@ -58,6 +59,23 @@ router.post("/", createTemplate);
  *       403: { description: Admin access required }
  */
 router.get("/", getTemplates);
+
+/**
+ * @swagger
+ * /api/templates/variables:
+ *   get:
+ *     tags: [Templates]
+ *     summary: List all global template variables (the variable palette)
+ *     description: >
+ *       Every variable returned here can be used in ANY template. The bot
+ *       replaces each {token} with the live order value when sending. Use this
+ *       to render a clickable variable list on the Chat Templates page.
+ *     responses:
+ *       200: { description: List of available variables with token, example and description }
+ *       401: { description: Unauthorized }
+ *       403: { description: Admin access required }
+ */
+router.get("/variables", getTemplateVariables);
 
 /**
  * @swagger

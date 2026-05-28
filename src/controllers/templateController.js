@@ -115,6 +115,27 @@ const createTemplate = async (req, res) => {
   }
 };
 
+// Get the list of global template variables (for the frontend variable palette).
+// Every variable here is available in EVERY template — the bot replaces it with
+// the live order value on send. See messageService.TEMPLATE_VARIABLES.
+const getTemplateVariables = async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      message: "Template variables retrieved successfully",
+      data: messageService.TEMPLATE_VARIABLES.map((v) => ({
+        // The exact token the admin types in a template, e.g. "{pan}"
+        token:       `{${v.name}}`,
+        name:        v.name,
+        example:     v.example,
+        description: v.description,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message, data: null });
+  }
+};
+
 // Get All Template Groups
 const getTemplates = async (req, res) => {
   try {
@@ -344,6 +365,7 @@ module.exports = {
   createTemplate,
   getTemplates,
   getTemplateByKey,
+  getTemplateVariables,
   updateTemplate,
   deleteTemplate,
   deleteTemplateGroup

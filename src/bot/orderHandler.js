@@ -1,6 +1,6 @@
 const { stateManager, ORDER_STATE } = require('./stateManager');
-const { MESSAGES }                  = require('./messages');
 const { chatService }               = require('../services/chatService');
+const messageService                = require('../services/messageService');
 const { verifyPAN }                 = require('../services/panService');
 const { processPayment }            = require('../services/paymentService');
 const orderDb                       = require('../services/orderDbService');
@@ -109,10 +109,12 @@ class OrderHandler {
       hasUpi:         !!order.paymentDetails?.upiId,
     });
 
-    // First-time / unverified seller — run the normal welcome + PAN-request flow
-    await this._send(orderNo, MESSAGES.WELCOME(order.sellerNickname, order.amount, order.asset));
+    // First-time / unverified seller — run the normal welcome + PAN-request
+    // flow. Both sections support multiple message blocks (add more in the
+    // Chat Templates page and they all send, in order).
+    await this._sendTpl(orderNo, 'welcome');
     await sleep(1500);
-    await this._send(orderNo, MESSAGES.PAN_REQUEST());
+    await this._sendTpl(orderNo, 'panRequest');
 
     stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN);
     this._startPANTimer(orderNo);
@@ -128,11 +130,22 @@ class OrderHandler {
 
     const tds = calculateTDS(order.amount, config.bot.tdsPercent);
 
-    // Mark as PAN-verified using the historical PAN / name. Persists to DB
-    // via stateManager.set() so the Orders page shows the reused PAN too.
+    // Identity fields come from the verified_sellers ledger (history) for the
+    // PRIOR order, with safe fallbacks. previousOrderNo is the seller's last
+    // completed order (so they see a familiar order # they recognise).
+    const kycName =
+      (history.seller_name || '').trim() ||
+      (history.pan_name    || '').trim() ||
+      (order.sellerName    || '').trim() ||
+      (order.sellerNickname|| '').trim();
+
+    // Mark as PAN-verified using the historical PAN / name AND store
+    // previousOrderNo on the state so _buildVars exposes {previousOrderNo}
+    // (and {pan}/{panName}) to EVERY template for this order.
     stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
-      pan:     history.pan,
-      panName: history.pan_name,
+      pan:             history.pan,
+      panName:         history.pan_name,
+      previousOrderNo: history.order_no,
       tds,
     });
     // Inherit the previous order's name-match status so the Orders detail
@@ -142,63 +155,22 @@ class OrderHandler {
       name_match_compare_source:  'previous_order',
     });
 
-    // Send the multi-block consolidated message (Overview / Approval / Summary).
-    // Identity fields come from the verified_sellers ledger (history) for the
-    // PRIOR order, with safe fallbacks. `previousOrderNo` is the seller's
-    // last completed order (so the seller sees a familiar order # they
-    // recognise from before).
-    const kycName =
-      (history.seller_name || '').trim() ||
-      (history.pan_name    || '').trim() ||
-      (order.sellerName    || '').trim() ||
-      (order.sellerNickname|| '').trim();
-
-    const tplVars = {
-      previousOrderNo: history.order_no,
-      pan:             history.pan,
-      panName:         history.pan_name,
-      kycName,
-      sellerNickname:  history.seller_nickname || order.sellerNickname || null,
-      tds,
-    };
-
-    logger.info('Returning-seller TDS template — substitution vars', {
+    logger.info('Returning-seller TDS — sending consolidated blocks', {
       orderNo,
-      previousOrderNo: tplVars.previousOrderNo || '(none)',
-      kycName:         tplVars.kycName         || '(none)',
-      pan:             tplVars.pan ? maskPAN(tplVars.pan) : '(none)',
-      panName:         tplVars.panName         || '(none)',
-      sellerNickname:  tplVars.sellerNickname  || '(none)',
+      previousOrderNo: history.order_no || '(none)',
+      kycName:         kycName || '(none)',
+      pan:             history.pan ? maskPAN(history.pan) : '(none)',
     });
 
-    const blocks = await MESSAGES.RETURNING_SELLER_TDS(tplVars);
-    logger.info('Returning-seller TDS — block count from DB', {
-      orderNo,
-      blockCount: blocks.length,
-      blockPreviews: blocks.map((b, i) => ({
-        idx:    i + 1,
-        empty:  !b,
-        length: b ? b.length : 0,
-        head:   b ? b.substring(0, 80) : '(empty)',
-      })),
+    // Multi-block consolidated message (Overview / Approval / Summary, plus
+    // any extra blocks the admin added). previousOrderNo is on the state now,
+    // so passing it as an extra is belt-and-suspenders. kycName is overridden
+    // here because the history-derived name is preferred over the live state.
+    await this._sendTplReliable(orderNo, 'returningSellerTdsApplied', {
+      previousOrderNo: history.order_no || '—',
+      kycName:         kycName || 'Customer',
+      sellerNickname:  history.seller_nickname || order.sellerNickname || '—',
     });
-    // Send each block sequentially. Each send is _sendReliable so a single
-    // queued/dropped delivery is retried — important here because missing
-    // block 2 ("Hi {kycName}" + previous order #) breaks the narrative.
-    for (let i = 0; i < blocks.length; i++) {
-      const block = blocks[i];
-      if (!block) {
-        logger.warn('Returning-seller TDS — empty block in template, skipping', {
-          orderNo, blockIndex: i + 1,
-        });
-        continue;
-      }
-      const ok = await this._sendReliable(orderNo, block);
-      logger.info('Returning-seller TDS — block delivery result', {
-        orderNo, blockIndex: i + 1, length: block.length, delivered: ok,
-      });
-      await sleep(1500);
-    }
 
     // Auto-accept TDS consent (they already approved on the prior order)
     stateManager.set(orderNo, ORDER_STATE.TDS_ACCEPTED);
@@ -426,7 +398,7 @@ class OrderHandler {
     });
 
     try {
-      await this._send(orderNo, MESSAGES.ORDER_CANCELLED());
+      await this._sendTpl(orderNo, 'orderCancelled');
     } catch (e) { /* chat may already be down */ }
 
     try {
@@ -487,7 +459,7 @@ class OrderHandler {
     // Image / video / file → can't read, ask for text
     if (msg.type === 'image' || msg.type === 'video' || msg.type === 'file') {
       if (order.state === ORDER_STATE.WAITING_FOR_PAN) {
-        await this._send(orderNo, MESSAGES.PAN_IMAGE_REJECTED());
+        await this._sendTpl(orderNo, 'panImageRejected');
       }
       return;
     }
@@ -582,7 +554,7 @@ class OrderHandler {
       case ORDER_STATE.PROCESSING_PAYMENT:
       case ORDER_STATE.AWAITING_MANUAL_PAYMENT:
       case ORDER_STATE.VALIDATING_PAN:
-        await this._send(orderNo, MESSAGES.WAIT_PROCESSING());
+        await this._sendTpl(orderNo, 'waitProcessing');
         break;
 
       case ORDER_STATE.PAYMENT_SENT:
@@ -597,21 +569,16 @@ class OrderHandler {
         //
         // Once Cashfree's webhook calls finalizePayoutSuccess(), the flag
         // is cleared and subsequent seller messages get the standard
-        // WAIT_RELEASE template with the real UTR already in chat history.
+        // waitRelease template with the real UTR already in chat history.
         if (order.paymentPending) {
-          await this._send(orderNo,
-            MESSAGES.PAYMENT_PROCESSING(
-              order.tds,
-              order.paymentMode || order.payMethod
-            )
-          );
+          await this._sendTpl(orderNo, 'paymentProcessing');
         } else {
-          await this._send(orderNo, MESSAGES.WAIT_RELEASE(order.payMethod));
+          await this._sendTpl(orderNo, 'waitRelease');
         }
         break;
 
       default:
-        await this._send(orderNo, MESSAGES.PAN_NOT_FOUND());
+        await this._sendTpl(orderNo, 'panNotFound');
     }
   }
 
@@ -620,7 +587,7 @@ class OrderHandler {
     const pan = extractPAN(text);
 
     if (!pan) {
-      await this._send(orderNo, MESSAGES.PAN_NOT_FOUND());
+      await this._sendTpl(orderNo, 'panNotFound');
       return;
     }
 
@@ -638,15 +605,15 @@ class OrderHandler {
 
         if (retries >= config.bot.maxPanRetries) {
           this._clearPANTimers(orderNo);
-          await this._send(orderNo, MESSAGES.PAN_MAX_RETRIES());
+          await this._sendTpl(orderNo, 'panMaxRetries');
           await this._escalate(orderNo, `Max PAN retries (${retries})`);
         } else {
           stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN);
           // Route by failure source so seller sees the most actionable message
           if (result.source === 'format') {
-            await this._send(orderNo, MESSAGES.PAN_INVALID_FORMAT());
+            await this._sendTpl(orderNo, 'panInvalidFormat');
           } else {
-            await this._send(orderNo, MESSAGES.PAN_API_INVALID(result.reason));
+            await this._sendTpl(orderNo, 'panApiInvalid', { reason: result.reason || '' });
           }
         }
         return;
@@ -804,17 +771,20 @@ class OrderHandler {
               // stays responsive — it doesn't escalate unless the seller
               // burns through maxPanRetries first. Same retry mechanic the
               // PAN-format / Surepass-invalid branches above use.
-              await this._send(orderNo, MESSAGES.NAME_MISMATCH({
+              // panName / kycName / accountName are passed as extras because
+              // they're the freshly-computed values from this verification
+              // attempt (the order state doesn't have panName yet).
+              await this._sendTpl(orderNo, 'nameMismatch', {
                 panName,
                 kycName:     kycUsable ? kycName : '—',
                 accountName: accountName || '—',
                 mismatchedSources,
-              }));
+              });
 
               const retries = stateManager.incPanRetry(orderNo);
               if (retries >= config.bot.maxPanRetries) {
                 this._clearPANTimers(orderNo);
-                await this._send(orderNo, MESSAGES.PAN_MAX_RETRIES());
+                await this._sendTpl(orderNo, 'panMaxRetries');
                 await this._escalate(orderNo,
                   `Name mismatch + max retries (${retries}): PAN="${panName}" vs [${failed.map((c) => `${c.label}="${c.compareName}" (${c.reason})`).join(', ')}]`
                 );
@@ -864,22 +834,16 @@ class OrderHandler {
         pan, tds, panName: result.name || null,
       });
 
-      await this._send(orderNo, MESSAGES.PAN_VERIFIED_TDS(pan, tds, result.name));
+      // pan / panName / TDS amounts are now on the order state, so _buildVars
+      // exposes them to every template below — no per-call vars needed.
+      await this._sendTpl(orderNo, 'panVerifiedTds');
       await sleep(1500);
 
-      // tdsInfo is multi-block: send each variation the admin added in
-      // the Chat Templates page (every block gets {tds}/{quarter}/etc.
-      // substituted from the same vars map). Use _sendReliable so a
-      // transient WSS hiccup doesn't drop a block mid-sequence.
-      const tdsInfoBlocks = await MESSAGES.TDS_INFO(tds);
-      for (let i = 0; i < tdsInfoBlocks.length; i++) {
-        const block = tdsInfoBlocks[i];
-        if (!block) continue;
-        await this._sendReliable(orderNo, block);
-        await sleep(1200);
-      }
+      // tdsInfo is multi-block: every variation the admin added in the Chat
+      // Templates page is sent in order ({tds}/{quarter}/etc. all filled).
+      await this._sendTplReliable(orderNo, 'tdsInfo');
 
-      await this._send(orderNo, MESSAGES.TDS_CONSENT(tds));
+      await this._sendTpl(orderNo, 'tdsConsent');
 
       stateManager.set(orderNo, ORDER_STATE.WAITING_TDS_CONSENT);
 
@@ -890,19 +854,19 @@ class OrderHandler {
       // retry once the verification system recovers.
       logger.error('PAN verification system error', { orderNo, error: err.message });
       stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN);
-      await this._send(orderNo, MESSAGES.PAN_API_DOWN());
+      await this._sendTpl(orderNo, 'panApiDown');
     }
   }
 
   // ── Handle TDS consent ────────────────────────────────────────────────────
   async _handleTDSConsent(orderNo, text) {
     if (!isAgreementMessage(text)) {
-      await this._send(orderNo, MESSAGES.TDS_CONSENT_RETRY());
+      await this._sendTpl(orderNo, 'tdsConsentRetry');
       return;
     }
 
     stateManager.set(orderNo, ORDER_STATE.TDS_ACCEPTED);
-    await this._send(orderNo, MESSAGES.CONSENT_RECEIVED());
+    await this._sendTpl(orderNo, 'consentReceived');
     await sleep(1000);
     await this._processPaymentFlow(orderNo);
   }
@@ -945,19 +909,19 @@ class OrderHandler {
         //   above_limit  → amount exceeds the auto-pay cap
         //   upi_only     → seller gave UPI only (Cashfree wallet can't pay UPI)
         //   else         → generic "payment is being prepared"
+        // paymentDetails (account/upi/method) are on the state now, and
+        // {postTDS}/{method} come from _buildVars. above_limit needs {limit}
+        // and an {amount} that means the post-TDS payable (not the full
+        // order amount), so both are passed as formatted extras.
         if (result.reason === 'above_limit') {
-          await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_ABOVE_LIMIT({
-            amount: order.tds.postTDS,
-            limit:  result.cap || config.bot.maxPaymentAmount,
-            method: payDetails.methodName,
-          }));
+          await this._sendTpl(orderNo, 'manualPaymentAboveLimit', {
+            amount: messageService.inr(order.tds.postTDS),
+            limit:  messageService.inr(result.cap || config.bot.maxPaymentAmount),
+          });
         } else if (result.reason === 'upi_only') {
-          await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_UPI({
-            upi:     payDetails.upiId,
-            postTDS: order.tds.postTDS,
-          }));
+          await this._sendTpl(orderNo, 'manualPaymentUpi');
         } else {
-          await this._send(orderNo, MESSAGES.MANUAL_PAYMENT_PENDING(order.tds, payDetails.methodName));
+          await this._sendTpl(orderNo, 'manualPaymentPending');
         }
 
         logger.warn('Manual payment required', {
@@ -1010,9 +974,9 @@ class OrderHandler {
           });
         }
 
-        await this._send(orderNo,
-          MESSAGES.PAYMENT_PROCESSING(order.tds, result.mode)
-        );
+        // method passed explicitly so {method} shows the Cashfree mode
+        // (IMPS/NEFT/RTGS) chosen for THIS transfer.
+        await this._sendTpl(orderNo, 'paymentProcessing', { method: result.mode });
 
         stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_RELEASE, {
           paymentPending: true,
@@ -1058,14 +1022,12 @@ class OrderHandler {
         logger.error('Payout sent but markOrderAsPaid FAILED — manual mark required', { orderNo });
       }
 
-      await this._send(orderNo,
-        MESSAGES.PAYMENT_SENT(
-          order.tds,
-          result.mode,
-          result.utr,
-          config.bot.tan
-        )
-      );
+      // method + utr passed explicitly so {method} reflects the Cashfree
+      // transfer mode and {utr} the real UTR (both also on the state now).
+      await this._sendTpl(orderNo, 'paymentSent', {
+        method: result.mode,
+        utr:    result.utr,
+      });
 
       stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_RELEASE);
 
@@ -1079,7 +1041,7 @@ class OrderHandler {
     } catch (err) {
       logger.error('Payment flow error', { orderNo, error: err.message });
       stateManager.set(orderNo, ORDER_STATE.FAILED);
-      await this._send(orderNo, MESSAGES.PAYMENT_FAILED());
+      await this._sendTpl(orderNo, 'paymentFailed');
 
       // Cashfree returned a HARD failure (FAILED / REJECTED / REVERSED) on
       // the initial poll → cancel the order on Binance per business rule.
@@ -1154,14 +1116,10 @@ class OrderHandler {
 
     const effectiveMode = mode || order.paymentMode || 'IMPS';
 
-    await this._sendReliable(orderNo,
-      MESSAGES.PAYMENT_SENT(
-        order.tds,
-        effectiveMode,
-        realUtr,
-        config.bot.tan
-      )
-    );
+    await this._sendTplReliable(orderNo, 'paymentSent', {
+      method: effectiveMode,
+      utr:    realUtr,
+    });
 
     logger.info('Pending payout FINALIZED as SUCCESS', {
       orderNo,
@@ -1195,7 +1153,7 @@ class OrderHandler {
       orderNo, reason,
     });
 
-    await this._sendReliable(orderNo, MESSAGES.PAYMENT_FAILED());
+    await this._sendTplReliable(orderNo, 'paymentFailed');
 
     // We DELIBERATELY skip canCancelOrder here. After markOrderAsPaid (which
     // we called when the pending branch fired in _processPaymentFlow), the
@@ -1265,7 +1223,7 @@ class OrderHandler {
       this._clearCancelTimer(orderNo);
       this._clearPANTimers(orderNo);
       // Send a polite goodbye before disconnecting (chat may still be live)
-      await this._send(orderNo, MESSAGES.ORDER_CANCELLED_REMOTE());
+      await this._sendTpl(orderNo, 'orderCancelledRemote');
       chatService.disconnect(orderNo);
       return;
     }
@@ -1304,14 +1262,14 @@ class OrderHandler {
       const o = stateManager.get(orderNo);
       if (!o || o.state !== ORDER_STATE.WAITING_FOR_PAN) return;
       stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN, { reminderSent: true });
-      await this._send(orderNo, MESSAGES.PAN_REMINDER());
+      await this._sendTpl(orderNo, 'panReminder');
     }, reminderMs);
 
     const lastWarningTimer = setTimeout(async () => {
       const o = stateManager.get(orderNo);
       if (!o || o.state !== ORDER_STATE.WAITING_FOR_PAN) return;
       stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN, { lastWarningSent: true });
-      await this._send(orderNo, MESSAGES.PAN_LAST_WARNING());
+      await this._sendTpl(orderNo, 'panLastWarning');
     }, lastWarningMs);
 
     const cancelTimer = setTimeout(async () => {
@@ -1339,15 +1297,16 @@ class OrderHandler {
   async _escalate(orderNo, reason) {
     logger.warn('Order escalated', { orderNo, reason });
     stateManager.set(orderNo, ORDER_STATE.ESCALATED);
-    await this._send(orderNo, MESSAGES.ESCALATED());
+    await this._sendTpl(orderNo, 'escalated');
     this._clearCancelTimer(orderNo);
     this._clearPANTimers(orderNo);
     chatService.disconnect(orderNo);
   }
 
   // ── Send chat message helper ──────────────────────────────────────────────
-  //  Accepts a string OR Promise<string> so callers can pass MESSAGES.X()
-  //  directly (they're DB-backed and async now).
+  //  Low-level single-message send. Accepts a string OR Promise<string>.
+  //  Most callers should use _sendTpl / _sendTplReliable (which render a
+  //  template key with the global var map and handle multi-block sends).
   //
   //  Returns true ONLY when chatService confirms the message actually went
   //  out over the live WSS. A queued/dropped send returns false so the
@@ -1406,6 +1365,122 @@ class OrderHandler {
     return false;
   }
 
+  // ── Build the GLOBAL template variable map for an order ───────────────────
+  //  Every template (welcome, panRequest, paymentSent, a custom one — any of
+  //  them) is rendered with this same comprehensive var map, so an admin can
+  //  use {pan}, {utr}, {tds}, {method}, etc. in ANY template and it gets the
+  //  real value. Keep the keys here in exact sync with
+  //  messageService.TEMPLATE_VARIABLES (the frontend variable palette).
+  //
+  //  `extras` always wins — used for values computed at the call site that
+  //  aren't (yet) on the order state, e.g. a name-mismatch source list or a
+  //  PAN-failure reason string.
+  _buildVars(orderNo, extras = {}) {
+    const order = stateManager.get(orderNo) || {};
+    const tds   = order.tds || {};
+    const pd    = order.paymentDetails || {};
+    const realUtr = order.utr && !String(order.utr).startsWith('PEND-')
+      ? order.utr
+      : '';
+
+    return {
+      // Identity
+      sellerName:      (order.sellerName || order.sellerNickname || 'Customer'),
+      sellerNickname:  (order.sellerNickname || ''),
+      kycName:         (order.sellerName || order.panName || order.sellerNickname || 'Customer'),
+      orderNo:         String(orderNo),
+      previousOrderNo: (order.previousOrderNo || '—'),
+
+      // Amounts
+      amount:          messageService.inr(order.amount),
+      cryptoAmount:    (order.cryptoAmount != null ? String(order.cryptoAmount) : ''),
+      asset:           (order.asset || 'USDT'),
+      fiat:            (order.fiat || 'INR'),
+
+      // PAN
+      pan:             (order.pan || '—'),
+      panName:         (order.panName || '—'),
+
+      // TDS amounts (formatted)
+      preTDS:          messageService.inr(tds.preTDS),
+      tds:             messageService.inr(tds.tds),
+      postTDS:         messageService.inr(tds.postTDS),
+
+      // Payment
+      method:          (order.paymentMode || order.payMethod || pd.methodName || 'Bank Transfer'),
+      upi:             (pd.upiId || '—'),
+      accountNo:       (pd.accountNo || ''),
+      ifsc:            (pd.ifscCode || ''),
+      bankName:        (pd.bankName || ''),
+      accountName:     (pd.accountName || '—'),
+      utr:             realUtr,
+      tan:             (config.bot.tan || ''),
+
+      // TDS timing (quarter / creditMonth / visibleMonth / year)
+      ...messageService.tdsInfoVars(tds),
+
+      // Call-site overrides
+      ...extras,
+    };
+  }
+
+  // ── Render + send a template by key with the GLOBAL var map ───────────────
+  //  Sends EVERY message block configured for the key (multi-template
+  //  support: add 1..N messages to any section in the Chat Templates page and
+  //  they all go out, in step_order, with a short delay between each).
+  //
+  //  Returns true if all non-empty blocks were delivered.
+  async _sendTpl(orderNo, templateKey, extras = {}) {
+    const vars = this._buildVars(orderNo, extras);
+    let blocks;
+    try {
+      blocks = await messageService.getAll(templateKey, vars);
+    } catch (err) {
+      logger.error('Template render failed', { orderNo, templateKey, error: err.message });
+      return false;
+    }
+    if (!blocks || !blocks.length) {
+      logger.warn('Template has no message blocks in DB', { orderNo, templateKey });
+      return false;
+    }
+    let allOk = true;
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      if (!block) continue;
+      const ok = await this._send(orderNo, block);
+      if (!ok) allOk = false;
+      if (i < blocks.length - 1) await sleep(1200);
+    }
+    return allOk;
+  }
+
+  // ── Same as _sendTpl but each block is retried (critical templates) ───────
+  //  Used for paymentSent / paymentFailed / thankYou / returning-seller where
+  //  a dropped block mid-sequence would break the conversation.
+  async _sendTplReliable(orderNo, templateKey, extras = {}) {
+    const vars = this._buildVars(orderNo, extras);
+    let blocks;
+    try {
+      blocks = await messageService.getAll(templateKey, vars);
+    } catch (err) {
+      logger.error('Template render failed', { orderNo, templateKey, error: err.message });
+      return false;
+    }
+    if (!blocks || !blocks.length) {
+      logger.warn('Template has no message blocks in DB', { orderNo, templateKey });
+      return false;
+    }
+    let allOk = true;
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      if (!block) continue;
+      const ok = await this._sendReliable(orderNo, block);
+      if (!ok) allOk = false;
+      if (i < blocks.length - 1) await sleep(1200);
+    }
+    return allOk;
+  }
+
   // ── Trade complete — Req #6: configurable thank-you ───────────────────────
   async complete(orderNo) {
     const order = stateManager.get(orderNo);
@@ -1414,17 +1489,11 @@ class OrderHandler {
 
     stateManager.set(orderNo, ORDER_STATE.COMPLETED);
 
-    // Send all thank-you blocks the admin configured (up to 5 variations
-    // in the Chat Templates page). Old behaviour was just texts[0]; now
-    // every step_order entry fires sequentially with a small delay so they
-    // arrive as separate chat messages instead of one merged one.
-    const blocks = await MESSAGES.THANK_YOU(order.asset, order.cryptoAmount, orderNo);
-    for (let i = 0; i < blocks.length; i++) {
-      const block = blocks[i];
-      if (!block) continue;
-      await this._sendReliable(orderNo, block);
-      await sleep(1200);
-    }
+    // Send all thank-you blocks the admin configured (any number of
+    // variations in the Chat Templates page) — each fires sequentially with
+    // a short delay. {asset}/{cryptoAmount}/{orderNo} (and every other
+    // global var) are available.
+    await this._sendTplReliable(orderNo, 'thankYou');
 
     this._clearCancelTimer(orderNo);
     this._clearPANTimers(orderNo);

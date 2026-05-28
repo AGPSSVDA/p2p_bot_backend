@@ -95,6 +95,63 @@ function inr(n) {
   return num.toLocaleString("en-IN", { maximumFractionDigits: 2 });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  GLOBAL TEMPLATE VARIABLES
+//
+//  Every variable below is available in EVERY template. The bot fills them
+//  from the live order state on each send (see orderHandler._buildVars), so an
+//  admin can use {pan}, {utr}, {tds}, etc. in ANY template — welcome, thankYou,
+//  paymentSent, a custom one — and it will be replaced with the real value.
+//
+//  The frontend "Chat Templates" page reads this list (GET
+//  /api/templates/variables) to show a clickable variable palette. Keep the
+//  names here in exact sync with the keys produced by orderHandler._buildVars.
+// ─────────────────────────────────────────────────────────────────────────────
+const TEMPLATE_VARIABLES = [
+  // Identity
+  { name: "sellerName",      example: "RAHUL SHARMA",        description: "Seller's Binance KYC / real name" },
+  { name: "sellerNickname",  example: "rahul_p2p",           description: "Seller's Binance public nickname" },
+  { name: "kycName",         example: "RAHUL SHARMA",        description: "Seller's KYC name (falls back to nickname)" },
+  { name: "orderNo",         example: "22899…1772416",       description: "Binance order number" },
+  { name: "previousOrderNo", example: "22891…5171772",       description: "Returning seller's previous completed order number" },
+
+  // Amounts
+  { name: "amount",          example: "242.27",              description: "Order fiat amount (₹), before TDS" },
+  { name: "cryptoAmount",    example: "2.85",                description: "Crypto quantity for the order" },
+  { name: "asset",           example: "USDT",                description: "Crypto asset (USDT / BTC / …)" },
+  { name: "fiat",            example: "INR",                 description: "Fiat currency" },
+
+  // PAN
+  { name: "pan",             example: "ABCDE1234F",          description: "Verified PAN number" },
+  { name: "panName",         example: "RAHUL SHARMA",        description: "Name as registered on the PAN" },
+
+  // TDS amounts
+  { name: "preTDS",          example: "242.27",              description: "Amount before TDS (₹)" },
+  { name: "tds",             example: "2.42",                description: "TDS amount deducted, 1% (₹)" },
+  { name: "postTDS",         example: "239.85",              description: "Amount seller receives after TDS (₹)" },
+
+  // Payment
+  { name: "method",          example: "IMPS",                description: "Payment method / mode (IMPS / NEFT / RTGS / Bank Transfer)" },
+  { name: "upi",             example: "rahul@okhdfc",        description: "Seller's UPI ID (if provided)" },
+  { name: "accountNo",       example: "50100xxxxxx123",      description: "Seller's bank account number" },
+  { name: "ifsc",            example: "HDFC0001234",         description: "Seller's bank IFSC code" },
+  { name: "bankName",        example: "HDFC Bank",           description: "Seller's bank name" },
+  { name: "accountName",     example: "RAHUL SHARMA",        description: "Seller's bank account holder name" },
+  { name: "utr",             example: "614518906536",        description: "Payment UTR / bank reference number" },
+  { name: "tan",             example: "DELA12345B",          description: "Company TAN (for TDS deposit)" },
+
+  // TDS timing (computed)
+  { name: "quarter",         example: "Apr–Jun",             description: "Current TDS quarter" },
+  { name: "creditMonth",     example: "Jul",                 description: "Month the TDS credit appears" },
+  { name: "visibleMonth",    example: "Aug",                 description: "Month TDS becomes visible on Form 26AS" },
+  { name: "year",            example: "2026",                description: "Current year" },
+
+  // Situational (only meaningful in specific templates, blank elsewhere)
+  { name: "reason",          example: "PAN inactive",        description: "Failure reason (PAN-invalid template)" },
+  { name: "mismatchedSources", example: "Binance KYC, Bank Holder", description: "Which name sources didn't match (name-mismatch template)" },
+  { name: "limit",           example: "100000",              description: "Max auto-pay limit (₹) (above-limit template)" },
+];
+
 // ── Compute the TDS_INFO quarter/credit/visible placeholders ─────────────────
 function tdsInfoVars(tds) {
   const now = new Date();
@@ -123,4 +180,5 @@ module.exports = {
   fill,
   inr,
   tdsInfoVars,
+  TEMPLATE_VARIABLES,
 };

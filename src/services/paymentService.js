@@ -344,11 +344,20 @@ async function processPayment(payDetails, amountINR, orderNo) {
     ...modeDecision.snapshot,
   });
 
+  // transfer_remarks carries the Binance order number so the payout is
+  // traceable back to its order from the Cashfree dashboard / statements.
+  // Cashfree restricts remarks to alphanumerics, spaces and a few symbols
+  // and caps length, so sanitise + truncate.
+  const transferRemarks = `Order ${String(orderNo)}`
+    .replace(/[^A-Za-z0-9 ]/g, '')
+    .slice(0, 70);
+
   const transferPayload = {
     transfer_id,
     transfer_amount:   Number(amountINR),
     transfer_currency: 'INR',
     transfer_mode:     modeDecision.mode,
+    transfer_remarks:  transferRemarks,
     beneficiary_details: { beneficiary_id: effectiveBeneficiaryId },
     ...(config.cashfree.defaultFundsourceId
       ? { fundsource_id: config.cashfree.defaultFundsourceId }
