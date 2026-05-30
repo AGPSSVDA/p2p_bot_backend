@@ -18,11 +18,14 @@ const logger = require('../utils/logger');
 //  Behaviour:
 //    1. If no Cashfree credentials configured → manual fallback.
 //    2. If `auto_payout` toggle on bot_config is OFF → manual fallback.
-//    3. If amount > MAX_PAYMENT_AMOUNT safety cap → manual fallback.
-//    4. If seller did NOT provide a bank account (UPI-only) → manual
+//    3. If seller did NOT provide a bank account (UPI-only) → manual
 //       fallback. Cashfree disabled UPI wallet payouts platform-wide.
+//    4. If account / IFSC / holder-name fail format checks → manual
+//       fallback (Cashfree would reject them anyway).
 //    5. Otherwise: create beneficiary (with conflict resolution), initiate
-//       transfer (IMPS by default), poll for terminal status / UTR.
+//       transfer (IMPS / NEFT / RTGS chosen by amount + bot_config limits,
+//       no upper amount cap — RTGS handles arbitrarily large transfers),
+//       poll for terminal status.
 //
 //  Determinism / idempotency:
 //    - beneficiary_id is hashed from (account_no + IFSC) — repeat payments
@@ -222,16 +225,15 @@ async function processPayment(payDetails, amountINR, orderNo) {
     return manual('toggle_off', amountINR, payDetails);
   }
 
-  // Gate 3 — safety amount cap. Per business rule, anything above this
-  // is paid out manually by the buyer team. Seller is told this explicitly.
-  if (amountINR > config.bot.maxPaymentAmount) {
-    logger.warn('Amount above auto-pay cap — manual payout by buyer', {
-      orderNo, amountINR, cap: config.bot.maxPaymentAmount,
-    });
-    return manual('above_limit', amountINR, payDetails, {
-      cap: config.bot.maxPaymentAmount,
-    });
-  }
+  // No upper-amount cap. Per business rule:
+  //   • amount  <  imps_max_amount           → IMPS
+  //   • amount  ∈  [imps_max, neft_max)      → NEFT
+  //   • amount  ≥  neft_max                  → RTGS (handles any size)
+  //
+  // RTGS clears any amount Cashfree will accept, so falling back to manual
+  // just because the amount is "large" is wrong. chooseTransferMode() below
+  // picks the right method; Cashfree itself rejects only if the bank
+  // returns an error (handled in the post-poll catch).
   if (!(amountINR > 0)) {
     throw new Error(`Invalid amount: ${amountINR}`);
   }

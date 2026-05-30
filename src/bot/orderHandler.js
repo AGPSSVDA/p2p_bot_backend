@@ -906,19 +906,13 @@ class OrderHandler {
         orderDb.recordPayoutPending(stateManager.get(orderNo));
 
         // Pick the right message based on WHY auto-payment was skipped:
-        //   above_limit  → amount exceeds the auto-pay cap
-        //   upi_only     → seller gave UPI only (Cashfree wallet can't pay UPI)
-        //   else         → generic "payment is being prepared"
-        // paymentDetails (account/upi/method) are on the state now, and
-        // {postTDS}/{method} come from _buildVars. above_limit needs {limit}
-        // and an {amount} that means the post-TDS payable (not the full
-        // order amount), so both are passed as formatted extras.
-        if (result.reason === 'above_limit') {
-          await this._sendTpl(orderNo, 'manualPaymentAboveLimit', {
-            amount: messageService.inr(order.tds.postTDS),
-            limit:  messageService.inr(result.cap || config.bot.maxPaymentAmount),
-          });
-        } else if (result.reason === 'upi_only') {
+        //   upi_only → seller gave UPI only (Cashfree wallet can't pay UPI)
+        //   else     → generic "payment is being prepared" (no_credentials /
+        //              toggle_off / bad_name / bad_ifsc / bad_account)
+        // There is no "above_limit" branch any more — IMPS/NEFT/RTGS in
+        // bot_config cover every amount band, so a large transfer routes to
+        // RTGS instead of falling back to manual.
+        if (result.reason === 'upi_only') {
           await this._sendTpl(orderNo, 'manualPaymentUpi');
         } else {
           await this._sendTpl(orderNo, 'manualPaymentPending');

@@ -80,7 +80,10 @@ const config = {
     panTimeoutMs:           parseInt(process.env.PAN_TIMEOUT_MS,           10) || 600000,
     panReminderMs:          parseInt(process.env.PAN_REMINDER_MS,          10) || 300000,
     maxPanRetries:          parseInt(process.env.MAX_PAN_RETRIES,          10) || 3,
-    maxPaymentAmount:       parseInt(process.env.MAX_PAYMENT_AMOUNT,       10) || 50000,
+    // NOTE: the old MAX_PAYMENT_AMOUNT env cap was removed in favour of a
+    // dynamically-derived hard cap (neft_max_amount × 50) inside
+    // paymentService. The IMPS/NEFT/RTGS limits on the Payments page are now
+    // the only source of truth for payment limits — no env override needed.
     tdsPercent:             parseFloat(process.env.TDS_PERCENT)               || 1,
     tan:                    process.env.TAN || 'JDHT04147D',
 
