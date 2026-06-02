@@ -23,6 +23,30 @@ function maskPan(p) {
   return `${p.slice(0, 3)}XX${p.slice(5, 9)}X`;
 }
 
+// Pick the most reliable "real order date" for an orders row.
+//
+//   Priority:
+//     1. order_created_at      — REAL Binance order creation time,
+//                                populated by sync from raw.createTime
+//                                (backfilled from notify_pay_end_time − 15
+//                                min for legacy rows).
+//     2. notify_pay_end_time   — Binance's payment deadline (~15 min after
+//                                creation). Real Binance timestamp.
+//     3. confirm_pay_end_time  — slightly later Binance deadline, also real.
+//     4. completed_at / cancelled_at / escalated_at — fallback for rare
+//                                rows where everything else is missing.
+//                                May be a sync-time fake on old data.
+//     5. created_at            — DB row insertion (absolute last resort).
+function deriveOrderDate(r) {
+  if (r.order_created_at)     return r.order_created_at;
+  if (r.notify_pay_end_time)  return r.notify_pay_end_time;
+  if (r.confirm_pay_end_time) return r.confirm_pay_end_time;
+  if (r.completed_at)         return r.completed_at;
+  if (r.cancelled_at)         return r.cancelled_at;
+  if (r.escalated_at)         return r.escalated_at;
+  return r.created_at;
+}
+
 // ── GET /api/orders ──────────────────────────────────────────────────────────
 //   Query params:
 //     page (default 1), limit (default 50, max 200)
@@ -75,14 +99,27 @@ async function listOrders(req, res) {
     );
     const total = Number(countRow[0]?.total) || 0;
 
+    // Sort by the REAL Binance order date (canonical priority chain matches
+    // deriveOrderDate). Newest orders first.
     const [rows] = await pool.query(
-      `SELECT * FROM orders ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      `SELECT * FROM orders ${whereSql}
+         ORDER BY COALESCE(order_created_at, notify_pay_end_time, confirm_pay_end_time,
+                           completed_at, cancelled_at, escalated_at, created_at) DESC,
+                  id DESC
+         LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
 
     const orders = rows.map((r) => ({
       id: `ORD-${String(r.id).padStart(5, "0")}`,
+      // order_id is the Binance order number too (mirror of order_no, kept
+      // for backward-compat with older frontend/integrations that read it).
+      order_id: r.order_id || r.order_no,
       order_no: r.order_no,
+      // ONE canonical "real order date" — use this for display. The
+      // individual *_at columns below are still returned for back-compat
+      // but most of the time order_date is what you want to show.
+      order_date: deriveOrderDate(r),
       adv_no: r.adv_no,
       asset: r.asset,
       fiat: r.fiat,

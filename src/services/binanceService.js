@@ -65,7 +65,10 @@ async function getPendingOrders() {
 //   (1 = wait payment, 2 = wait release, 3 = appealing, 4 = completed,
 //   6 = cancelled by user, 7 = cancelled by system). Use for backfill /
 //   completion reconciliation.
-async function getOrdersByStatus(statuses, { page = 1, rows = 50, tradeType = 'BUY' } = {}) {
+async function getOrdersByStatus(
+  statuses,
+  { page = 1, rows = 50, tradeType = 'BUY', sinceDays = 90 } = {}
+) {
   if (!Array.isArray(statuses) || statuses.length === 0) {
     statuses = [
       ORDER_STATUS.WAIT_PAYMENT,
@@ -76,6 +79,13 @@ async function getOrdersByStatus(statuses, { page = 1, rows = 50, tradeType = 'B
       ORDER_STATUS.SYS_CANCELLED,
     ];
   }
+  // Rolling lookback window — default last 90 days (~3 months). Stops
+  // listOrders from returning years of historical CANCELLED orders that
+  // would otherwise bloat the DB. Callers can override sinceDays (or pass
+  // 0 / Infinity to disable the filter for a one-off full backfill).
+  const startTimestamp = (sinceDays && Number.isFinite(sinceDays))
+    ? Date.now() - (Number(sinceDays) * 86_400_000)
+    : null;
   return withRetry(async () => {
     const qs = buildSignedQuery({});
     const body = {
@@ -83,6 +93,7 @@ async function getOrdersByStatus(statuses, { page = 1, rows = 50, tradeType = 'B
       tradeType,
       page,
       rows,
+      ...(startTimestamp ? { startTimestamp, endTimestamp: Date.now() } : {}),
     };
     const res = await axios.post(
       `${url(config.binance.endpoints.listOrders)}?${qs}`,

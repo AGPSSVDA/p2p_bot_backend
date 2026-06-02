@@ -762,13 +762,70 @@ async function initMysql() {
       // payment). MANUAL = order existed on Binance and was pulled in via the
       // sync without the bot's live flow ever touching it.
       { name: 'processed_by',               def: "VARCHAR(16) NOT NULL DEFAULT 'BOT'" },
+      // The REAL Binance order creation time — independent of created_at
+      // (which is the DB row insertion moment). Populated from Binance's
+      // raw.createTime on every sync, with notify_pay_end_time − 15 min as
+      // a fallback for rows where Binance didn't return createTime.
+      // ALL date displays on the dashboard / TDS view should prefer this.
+      { name: 'order_created_at',           def: 'DATETIME NULL' },
       { name: 'created_at',                 def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
       { name: 'updated_at',                 def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP' },
     ]);
     await ensureIndex(connection, 'orders', 'idx_orders_state', 'state');
     await ensureIndex(connection, 'orders', 'idx_orders_processed_by', 'processed_by');
     await ensureIndex(connection, 'orders', 'idx_orders_created', 'created_at');
+    await ensureIndex(connection, 'orders', 'idx_orders_order_created', 'order_created_at');
     await ensureIndex(connection, 'orders', 'idx_orders_adv', 'adv_no');
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CRITICAL: enforce UNIQUE on orders.order_no
+    //
+    // The CREATE TABLE above defines order_no as UNIQUE NOT NULL, but legacy
+    // installs that had the orders table BEFORE order_no was introduced got
+    // the column added via ensureColumns WITHOUT the UNIQUE constraint.
+    // Without UNIQUE, INSERT ... ON DUPLICATE KEY UPDATE in the upsert paths
+    // doesn't fire, so every sync creates a NEW row instead of refreshing
+    // the existing one. Result: thousands of duplicates per order_no.
+    //
+    // Step 1: dedupe — for each order_no with > 1 row, keep the smallest id
+    //         (the first/oldest row, typically the BOT-handled live row).
+    // Step 2: add the unique index if missing.
+    // ──────────────────────────────────────────────────────────────────────
+    try {
+      const [uniqIdx] = await connection.query(
+        `SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME   = 'orders'
+            AND COLUMN_NAME  = 'order_no'
+            AND NON_UNIQUE   = 0`
+      );
+      if (uniqIdx.length === 0) {
+        // Dedupe first (a duplicate key error from ALTER TABLE would block the
+        // schema fix). Wrapped subquery dodges MySQL's "Can't specify target
+        // table for update in FROM clause" restriction.
+        const [del] = await connection.query(`
+          DELETE FROM orders
+           WHERE order_no IS NOT NULL
+             AND id NOT IN (
+               SELECT keeper FROM (
+                 SELECT MIN(id) AS keeper
+                   FROM orders
+                  WHERE order_no IS NOT NULL
+                  GROUP BY order_no
+               ) t
+             )
+        `);
+        if (del && del.affectedRows > 0) {
+          console.log(`   • removed ${del.affectedRows} duplicate orders rows (same order_no)`);
+        }
+        await connection.query(
+          `ALTER TABLE orders ADD UNIQUE INDEX uq_orders_order_no (order_no)`
+        );
+        console.log(`   • added UNIQUE INDEX on orders.order_no — sync upserts will now deduplicate correctly`);
+      }
+    } catch (e) {
+      console.error(`   ✗ failed to enforce UNIQUE on orders.order_no: ${e.message}`);
+    }
 
     // Relax any legacy NOT NULL columns that pre-date the current schema so
     // new inserts (which don't know about them) don't fail with
@@ -785,6 +842,92 @@ async function initMysql() {
       'name_match_score',
     ]) {
       await relaxColumnToNullable(connection, 'orders', col);
+    }
+
+    // One-time backfill: mirror order_no into the legacy order_id column
+    // for any existing rows where it's NULL. Idempotent — re-running this
+    // is a no-op once all rows have order_id populated. The bot's upsert
+    // paths also set order_id on every new insert, so this catches the
+    // historical 40k+ synced rows that were inserted before the mirror.
+    try {
+      const [r] = await connection.query(
+        `UPDATE orders SET order_id = order_no
+           WHERE order_id IS NULL AND order_no IS NOT NULL`
+      );
+      if (r && r.affectedRows > 0) {
+        console.log(`   • backfilled order_id from order_no on ${r.affectedRows} legacy rows`);
+      }
+    } catch (e) {
+      // Column may not exist on very-new installs (CREATE TABLE doesn't
+      // include order_id) — that's fine, nothing to backfill.
+    }
+
+    // One-time data cleanup: NULL out terminal timestamps that were stamped
+    // with Date.now() (the sync moment) by a prior bug. We detect them by
+    // their proximity to created_at (within 5 sec) — real Binance
+    // completion / cancellation times are NEVER that close to the sync time.
+    // After this runs, the deriveOrderDate logic in the controllers falls
+    // back cleanly to notify_pay_end_time (the real Binance order time).
+    try {
+      const [r1] = await connection.query(`
+        UPDATE orders
+           SET completed_at = NULL
+         WHERE completed_at IS NOT NULL
+           AND created_at IS NOT NULL
+           AND ABS(TIMESTAMPDIFF(SECOND, completed_at, created_at)) < 5
+      `);
+      const [r2] = await connection.query(`
+        UPDATE orders
+           SET cancelled_at = NULL
+         WHERE cancelled_at IS NOT NULL
+           AND created_at IS NOT NULL
+           AND ABS(TIMESTAMPDIFF(SECOND, cancelled_at, created_at)) < 5
+      `);
+      const [r3] = await connection.query(`
+        UPDATE orders
+           SET escalated_at = NULL
+         WHERE escalated_at IS NOT NULL
+           AND created_at IS NOT NULL
+           AND ABS(TIMESTAMPDIFF(SECOND, escalated_at, created_at)) < 5
+      `);
+      const cleared = (r1?.affectedRows || 0) + (r2?.affectedRows || 0) + (r3?.affectedRows || 0);
+      if (cleared > 0) {
+        console.log(`   • cleared ${cleared} sync-time fake terminal timestamps from orders`);
+      }
+    } catch (e) {
+      // Non-fatal — these columns may be missing on very-old installs.
+    }
+
+    // One-time backfill: populate order_created_at from the BEST available
+    // Binance timestamp. Priority:
+    //   1. notify_pay_end_time − 15 min (Binance sets notifyPayEndTime
+    //      ~15 min after order creation, so subtracting gives a close
+    //      estimate of the real order time).
+    //   2. completed_at — only if it's NOT a sync-time fake (i.e. it
+    //      survived the cleanup above and looks legit).
+    //   3. cancelled_at / escalated_at — same logic.
+    //
+    // Live syncs after this point write the EXACT createTime from Binance
+    // into order_created_at (see orderDbService.upsertOrderFromBinance).
+    try {
+      const [back] = await connection.query(`
+        UPDATE orders
+           SET order_created_at = COALESCE(
+             DATE_SUB(notify_pay_end_time, INTERVAL 15 MINUTE),
+             completed_at,
+             cancelled_at,
+             escalated_at,
+             confirm_pay_end_time,
+             created_at
+           )
+         WHERE order_created_at IS NULL
+      `);
+      if (back && back.affectedRows > 0) {
+        console.log(`   • backfilled order_created_at for ${back.affectedRows} rows`);
+      }
+    } catch (e) {
+      // Non-fatal — column may not yet exist on very-fresh installs (the
+      // ensureColumns call above just added it; this query runs after).
     }
 
     // ── order_state_log ───────────────────────────────────────────────────────

@@ -31,12 +31,17 @@ function safe(promise, label) {
 //   on existing rows (e.g. a previously-synced MANUAL row gets promoted to
 //   BOT once the live flow starts handling it).
 async function upsertOrder(order) {
+  // order_id is a legacy column kept for backward-compat with older queries
+  // and external reports. We mirror order_no into it so both columns carry
+  // the same Binance order number — saves the operator from having to know
+  // which one is the "real" id when querying the DB.
   const sql = `
     INSERT INTO orders (
-      order_no, adv_no, trade_type, asset, fiat,
+      order_no, order_id, adv_no, trade_type, asset, fiat,
       amount, crypto_amount, seller_nickname, seller_user_id, state, processed_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BOT')
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BOT')
     ON DUPLICATE KEY UPDATE
+      order_id = COALESCE(order_id, VALUES(order_id)),
       adv_no = COALESCE(VALUES(adv_no), adv_no),
       asset = COALESCE(VALUES(asset), asset),
       fiat = COALESCE(VALUES(fiat), fiat),
@@ -50,6 +55,7 @@ async function upsertOrder(order) {
   return safe(
     pool.query(sql, [
       order.orderNo,
+      order.orderNo,         // mirror into legacy order_id
       order.advOrderNo || null,
       "BUY",
       order.asset || null,
@@ -563,11 +569,28 @@ async function upsertOrderFromBinance(raw) {
   const targetState = BINANCE_STATUS_TO_STATE[statusCode] || "NEW_ORDER";
   const isTerminal = TERMINAL_STATES.has(targetState);
 
-  const finishMs = Number(raw.finishTime) || Number(raw.updateTime) || null;
-  const completedAt = statusCode === 4 ? tsOrNull(finishMs || Date.now()) : null;
-  const cancelledAt = statusCode === 6 || statusCode === 7
-    ? tsOrNull(finishMs || Date.now()) : null;
-  const escalatedAt = statusCode === 3 ? tsOrNull(finishMs || Date.now()) : null;
+  // ── Real order timestamps from Binance, NEVER fall back to "now" ──
+  //   Old behaviour stamped completed_at/cancelled_at/escalated_at with the
+  //   sync moment when Binance didn't return finishTime — that lied to the
+  //   dashboard ("order cancelled today" when it actually cancelled months
+  //   ago). Now: if Binance gives us nothing, the column stays NULL and the
+  //   frontend can show "—" instead of a fake "today".
+  const finishMs    = Number(raw.finishTime) || Number(raw.updateTime) || null;
+  const completedAt = statusCode === 4 && finishMs ? tsOrNull(finishMs) : null;
+  const cancelledAt = (statusCode === 6 || statusCode === 7) && finishMs ? tsOrNull(finishMs) : null;
+  const escalatedAt = statusCode === 3 && finishMs ? tsOrNull(finishMs) : null;
+
+  // Binance's createTime is when the seller placed the order. We store it
+  // in the dedicated `order_created_at` column (separate from the DB row's
+  // `created_at`, which stays as the row-insertion moment for audit). When
+  // Binance doesn't return createTime, derive from notify_pay_end_time
+  // (≈ createTime + 15 min) so we still have an accurate order timestamp.
+  const createdMs = Number(raw.createTime) || Number(raw.orderCreateTime) || null;
+  const notifyMs  = Number(raw.notifyPayEndTime) || null;
+  const orderCreatedMs =
+    createdMs ||
+    (notifyMs ? notifyMs - 15 * 60_000 : null);
+  const orderCreatedAt = orderCreatedMs ? tsOrNull(orderCreatedMs) : null;
 
   const confirmPayEnd = tsOrNull(raw.confirmPayEndTime);
   const notifyPayEnd = tsOrNull(raw.notifyPayEndTime);
@@ -585,16 +608,23 @@ async function upsertOrderFromBinance(raw) {
     // Force terminal state on existing rows; insert new ones with all metadata.
     // processed_by: new rows from sync get 'MANUAL'; existing BOT rows keep
     // their 'BOT' marker (the bot is still credited with handling it).
+    // order_id mirrors order_no (see upsertOrder note above — legacy column
+    // kept in sync so external SQL tooling works).
+    // `order_created_at` holds the REAL Binance order creation time, used
+    // by the dashboard / TDS view for display. `created_at` stays as the
+    // DB row insertion moment (audit-only).
     const sql = `
       INSERT INTO orders (
-        order_no, adv_no, trade_type, asset, fiat,
+        order_no, order_id, adv_no, trade_type, asset, fiat,
         amount, crypto_amount, seller_nickname, seller_user_id,
         state, completed_at, cancelled_at, escalated_at,
         confirm_pay_end_time, notify_pay_end_time,
         pre_tds_amount, tds_amount, post_tds_amount,
+        order_created_at,
         processed_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL')
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL')
       ON DUPLICATE KEY UPDATE
+        order_id = COALESCE(order_id, VALUES(order_id)),
         adv_no = COALESCE(VALUES(adv_no), adv_no),
         asset = COALESCE(VALUES(asset), asset),
         fiat = COALESCE(VALUES(fiat), fiat),
@@ -611,11 +641,13 @@ async function upsertOrderFromBinance(raw) {
         pre_tds_amount = COALESCE(pre_tds_amount, VALUES(pre_tds_amount)),
         tds_amount = COALESCE(tds_amount, VALUES(tds_amount)),
         post_tds_amount = COALESCE(post_tds_amount, VALUES(post_tds_amount)),
+        order_created_at = COALESCE(VALUES(order_created_at), order_created_at),
         processed_by = processed_by
     `;
     await safe(
       pool.query(sql, [
         orderNo,
+        orderNo,               // mirror into legacy order_id
         raw.adOrderNo || raw.advNo || null,
         "BUY",
         raw.asset || null,
@@ -633,6 +665,7 @@ async function upsertOrderFromBinance(raw) {
         preTds,
         tdsAmt,
         postTds,
+        orderCreatedAt,         // real Binance createTime → order_created_at
       ]),
       `upsertFromBinance(terminal):${orderNo}`
     );
@@ -672,16 +705,21 @@ async function upsertOrderFromBinance(raw) {
     // In-flight (status 1 or 2). Insert if missing, never clobber existing.
     // Mark new rows as MANUAL — if the bot later picks it up, upsertOrder()
     // will promote processed_by back to 'BOT'.
+    // order_id mirrors order_no (legacy column kept in sync). The real
+    // Binance create time goes into order_created_at (audit-friendly: the
+    // DB-managed created_at stays as the row-insertion moment).
     const sql = `
       INSERT IGNORE INTO orders (
-        order_no, adv_no, trade_type, asset, fiat,
+        order_no, order_id, adv_no, trade_type, asset, fiat,
         amount, crypto_amount, seller_nickname, seller_user_id,
-        state, confirm_pay_end_time, notify_pay_end_time, processed_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL')
+        state, confirm_pay_end_time, notify_pay_end_time,
+        order_created_at, processed_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL')
     `;
     await safe(
       pool.query(sql, [
         orderNo,
+        orderNo,               // mirror into legacy order_id
         raw.adOrderNo || raw.advNo || null,
         "BUY",
         raw.asset || null,
@@ -693,6 +731,7 @@ async function upsertOrderFromBinance(raw) {
         targetState,
         confirmPayEnd,
         notifyPayEnd,
+        orderCreatedAt,         // real Binance createTime → order_created_at
       ]),
       `upsertFromBinance(active):${orderNo}`
     );
