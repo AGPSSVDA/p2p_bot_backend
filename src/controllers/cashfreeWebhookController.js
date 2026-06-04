@@ -34,16 +34,29 @@ const logger = require("../utils/logger");
 //  speeds up our knowledge of payout-side outcomes (UTR / failures).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Verify HMAC-SHA256 of the raw body against the signature header.
-function verifySignature(rawBody, signature) {
-  if (!signature || !config.cashfree.clientSecret) return false;
+// Verify Cashfree Payouts V2 webhook signature.
+//
+//   Per https://docs.cashfree.com/docs/payouts-v2-webhooks :
+//
+//     signedPayload    = x-webhook-timestamp + rawBody    (concatenated)
+//     expectedSignature = Base64( HMAC-SHA256( signedPayload, clientSecret ) )
+//
+//   The timestamp comes from the `x-webhook-timestamp` request header — NOT
+//   from the body. Without it the HMAC outputs don't match and every real
+//   webhook gets rejected as "signature_invalid", silently dropping the
+//   final SUCCESS / FAILED notification.
+function verifySignature(rawBody, signature, timestamp) {
+  if (!signature || !timestamp || !config.cashfree.clientSecret) return false;
   try {
+    const signedPayload = String(timestamp) + (
+      Buffer.isBuffer(rawBody) ? rawBody.toString("utf8") : String(rawBody || "")
+    );
     const expected = crypto
       .createHmac("sha256", config.cashfree.clientSecret)
-      .update(rawBody)
+      .update(signedPayload)
       .digest("base64");
-    const expectedBuf  = Buffer.from(expected);
-    const receivedBuf  = Buffer.from(String(signature));
+    const expectedBuf = Buffer.from(expected);
+    const receivedBuf = Buffer.from(String(signature));
     if (expectedBuf.length !== receivedBuf.length) return false;
     return crypto.timingSafeEqual(expectedBuf, receivedBuf);
   } catch (err) {
@@ -86,9 +99,10 @@ async function handleWebhook(req, res) {
   // Always 200 to Cashfree so they don't retry forever — even if we drop
   // the event, the bot's polling fallback still picks up the UTR. We log
   // every event for debug.
-  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
+  const rawBody   = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
   const signature = req.headers["x-webhook-signature"] || "";
-  const verified  = verifySignature(rawBody, signature);
+  const timestamp = req.headers["x-webhook-timestamp"] || "";
+  const verified  = verifySignature(rawBody, signature, timestamp);
 
   let parsed = null;
   try { parsed = JSON.parse(rawBody); } catch (_) {}
@@ -99,6 +113,8 @@ async function handleWebhook(req, res) {
   logger.info("Cashfree webhook received", {
     event:          eventType || "(no event field)",
     verified,
+    hasTimestamp:   !!timestamp,
+    hasSignature:   !!signature,
     transfer_id:    evt.transfer_id    || "(missing)",
     cf_transfer_id: evt.cf_transfer_id || "(missing)",
     status:         evt.status         || "(unknown)",
@@ -110,7 +126,9 @@ async function handleWebhook(req, res) {
   // and we don't want them retrying.
   if (!verified) {
     logger.warn("Cashfree webhook signature INVALID — refusing to apply", {
-      transfer_id: evt.transfer_id || "(missing)",
+      transfer_id:  evt.transfer_id || "(missing)",
+      hasTimestamp: !!timestamp,
+      hasSignature: !!signature,
     });
     return res.status(200).json({ ok: false, reason: "signature_invalid" });
   }
