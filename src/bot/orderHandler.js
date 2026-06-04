@@ -17,7 +17,7 @@ const {
   canCancelOrder,
 } = require('../services/binanceService');
 const botStatusService = require('../services/botStatusService');
-const cashfreeVerificationService = require('../services/cashfreeVerificationService');
+const bankVerificationService = require('../services/surepassBankVerificationService');
 const {
   extractPAN,
   isProblemMessage,
@@ -625,11 +625,17 @@ class OrderHandler {
       // token of the other side (case-insensitive, punctuation/honorific
       // stripped). Both steps must pass to proceed.
       //
-      //   Step 1: PAN name ↔ Binance KYC name
-      //   Step 2: PAN name ↔ Bank account holder name
+      //   Step 1: Binance KYC name ↔ PAN name
+      //   Step 2: Binance KYC name ↔ Bank account holder name
       //
-      // If either step fails the order is escalated with the standard
-      // NAME_MISMATCH template, listing which step(s) diverged.
+      // Rationale: anchor on the Binance KYC name in BOTH steps because a
+      // fraudster cannot easily change their Binance-verified identity, but
+      // can submit any PAN. Confirming the same KYC identity against (a)
+      // the PAN record and (b) the bank account holder gives two
+      // independent fraud signals.
+      //
+      // If either step fails the order goes back to WAITING_FOR_PAN and the
+      // seller is asked to retry with a correct PAN (up to maxPanRetries).
       const order = stateManager.get(orderNo);
 
       if (result.name && config.surepass.nameMatchMode !== 'off') {
@@ -642,60 +648,65 @@ class OrderHandler {
         const panName     = (result.name || '').trim();
 
         // Resolve the BANK holder name authoritatively. Preferred source is
-        // Cashfree's penny-drop verification — it returns the name on file
-        // at the seller's bank, which is more reliable than the seller-
-        // supplied account-holder name Binance ships in the order detail.
-        // Fall back to the Binance-provided name if Cashfree fails (e.g.
-        // Verifications product not enabled, IFSC malformed, network).
+        // Surepass bank verification — POST to /api/v1/bank-verification/
+        // returns `data.full_name`, i.e. the name registered with the bank.
+        // More trustworthy than the seller-supplied account-holder name
+        // Binance ships in the order detail. Falls back to the Binance-
+        // provided name on any failure (no credentials, bad IFSC, account
+        // not found, network, rate limit). The existing flow (mismatch →
+        // ask for a different PAN) still kicks in if names don't match.
         const acc  = refreshed.paymentDetails?.accountNo;
         const ifsc = refreshed.paymentDetails?.ifscCode;
         const binanceProvidedName = refreshed.paymentDetails?.accountName?.trim() || '';
 
         let accountName       = binanceProvidedName;
         let accountNameSource = 'binance_order_detail';
-        let cashfreeVerify    = null;
+        let bankVerify        = null;
 
-        // Operator-controlled toggle (Overview → Cashfree Bank Verify).
+        // Operator-controlled toggle (Overview → Bank Verify).
         // OFF (default) → use Binance-provided account holder name only.
-        // ON            → call Cashfree penny-drop for the bank-side name,
-        //                 fall back to Binance-provided on any failure.
-        let pennyDropEnabled = false;
+        // ON            → call Surepass for the bank-side name, fall back
+        //                 to Binance-provided on any failure.
+        // NOTE: the DB column is still named `cashfree_bank_verify_enabled`
+        // for backward compat — provider was swapped to Surepass; the toggle
+        // semantics ("enable bank-side name verification") are unchanged.
+        let bankVerifyEnabled = false;
         try {
-          pennyDropEnabled = await botStatusService.isCashfreeBankVerifyEnabled();
+          bankVerifyEnabled = await botStatusService.isCashfreeBankVerifyEnabled();
         } catch (_) { /* default OFF on DB hiccup */ }
 
-        if (pennyDropEnabled && acc && ifsc) {
-          cashfreeVerify = await cashfreeVerificationService.verifyBankAccount({
+        if (bankVerifyEnabled && acc && ifsc) {
+          bankVerify = await bankVerificationService.verifyBankAccount({
             accountNumber: acc,
             ifsc,
             name:          panName,
             orderNo,
           });
-          if (cashfreeVerify.ok && cashfreeVerify.nameAtBank) {
-            accountName       = cashfreeVerify.nameAtBank.trim();
-            accountNameSource = 'cashfree_penny_drop';
-            logger.info('Account holder name overridden by Cashfree penny-drop', {
+          if (bankVerify.ok && bankVerify.nameAtBank) {
+            accountName       = bankVerify.nameAtBank.trim();
+            accountNameSource = 'surepass_bank_verification';
+            logger.info('Account holder name overridden by Surepass bank verification', {
               orderNo,
-              cashfreeNameAtBank: cashfreeVerify.nameAtBank,
+              surepassNameAtBank: bankVerify.nameAtBank,
               binanceProvidedName,
-              bankName:           cashfreeVerify.bankName || '(n/a)',
-              accountStatus:      cashfreeVerify.accountStatus || '(n/a)',
-              cashfreeMatchHint:  cashfreeVerify.nameMatchResult || '(n/a)',
+              bankName:           bankVerify.bankName  || '(n/a)',
+              branchName:         bankVerify.branchName || '(n/a)',
+              referenceId:        bankVerify.referenceId || '(n/a)',
             });
           } else {
-            logger.warn('Cashfree penny-drop unavailable — falling back to Binance-provided account name', {
+            logger.warn('Surepass bank verification unavailable — falling back to Binance-provided account name', {
               orderNo,
-              reason:              cashfreeVerify.reason || 'unknown',
+              reason:              bankVerify.reason || 'unknown',
               binanceProvidedName: binanceProvidedName || '(none)',
             });
           }
-        } else if (!pennyDropEnabled) {
-          logger.info('Cashfree penny-drop toggle is OFF — using Binance-provided account name', {
+        } else if (!bankVerifyEnabled) {
+          logger.info('Bank verification toggle is OFF — using Binance-provided account name', {
             orderNo,
             binanceProvidedName: binanceProvidedName || '(none)',
           });
         } else {
-          logger.info('Skipping Cashfree penny-drop — no account+ifsc on order', {
+          logger.info('Skipping Surepass bank verification — no account+ifsc on order', {
             orderNo,
             hasAccount: !!acc,
             hasIfsc:    !!ifsc,
@@ -706,33 +717,45 @@ class OrderHandler {
         // Don't compare against the seller's nickname (it's a screen name)
         const kycUsable = kycName && kycName !== refreshed.sellerNickname;
 
-        // Step 1: PAN ↔ KYC
+        // Step 1: Binance KYC name ↔ PAN name (symmetric, token-intersection
+        // doesn't care about argument order — labels reflect the anchor).
         let kycCheck = null;
         if (kycUsable) {
-          kycCheck = tokenIntersectionMatch(panName, kycName);
-          logger.info('Name match Step 1 — PAN ↔ Binance KYC', {
+          kycCheck = tokenIntersectionMatch(kycName, panName);
+          logger.info('Name match Step 1 — Binance KYC ↔ PAN', {
             orderNo,
-            panName,
             kycName,
+            panName,
             matched: kycCheck.matched,
             overlap: kycCheck.overlap,
             reason:  kycCheck.reason,
           });
         }
 
-        // Step 2: PAN ↔ Bank account holder
-        // Source: Cashfree penny-drop when available, else Binance order detail.
+        // Step 2: Binance KYC name ↔ Bank account holder name
+        // Source: Surepass bank verification when available, else Binance
+        // order detail. Compares the seller's Binance KYC name against the
+        // name actually registered with the bank — a stronger fraud check
+        // than PAN-vs-bank, because a fraudster may have a real PAN but
+        // can't change their Binance KYC identity to match a stolen bank
+        // account.
         let bankCheck = null;
-        if (accountName) {
-          bankCheck = tokenIntersectionMatch(panName, accountName);
-          logger.info('Name match Step 2 — PAN ↔ Bank Holder', {
+        if (accountName && kycUsable) {
+          bankCheck = tokenIntersectionMatch(kycName, accountName);
+          logger.info('Name match Step 2 — Binance KYC ↔ Bank Holder', {
             orderNo,
-            panName,
+            kycName,
             accountName,
             source:  accountNameSource,
             matched: bankCheck.matched,
             overlap: bankCheck.overlap,
             reason:  bankCheck.reason,
+          });
+        } else if (accountName && !kycUsable) {
+          logger.warn('Name match Step 2 SKIPPED — KYC name unusable, cannot compare against bank holder', {
+            orderNo,
+            accountName,
+            sellerNickname: refreshed.sellerNickname || '(none)',
           });
         }
 
@@ -872,6 +895,21 @@ class OrderHandler {
   }
 
   // ── Payment flow — Req #3, #4 ─────────────────────────────────────────────
+  //
+  //   Sequence (per business rule: mark paid immediately on "I agree"):
+  //     1. Fetch seller payment details from Binance order detail.
+  //     2. markOrderAsPaid on Binance IMMEDIATELY — without a UTR.
+  //        Binance auto-cancel is now disarmed; seller sees the order
+  //        flip to "Paid" on their UI. We'll attach the real UTR to the
+  //        chat template once Cashfree confirms.
+  //     3. Call Cashfree (75-sec poll).
+  //     4. Branch on the result:
+  //          MANUAL  → AWAITING_MANUAL_PAYMENT, operator pays via admin UI
+  //          PENDING → paymentProcessing template, await webhook
+  //          SUCCESS → paymentSent template with real UTR
+  //          FAILED  → paymentFailed template + force-cancel on Binance
+  //                    (cancel may fail because we already markPaid'd;
+  //                    operator must then manually appeal)
   async _processPaymentFlow(orderNo) {
     const order = stateManager.get(orderNo);
 
@@ -893,7 +931,24 @@ class OrderHandler {
         payMethod:      payDetails.methodName,
       });
 
-      // Req #4: auto-pay via Razorpay (or manual alert in Phase 1)
+      // ── EARLY markOrderAsPaid ──────────────────────────────────────────
+      // Fire immediately, before Cashfree. No UTR yet — Binance just shows
+      // the order as "Paid" without a specific reference. The real UTR is
+      // delivered to the seller via the paymentSent chat template once
+      // Cashfree confirms. This preempts Binance's notify_pay_end_time
+      // auto-cancel during the 75-sec Cashfree poll.
+      try {
+        await markOrderAsPaid(orderNo, payDetails.payId, null);
+        logger.info('Order marked as paid on Binance (early — pre-Cashfree)', {
+          orderNo, payId: payDetails.payId,
+        });
+      } catch (err) {
+        logger.error('Early markOrderAsPaid failed — continuing to Cashfree anyway', {
+          orderNo, error: err.message,
+        });
+      }
+
+      // Req #4: auto-pay via Cashfree (or manual fallback)
       const result = await processPayment(payDetails, order.tds.postTDS, orderNo);
 
       // Manual fallback. Park the order in AWAITING_MANUAL_PAYMENT and
@@ -933,17 +988,9 @@ class OrderHandler {
 
       // ── PENDING branch ─────────────────────────────────────────────────
       // Cashfree accepted the transfer but the bank hasn't confirmed yet.
-      // Per business rule:
-      //   1. markOrderAsPaid on Binance now (so Binance doesn't auto-cancel)
-      //   2. Send the PAYMENT_PROCESSING template (NOT PAYMENT_SENT with a
-      //      junk PEND- UTR like before)
-      //   3. Park the order in WAITING_FOR_RELEASE with paymentPending: true
-      //      + a PEND-<transferId> placeholder UTR (used by the webhook to
-      //      look up the order)
-      //   4. Cashfree's webhook (cashfreeWebhookController) will later call
-      //      finalizePayoutSuccess() or finalizePayoutFailed() depending on
-      //      the bank's final response — that's where the real UTR /
-      //      cancel-on-failure logic lives.
+      // markOrderAsPaid already fired pre-Cashfree (above) so Binance auto-
+      // cancel is disarmed. Just record state + send the processing template
+      // and wait for Cashfree's webhook to resolve to success or failed.
       if (result.pending) {
         const placeholderUtr = `PEND-${result.transferId || result.payoutId}`;
 
@@ -955,18 +1002,6 @@ class OrderHandler {
         });
         this._clearCancelTimer(orderNo);
         orderDb.recordPayoutPending(stateManager.get(orderNo));
-
-        // Mark paid on Binance immediately so the buyer's-side auto-cancel
-        // doesn't fire while we wait for Cashfree to settle. We pass the
-        // PEND- placeholder as payInfo; Binance just shows whatever string
-        // we send as payment proof.
-        try {
-          await markOrderAsPaid(orderNo, payDetails.payId, placeholderUtr);
-        } catch (err) {
-          logger.error('markOrderAsPaid failed during pending payout', {
-            orderNo, error: err.message,
-          });
-        }
 
         // method passed explicitly so {method} shows the Cashfree mode
         // (IMPS/NEFT/RTGS) chosen for THIS transfer.
@@ -1002,18 +1037,16 @@ class OrderHandler {
         result.mode
       );
 
-      // Mark order as paid on Binance immediately — triggers Binance's own
-      // "buyer has marked the order as paid" system message in the chat
-      // (the red-circled one in the seller's screenshot). UTR is passed via
-      // payInfo so it shows on Binance's seller-side UI as the payment proof.
-      // Bot is buyer; seller releases crypto next.
+      // Best-effort: re-call markOrderAsPaid with the real UTR so it shows
+      // on Binance's seller-side UI as the payment proof. Binance may
+      // ignore the second call (order already in PAID state) — that's fine,
+      // the chat template below carries the UTR authoritatively.
       try {
         await markOrderAsPaid(orderNo, payDetails.payId, result.utr);
       } catch (err) {
-        logger.error('markOrderAsPaid failed (payout already sent)', {
+        logger.warn('Second markOrderAsPaid (with real UTR) was rejected — UTR still in chat template', {
           orderNo, error: err.message,
         });
-        logger.error('Payout sent but markOrderAsPaid FAILED — manual mark required', { orderNo });
       }
 
       // method + utr passed explicitly so {method} reflects the Cashfree
@@ -1039,24 +1072,29 @@ class OrderHandler {
 
       // Cashfree returned a HARD failure (FAILED / REJECTED / REVERSED) on
       // the initial poll → cancel the order on Binance per business rule.
-      // Safe here because we never called markOrderAsPaid in this branch.
+      //
+      // We DELIBERATELY skip canCancelOrder here. Because markOrderAsPaid
+      // already fired at the top of this flow, the Binance order is in
+      // status 2 (PAID) and canCancelOrder returns false. But the real
+      // cancelOrder endpoint may still accept a "Due to seller" reason
+      // code (code 6 = "Seller cannot release" — designed for post-
+      // payment scenarios). Use the existing rotating seller-fault reason
+      // picker exactly like the auto-cancel path does.
       try {
-        const allowed = await canCancelOrder(orderNo);
-        if (allowed) {
-          const picked = pickSellerCancelReason();
-          await cancelOrder(orderNo, picked.code, String(picked.info || '').slice(0, 200));
-          stateManager.set(orderNo, ORDER_STATE.CANCELLED);
-          logger.warn('Order cancelled on Binance after Cashfree hard fail', {
-            orderNo, reason: err.message,
-          });
-        } else {
-          logger.warn('Cashfree hard fail but Binance says cancel not allowed', {
-            orderNo, reason: err.message,
-          });
-        }
+        const picked = pickSellerCancelReason();
+        await cancelOrder(orderNo, picked.code, String(picked.info || '').slice(0, 200));
+        stateManager.set(orderNo, ORDER_STATE.CANCELLED);
+        logger.warn('Order cancelled on Binance after Cashfree hard fail', {
+          orderNo, reason: err.message, reasonCode: picked.code,
+        });
       } catch (cancelErr) {
-        logger.error('Cancel-on-Cashfree-fail attempt failed', {
-          orderNo, error: cancelErr.message,
+        // Binance refused — order remains in PAID state on their side.
+        // Operator must manually appeal via Binance dashboard.
+        logger.error('💥 CRITICAL: Cancel rejected after early markPaid + Cashfree fail — operator must appeal manually', {
+          orderNo,
+          cashfreeError: err.message,
+          cancelError:   cancelErr.message,
+          action:        'Open Binance merchant dashboard → Orders → this order → Appeal',
         });
       }
     }
