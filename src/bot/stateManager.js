@@ -8,6 +8,10 @@ const ORDER_STATE = {
   NEW_ORDER:               'NEW_ORDER',
   WAITING_FOR_PAN:         'WAITING_FOR_PAN',
   VALIDATING_PAN:          'VALIDATING_PAN',
+  // PAN matched KYC but Surepass bank verification returned a different
+  // holder name than the KYC name. Bot asks seller to submit correct bank
+  // account number + IFSC in chat. See _handleBankAccountReply.
+  WAITING_FOR_BANK_ACCOUNT: 'WAITING_FOR_BANK_ACCOUNT',
   PAN_VERIFIED:            'PAN_VERIFIED',
   WAITING_TDS_CONSENT:     'WAITING_TDS_CONSENT',
   TDS_ACCEPTED:            'TDS_ACCEPTED',
@@ -45,6 +49,10 @@ class StateManager {
       fiat:          data.fiat   || 'INR',
       pan:           null,
       panRetries:    0,
+      // Counter for the "submit correct bank account" retry flow that
+      // kicks in when KYC ↔ Bank Holder mismatches but PAN ↔ KYC passes.
+      // Capped at config.bot.maxBankRetries (env MAX_BANK_RETRIES, default 2).
+      bankRetries:   0,
       payMethods:    [],
       selectedPayId: null,
       tds:           null,
@@ -134,6 +142,15 @@ class StateManager {
     this.orders[orderNo].panRetries++;
     orderDb.setPanRetries(orderNo, this.orders[orderNo].panRetries);
     return this.orders[orderNo].panRetries;
+  }
+
+  // Independent retry counter for the bank-account-resubmit flow. Doesn't
+  // touch panRetries because the two flows have different limits and
+  // shouldn't share a counter (env MAX_BANK_RETRIES vs MAX_PAN_RETRIES).
+  incBankRetry(orderNo) {
+    if (!this.orders[orderNo]) return 0;
+    this.orders[orderNo].bankRetries = (this.orders[orderNo].bankRetries || 0) + 1;
+    return this.orders[orderNo].bankRetries;
   }
 
   setWss(orderNo, ws) {

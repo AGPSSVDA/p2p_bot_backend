@@ -293,6 +293,57 @@ function uuidv4() {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Parse bank account number + IFSC from a seller's free-form chat message
+//
+//  Accepts a wide variety of phrasings the seller might type:
+//    "Account Number - 1234567890\nifsc - ABCD0001234"
+//    "ACC NO: 1234567890   IFSC: ABCD0001234"
+//    "a/c 1234567890 abcd0001234"
+//    "Bank A/c 1234567890 ifsc - ABCD0001234"
+//
+//  Returns { accountNo, ifsc } — either field may be null if not found.
+//  IFSC is normalised to uppercase. Account number is digits only, 4–25 chars.
+// ─────────────────────────────────────────────────────────────────────────────
+const IFSC_RE = /\b([A-Za-z]{4}0[A-Za-z0-9]{6})\b/;
+
+function parseBankAccountInput(text) {
+  if (!text) return { accountNo: null, ifsc: null };
+
+  const flat = String(text).replace(/\s+/g, ' ').trim();
+
+  // IFSC first (strict — 4 letters + 0 + 6 alphanumeric)
+  let ifsc = null;
+  const ifscMatch = flat.match(IFSC_RE);
+  if (ifscMatch) ifsc = ifscMatch[1].toUpperCase();
+
+  // Strip the IFSC from the text so its digits don't get parsed as an
+  // account number on the next pass.
+  const withoutIfsc = ifsc
+    ? flat.replace(new RegExp(ifsc, "ig"), "")
+    : flat;
+
+  // Account number — try labeled patterns first, then any standalone digit run.
+  let accountNo = null;
+  const labeledPatterns = [
+    /\ba\/?c(?:count)?\s*(?:no|num|number)?\s*[:\-=]?\s*(\d{4,25})/i,
+    /\baccount\s*(?:no|num|number)?\s*[:\-=]?\s*(\d{4,25})/i,
+    /\bacc\b\s*[:\-=]?\s*(\d{4,25})/i,
+    /\bbank\s*(?:a\/?c|account)?\s*(?:no|num|number)?\s*[:\-=]?\s*(\d{4,25})/i,
+  ];
+  for (const re of labeledPatterns) {
+    const m = withoutIfsc.match(re);
+    if (m) { accountNo = m[1]; break; }
+  }
+  if (!accountNo) {
+    // Fallback: any 4–25-digit run that isn't an IFSC's number portion.
+    const m = withoutIfsc.match(/\b(\d{4,25})\b/);
+    if (m) accountNo = m[1];
+  }
+
+  return { accountNo, ifsc };
+}
+
 module.exports = {
   signQuery, buildSignedQuery,
   syncBinanceTime, nowMs,
@@ -300,5 +351,6 @@ module.exports = {
   calculateTDS,
   isProblemMessage, isAgreementMessage,
   matchNames, tokenIntersectionMatch,
+  parseBankAccountInput,
   withRetry, sleep, formatINR, uuidv4,
 };

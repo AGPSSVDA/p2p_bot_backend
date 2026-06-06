@@ -356,6 +356,26 @@ const TEMPLATE_DEFAULTS = [
     ],
   },
   {
+    key: "bankAccountRequest",
+    description:
+      "Bank holder name mismatch — asks seller to resend correct account " +
+      "number + IFSC for Surepass re-verify. Max MAX_BANK_RETRIES (default 2). " +
+      "Placeholder: {kycName}.",
+    sort_order: 19,
+    messages: [
+      {
+        order: 1,
+        text:
+          "⚠️ *Bank account holder name doesn't match your Binance KYC name* ({kycName}).\n\n" +
+          "If the bank info on your order is incorrect, please share your *correct* bank account details *in the exact format below*:\n\n" +
+          "Account Number - 1234567890\n" +
+          "ifsc - ABCD0001234\n\n" +
+          "📌 Both lines on separate rows. The IFSC is 11 characters (4 letters + 0 + 6 alphanumeric).\n" +
+          "We'll re-verify with the bank and continue your order automatically if it matches.",
+      },
+    ],
+  },
+  {
     key: "panApiDown",
     description: "Sent when PAN verification API is unreachable",
     sort_order: 19,

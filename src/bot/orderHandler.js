@@ -26,6 +26,7 @@ const {
   calculateTDS,
   matchNames,
   tokenIntersectionMatch,
+  parseBankAccountInput,
   formatINR,
   sleep,
 } = require('../utils/helpers');
@@ -526,6 +527,7 @@ class OrderHandler {
     // we only fire isProblemMessage in NEW_ORDER — and that's a rare race.
     const noEscalateStates = [
       ORDER_STATE.WAITING_FOR_PAN,
+      ORDER_STATE.WAITING_FOR_BANK_ACCOUNT,
       ORDER_STATE.WAITING_TDS_CONSENT,
       ORDER_STATE.VALIDATING_PAN,
       ORDER_STATE.PAN_VERIFIED,
@@ -543,6 +545,10 @@ class OrderHandler {
     switch (order.state) {
       case ORDER_STATE.WAITING_FOR_PAN:
         await this._handlePANReply(orderNo, text);
+        break;
+
+      case ORDER_STATE.WAITING_FOR_BANK_ACCOUNT:
+        await this._handleBankAccountReply(orderNo, text);
         break;
 
       case ORDER_STATE.WAITING_TDS_CONSENT:
@@ -606,7 +612,7 @@ class OrderHandler {
         if (retries >= config.bot.maxPanRetries) {
           this._clearPANTimers(orderNo);
           await this._sendTpl(orderNo, 'panMaxRetries');
-          await this._escalate(orderNo, `Max PAN retries (${retries})`);
+          await this._escalateAndCancel(orderNo, `Max PAN retries (${retries})`);
         } else {
           stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_PAN);
           // Route by failure source so seller sees the most actionable message
@@ -790,10 +796,11 @@ class OrderHandler {
             });
 
             if (behavior === 'block') {
-              // Send the mismatch message and ASK FOR A NEW PAN. The bot
-              // stays responsive — it doesn't escalate unless the seller
-              // burns through maxPanRetries first. Same retry mechanic the
-              // PAN-format / Surepass-invalid branches above use.
+              const failedLabels    = failed.map((c) => c.label);
+              const panFailed       = failedLabels.includes('binance_kyc');
+              const onlyBankFailed  = !panFailed && failedLabels.includes('bank_account_holder');
+
+              // Send the standard "names don't match" notification regardless.
               // panName / kycName / accountName are passed as extras because
               // they're the freshly-computed values from this verification
               // attempt (the order state doesn't have panName yet).
@@ -804,11 +811,40 @@ class OrderHandler {
                 mismatchedSources,
               });
 
+              if (onlyBankFailed) {
+                // KYC ↔ PAN matches but KYC ↔ Bank Holder doesn't. Most
+                // likely the seller's Binance ad has stale bank info — give
+                // them up to MAX_BANK_RETRIES (default 2) chances to send
+                // correct bank account number + IFSC in chat for re-verify.
+                logger.info(
+                  'Name match — only Bank Holder mismatched, starting bank-retry flow',
+                  { orderNo, panName, kycName, accountName }
+                );
+
+                // PAN was already validated this attempt — stamp it on state
+                // so the TDS consent flow has what it needs after recovery.
+                const tds = calculateTDS(order.amount, config.bot.tdsPercent);
+                stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
+                  pan, tds, panName: result.name || null,
+                });
+                this._clearPANTimers(orderNo);
+
+                await sleep(1000);
+                await this._sendTpl(orderNo, 'bankAccountRequest');
+                stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_BANK_ACCOUNT, {
+                  bankRetries: 0,
+                });
+                return;
+              }
+
+              // PAN ↔ KYC failed (regardless of bank). Existing PAN-retry
+              // flow — ask for a different PAN, escalate + cancel on Binance
+              // after maxPanRetries attempts (per business rule).
               const retries = stateManager.incPanRetry(orderNo);
               if (retries >= config.bot.maxPanRetries) {
                 this._clearPANTimers(orderNo);
                 await this._sendTpl(orderNo, 'panMaxRetries');
-                await this._escalate(orderNo,
+                await this._escalateAndCancel(orderNo,
                   `Name mismatch + max retries (${retries}): PAN="${panName}" vs [${failed.map((c) => `${c.label}="${c.compareName}" (${c.reason})`).join(', ')}]`
                 );
               } else {
@@ -892,6 +928,183 @@ class OrderHandler {
     await this._sendTpl(orderNo, 'consentReceived');
     await sleep(1000);
     await this._processPaymentFlow(orderNo);
+  }
+
+  // ── Bank account resubmit flow ───────────────────────────────────────────
+  //   Triggered when KYC ↔ Bank Holder mismatched but KYC ↔ PAN passed.
+  //   Seller is asked (via bankAccountRequest template) to send their
+  //   correct bank account number + IFSC in chat. We parse it, re-run
+  //   Surepass bank verification with the new details, and:
+  //     • Match → overwrite paymentDetails (so Cashfree pays the new
+  //                 account) and proceed to TDS consent.
+  //     • Mismatch / parse fail → incBankRetry. Re-send the template
+  //                 until config.bot.maxBankRetries hit, then
+  //                 escalateAndCancel.
+  async _handleBankAccountReply(orderNo, text) {
+    const order = stateManager.get(orderNo);
+    if (!order) return;
+
+    const parsed = parseBankAccountInput(text);
+    if (!parsed.accountNo || !parsed.ifsc) {
+      logger.info('Bank-retry — parse failed', {
+        orderNo, preview: String(text).substring(0, 80),
+        gotAccountNo: parsed.accountNo || '(none)',
+        gotIfsc:      parsed.ifsc      || '(none)',
+      });
+      return this._handleBankRetryFailure(orderNo, 'parse_fail');
+    }
+
+    logger.info('Bank-retry — parsed seller input', {
+      orderNo,
+      accountNo: `${parsed.accountNo.slice(0, 4)}…${parsed.accountNo.slice(-4)}`,
+      ifsc:      parsed.ifsc,
+    });
+
+    let bankVerify;
+    try {
+      bankVerify = await bankVerificationService.verifyBankAccount({
+        accountNumber: parsed.accountNo,
+        ifsc:          parsed.ifsc,
+        orderNo,
+      });
+    } catch (err) {
+      logger.error('Bank-retry — Surepass call threw', { orderNo, error: err.message });
+      return this._handleBankRetryFailure(orderNo, 'surepass_error');
+    }
+
+    if (!bankVerify.ok || !bankVerify.nameAtBank) {
+      logger.warn('Bank-retry — Surepass returned no usable result', {
+        orderNo, reason: bankVerify.reason || 'unknown',
+      });
+      return this._handleBankRetryFailure(orderNo, bankVerify.reason || 'verify_fail');
+    }
+
+    // Compare new bank-side name against Binance KYC name
+    const kycName        = (order.sellerName || '').trim();
+    const newAccountName = bankVerify.nameAtBank.trim();
+    const bankCheck      = tokenIntersectionMatch(kycName, newAccountName);
+
+    logger.info('Bank-retry — name match attempt (Binance KYC ↔ new Bank Holder)', {
+      orderNo,
+      kycName,
+      newAccountName,
+      matched: bankCheck.matched,
+      overlap: bankCheck.overlap,
+      reason:  bankCheck.reason,
+    });
+
+    if (!bankCheck.matched) {
+      return this._handleBankRetryFailure(orderNo, 'name_mismatch');
+    }
+
+    // ─── Bank-retry SUCCESS ───────────────────────────────────────────────
+    // Overwrite paymentDetails with the seller's freshly-provided info so
+    // Cashfree pays into THIS account. Mirror to DB for the dashboard.
+    const existingDetails = order.paymentDetails || {};
+    const updatedDetails  = {
+      ...existingDetails,
+      accountNo:   parsed.accountNo,
+      ifscCode:    parsed.ifsc,
+      accountName: newAccountName,
+      bankName:    bankVerify.bankName || existingDetails.bankName || null,
+    };
+    stateManager.set(orderNo, order.state, { paymentDetails: updatedDetails });
+    orderDb.updateOrder(orderNo, {
+      account_no:                parsed.accountNo,
+      ifsc_code:                 parsed.ifsc,
+      account_name:              newAccountName,
+      bank_name:                 bankVerify.bankName || null,
+      name_match_status:         'MATCH',
+      name_match_compare_source: 'bank_retry_via_surepass',
+    });
+
+    logger.info('Bank-retry — match confirmed, proceeding to TDS consent', {
+      orderNo,
+      accountNo: `${parsed.accountNo.slice(0, 4)}…${parsed.accountNo.slice(-4)}`,
+      ifsc:      parsed.ifsc,
+      bankName:  bankVerify.bankName || '(n/a)',
+    });
+
+    await this._proceedToTdsConsent(orderNo);
+  }
+
+  // ── Bank-retry failure step ──────────────────────────────────────────────
+  //   incBankRetry + decide: re-prompt or terminate. Used for parse-fail,
+  //   Surepass error, and name-mismatch — all three "didn't work" cases.
+  async _handleBankRetryFailure(orderNo, reason) {
+    const retries     = stateManager.incBankRetry(orderNo);
+    const maxRetries  = config.bot.maxBankRetries;
+    logger.warn('Bank-retry — attempt failed', {
+      orderNo, reason, retries, maxRetries,
+    });
+
+    if (retries >= maxRetries) {
+      this._clearPANTimers(orderNo);
+      await this._sendTpl(orderNo, 'panMaxRetries');
+      await this._escalateAndCancel(orderNo,
+        `Bank-retry exhausted (${retries}/${maxRetries}): ${reason}`
+      );
+    } else {
+      await this._sendTpl(orderNo, 'bankAccountRequest');
+      // Stay in WAITING_FOR_BANK_ACCOUNT — next seller msg routes here again
+    }
+  }
+
+  // ── PAN verified → TDS consent (shared by initial flow + bank-retry) ────
+  async _proceedToTdsConsent(orderNo) {
+    const order = stateManager.get(orderNo);
+    if (!order) return;
+
+    await this._sendTpl(orderNo, 'panVerifiedTds');
+    await sleep(1500);
+    await this._sendTplReliable(orderNo, 'tdsInfo');
+    await this._sendTpl(orderNo, 'tdsConsent');
+
+    stateManager.set(orderNo, ORDER_STATE.WAITING_TDS_CONSENT);
+  }
+
+  // ── Escalate AND cancel the order on Binance ─────────────────────────────
+  //   Stronger than _escalate — used after MAX retry exhaustion (PAN or
+  //   bank). Sends the escalated chat, disconnects the WSS handler, then
+  //   issues the seller-fault cancel reason to Binance. If Binance refuses
+  //   (already past WAIT_PAYMENT), state stays ESCALATED for operator
+  //   manual appeal.
+  async _escalateAndCancel(orderNo, reason) {
+    const order = stateManager.get(orderNo);
+    if (!order) return;
+    if (order.state === ORDER_STATE.CANCELLED || order.state === ORDER_STATE.FAILED) {
+      logger.info('escalateAndCancel: already terminal — skipping', {
+        orderNo, state: order.state, reason,
+      });
+      return;
+    }
+
+    logger.warn('Order escalating + cancelling on Binance', { orderNo, reason });
+
+    stateManager.set(orderNo, ORDER_STATE.ESCALATED);
+    await this._sendTpl(orderNo, 'escalated');
+    this._clearCancelTimer(orderNo);
+    this._clearPANTimers(orderNo);
+
+    // Use the existing rotating "Due to seller" reason codes so the bot's
+    // own cancellation rate isn't dinged (codes 3/4/6 are attributed to
+    // the seller per Binance v7.4 rules).
+    try {
+      const picked = pickSellerCancelReason();
+      await cancelOrder(orderNo, picked.code, String(picked.info || '').slice(0, 200));
+      stateManager.set(orderNo, ORDER_STATE.CANCELLED, { cancel_reason: reason });
+      logger.warn('Order cancelled on Binance via escalateAndCancel', {
+        orderNo, reason, reasonCode: picked.code,
+      });
+    } catch (cancelErr) {
+      logger.error('Cancel-on-escalate failed — order stays ESCALATED', {
+        orderNo, reason, error: cancelErr.message,
+        action: 'Operator: open Binance dashboard → Orders → this order → Appeal',
+      });
+      // State already ESCALATED from above — leave it there.
+    }
+
+    chatService.disconnect(orderNo);
   }
 
   // ── Payment flow — Req #3, #4 ─────────────────────────────────────────────

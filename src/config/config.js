@@ -80,6 +80,9 @@ const config = {
     panTimeoutMs:           parseInt(process.env.PAN_TIMEOUT_MS,           10) || 600000,
     panReminderMs:          parseInt(process.env.PAN_REMINDER_MS,          10) || 300000,
     maxPanRetries:          parseInt(process.env.MAX_PAN_RETRIES,          10) || 3,
+    // Cap on the "submit correct bank account in chat" retry flow that
+    // fires when KYC ↔ Bank Holder mismatches but PAN ↔ KYC passed.
+    maxBankRetries:         parseInt(process.env.MAX_BANK_RETRIES,         10) || 2,
     // NOTE: the old MAX_PAYMENT_AMOUNT env cap was removed in favour of a
     // dynamically-derived hard cap (neft_max_amount × 50) inside
     // paymentService. The IMPS/NEFT/RTGS limits on the Payments page are now
