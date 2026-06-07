@@ -149,11 +149,131 @@ class OrderHandler {
       previousOrderNo: history.order_no,
       tds,
     });
+
+    // ── Bank-info change check (Option B) ──────────────────────────────
+    // Returning sellers normally skip ALL re-verification. But if their
+    // bank account info on THIS order differs from what was verified on
+    // the prior order, we must re-run Surepass bank-verification on the
+    // new account — otherwise a compromised Binance ad could redirect
+    // payment to an attacker's account. Only fires when:
+    //   • Cashfree Bank Verify toggle is ON
+    //   • Current order has bank info (not UPI-only)
+    //   • account_no or IFSC differs from the verified_sellers ledger
+    const currentAccountNo = String(order.paymentDetails?.accountNo || '').trim();
+    const currentIfsc      = String(order.paymentDetails?.ifscCode  || '').trim().toUpperCase();
+    const historyAccountNo = String(history.account_no || '').trim();
+    const historyIfsc      = String(history.ifsc_code  || '').trim().toUpperCase();
+    const hasCurrentBank   = !!(currentAccountNo && currentIfsc);
+    const bankInfoChanged  = currentAccountNo !== historyAccountNo
+                          || currentIfsc      !== historyIfsc;
+
+    let bankVerifyEnabled = false;
+    try {
+      bankVerifyEnabled = await botStatusService.isCashfreeBankVerifyEnabled();
+    } catch (_) { /* default OFF on DB hiccup */ }
+
+    if (bankVerifyEnabled && hasCurrentBank && bankInfoChanged) {
+      logger.info('Returning seller — bank info CHANGED from prior order, re-verifying via Surepass', {
+        orderNo,
+        previousAccount: historyAccountNo
+          ? `${historyAccountNo.slice(0, 4)}…${historyAccountNo.slice(-4)}` : '(none)',
+        previousIfsc:    historyIfsc || '(none)',
+        newAccount:      `${currentAccountNo.slice(0, 4)}…${currentAccountNo.slice(-4)}`,
+        newIfsc:         currentIfsc,
+      });
+
+      let bankVerify = null;
+      try {
+        bankVerify = await bankVerificationService.verifyBankAccount({
+          accountNumber: currentAccountNo,
+          ifsc:          currentIfsc,
+          orderNo,
+        });
+      } catch (err) {
+        logger.error('Returning-seller Surepass call threw — proceeding without re-verify (Surepass down)', {
+          orderNo, error: err.message,
+        });
+      }
+
+      if (bankVerify && bankVerify.ok && bankVerify.nameAtBank) {
+        const newAccountName = bankVerify.nameAtBank.trim();
+        const bankCheck      = tokenIntersectionMatch(kycName, newAccountName);
+
+        logger.info('Returning seller — bank-name match attempt (new account)', {
+          orderNo,
+          kycName,
+          newAccountName,
+          matched: bankCheck.matched,
+          overlap: bankCheck.overlap,
+          reason:  bankCheck.reason,
+        });
+
+        if (!bankCheck.matched) {
+          // Mismatch on new account — route into the bank-retry flow,
+          // EXACTLY like first-time sellers. _handleBankAccountReply will
+          // call _proceedToTdsConsent on success, which routes back into
+          // the returning-seller TDS template because previousOrderNo is
+          // already set on the state.
+          logger.warn('Returning seller — new bank holder name mismatch, starting bank-retry flow', {
+            orderNo, kycName, newAccountName,
+          });
+          orderDb.updateOrder(orderNo, {
+            name_match_status:         'MISMATCH',
+            name_match_compare_source: 'returning_seller_bank_reverify',
+          });
+          await this._sendTpl(orderNo, 'nameMismatch', {
+            panName:           history.pan_name || '—',
+            kycName:           kycName || '—',
+            accountName:       newAccountName,
+            mismatchedSources: 'Bank Holder',
+          });
+          await sleep(1000);
+          await this._sendTpl(orderNo, 'bankAccountRequest');
+          stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_BANK_ACCOUNT, {
+            bankRetries: 0,
+          });
+          return;
+        }
+
+        // Match — overwrite paymentDetails with Surepass's authoritative
+        // bank-side name + bank metadata so subsequent templates and the
+        // payment routing use this verified info.
+        const existingDetails = order.paymentDetails || {};
+        const updatedDetails  = {
+          ...existingDetails,
+          accountName: newAccountName,
+          bankName:    bankVerify.bankName || existingDetails.bankName || null,
+        };
+        stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
+          paymentDetails: updatedDetails,
+        });
+        logger.info('Returning seller — new bank verified, proceeding to payment flow', {
+          orderNo, accountName: newAccountName,
+        });
+      } else {
+        // Surepass returned no usable result OR API was unreachable.
+        // We've already done the PAN trust check via verified_sellers —
+        // don't block the seller on Surepass infra issues. Log loudly so
+        // the operator can audit.
+        logger.warn('Returning seller — Surepass re-verify failed, proceeding without bank-name check', {
+          orderNo, reason: bankVerify?.reason || 'unknown',
+        });
+      }
+    } else if (bankVerifyEnabled && hasCurrentBank && !bankInfoChanged) {
+      logger.info('Returning seller — bank info unchanged from prior order, skipping re-verify (fast path)', {
+        orderNo,
+        accountNo: `${currentAccountNo.slice(0, 4)}…${currentAccountNo.slice(-4)}`,
+        ifsc:      currentIfsc,
+      });
+    }
+
     // Inherit the previous order's name-match status so the Orders detail
     // drawer reflects that this is a trusted PAN reused from a prior verify.
     orderDb.updateOrder(orderNo, {
       name_match_status:          'MATCH',
-      name_match_compare_source:  'previous_order',
+      name_match_compare_source:  bankInfoChanged
+        ? 'returning_seller_bank_reverified'
+        : 'previous_order',
     });
 
     logger.info('Returning-seller TDS — sending consolidated blocks', {
@@ -1055,6 +1175,35 @@ class OrderHandler {
     const order = stateManager.get(orderNo);
     if (!order) return;
 
+    // Returning-seller branch: if this order was identified as a returning
+    // seller (previousOrderNo set by _handleReturningSeller), they've
+    // already given TDS consent on a prior order — skip the consent prompt,
+    // send the consolidated returningSellerTdsApplied template, auto-accept
+    // and go straight to payment.
+    //
+    // This branch is hit when:
+    //   • Returning seller's bank info changed (Option B re-verify)
+    //   • → routed into bank-retry flow (WAITING_FOR_BANK_ACCOUNT)
+    //   • → seller provides correct bank info → _handleBankAccountReply
+    //   • → that calls _proceedToTdsConsent (us)
+    if (order.previousOrderNo) {
+      logger.info(
+        '_proceedToTdsConsent — returning-seller path (bank-retry recovered)',
+        { orderNo, previousOrderNo: order.previousOrderNo }
+      );
+      const kycName = (order.sellerName || order.panName || '').trim() || 'Customer';
+      await this._sendTplReliable(orderNo, 'returningSellerTdsApplied', {
+        previousOrderNo: order.previousOrderNo,
+        kycName,
+        sellerNickname:  order.sellerNickname || '—',
+      });
+      stateManager.set(orderNo, ORDER_STATE.TDS_ACCEPTED);
+      await sleep(500);
+      await this._processPaymentFlow(orderNo);
+      return;
+    }
+
+    // First-time seller — standard TDS consent prompt flow
     await this._sendTpl(orderNo, 'panVerifiedTds');
     await sleep(1500);
     await this._sendTplReliable(orderNo, 'tdsInfo');
