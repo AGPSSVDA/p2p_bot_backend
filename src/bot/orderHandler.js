@@ -237,7 +237,9 @@ class OrderHandler {
 
         // Match — overwrite paymentDetails with Surepass's authoritative
         // bank-side name + bank metadata so subsequent templates and the
-        // payment routing use this verified info.
+        // payment routing use this verified info. Lock the details with
+        // paymentDetailsOverridden so _processPaymentFlow doesn't re-fetch
+        // from Binance and clobber the verified account info.
         const existingDetails = order.paymentDetails || {};
         const updatedDetails  = {
           ...existingDetails,
@@ -245,7 +247,8 @@ class OrderHandler {
           bankName:    bankVerify.bankName || existingDetails.bankName || null,
         };
         stateManager.set(orderNo, ORDER_STATE.PAN_VERIFIED, {
-          paymentDetails: updatedDetails,
+          paymentDetails:           updatedDetails,
+          paymentDetailsOverridden: true,
         });
         logger.info('Returning seller — new bank verified, proceeding to payment flow', {
           orderNo, accountName: newAccountName,
@@ -1119,7 +1122,9 @@ class OrderHandler {
 
     // ─── Bank-retry SUCCESS ───────────────────────────────────────────────
     // Overwrite paymentDetails with the seller's freshly-provided info so
-    // Cashfree pays into THIS account. Mirror to DB for the dashboard.
+    // Cashfree pays into THIS account, NOT the stale Binance order-detail
+    // info. The `paymentDetailsOverridden: true` flag tells _processPaymentFlow
+    // to skip its usual re-fetch from Binance and use these details as-is.
     const existingDetails = order.paymentDetails || {};
     const updatedDetails  = {
       ...existingDetails,
@@ -1128,7 +1133,10 @@ class OrderHandler {
       accountName: newAccountName,
       bankName:    bankVerify.bankName || existingDetails.bankName || null,
     };
-    stateManager.set(orderNo, order.state, { paymentDetails: updatedDetails });
+    stateManager.set(orderNo, order.state, {
+      paymentDetails:           updatedDetails,
+      paymentDetailsOverridden: true,            // ← critical: lock these details in
+    });
     orderDb.updateOrder(orderNo, {
       account_no:                parsed.accountNo,
       ifsc_code:                 parsed.ifsc,
@@ -1278,15 +1286,33 @@ class OrderHandler {
     try {
       stateManager.set(orderNo, ORDER_STATE.PROCESSING_PAYMENT);
 
-      // Req #3: fetch seller payment details from order detail
-      const orderDetail = await getOrderDetail(orderNo);
-      const payDetails  = extractPaymentDetails(orderDetail);
-
-      logger.info('Seller payment details fetched', {
-        orderNo,
-        method: payDetails.methodName,
-        isUPI:  payDetails.isUPI,
-      });
+      // Req #3: resolve seller payment details.
+      //
+      //   Priority:
+      //     1. order.paymentDetails on state IF the bank-retry flow
+      //        previously overrode it with seller-provided + Surepass-
+      //        verified info (flag: paymentDetailsOverridden=true).
+      //        Cashfree MUST pay to the seller-entered account, not the
+      //        stale Binance order-detail bank info.
+      //     2. Otherwise fetch fresh from Binance via getOrderDetail.
+      let payDetails;
+      if (order.paymentDetailsOverridden && order.paymentDetails?.accountNo && order.paymentDetails?.ifscCode) {
+        payDetails = order.paymentDetails;
+        logger.info('Using seller-overridden paymentDetails from bank-retry flow', {
+          orderNo,
+          accountNo: `${payDetails.accountNo.slice(0, 4)}…${payDetails.accountNo.slice(-4)}`,
+          ifsc:      payDetails.ifscCode,
+          source:    'bank_retry_via_surepass',
+        });
+      } else {
+        const orderDetail = await getOrderDetail(orderNo);
+        payDetails        = extractPaymentDetails(orderDetail);
+        logger.info('Seller payment details fetched from Binance order detail', {
+          orderNo,
+          method: payDetails.methodName,
+          isUPI:  payDetails.isUPI,
+        });
+      }
 
       stateManager.set(orderNo, ORDER_STATE.PROCESSING_PAYMENT, {
         paymentDetails: payDetails,
