@@ -43,7 +43,10 @@ const {
 
 const PROVIDER = "paywize";
 
-// ─── AES-256-GCM helpers (V2) ────────────────────────────────────────────────
+// ─── AES helpers — try V2 (GCM) first, fall back to V1 (CBC) ────────────────
+//   Live Paywize accounts can be on either scheme: V2 GCM (newer, AEAD) or
+//   V1 CBC (legacy, used by their auth response). decrypt() probes both so a
+//   single integration handles either tier.
 function encrypt(data, secretKey) {
   if (typeof data === "object") data = JSON.stringify(data);
   const nonce  = crypto.randomBytes(12);
@@ -57,7 +60,8 @@ function encrypt(data, secretKey) {
   return Buffer.concat([nonce, ciphertext, authTag]).toString("base64");
 }
 
-function decrypt(encryptedData, secretKey) {
+// V2 — AES-256-GCM. Wire format: base64( nonce(12) || ciphertext || tag(16) ).
+function decryptGcm(encryptedData, secretKey) {
   const combined     = Buffer.from(encryptedData, "base64");
   const NONCE_LEN    = 12;
   const AUTH_TAG_LEN = 16;
@@ -72,18 +76,43 @@ function decrypt(encryptedData, secretKey) {
   return plain;
 }
 
+// V1 — AES-256-CBC. Wire format: base64( iv(16) || ciphertext ). Key is
+// SHA-256 of secretKey (same as GCM) — the difference is mode + IV layout
+// and no auth tag. Some Paywize tenants still respond with this on /auth.
+function decryptCbc(encryptedData, secretKey) {
+  const combined = Buffer.from(encryptedData, "base64");
+  const IV_LEN   = 16;
+  const iv         = combined.subarray(0, IV_LEN);
+  const ciphertext = combined.subarray(IV_LEN);
+  const key        = crypto.createHash("sha256").update(secretKey).digest();
+  const decipher   = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  let plain = decipher.update(ciphertext, undefined, "utf8");
+  plain += decipher.final("utf8");
+  return plain;
+}
+
+// Public decrypt — keeps name stable for callers; tries V2 then V1.
+function decrypt(encryptedData, secretKey) {
+  try { return decryptGcm(encryptedData, secretKey); } catch (_) {}
+  return decryptCbc(encryptedData, secretKey);
+}
+
 // Convenience: decrypt a possibly-encrypted JSON `data` field. Accepts already-
 // decoded objects too (some responses return data unencrypted on auth/balance).
 function tryDecryptToObject(maybeEncrypted, secretKey) {
   if (!maybeEncrypted) return null;
   if (typeof maybeEncrypted === "object") return maybeEncrypted;
-  try {
-    const plain = decrypt(maybeEncrypted, secretKey);
-    try { return JSON.parse(plain); } catch (_) { return plain; }
-  } catch (err) {
-    logger.warn("Paywize decrypt failed", { error: err.message });
-    return null;
+  // Probe GCM first (V2 — newer accounts), then CBC (V1 — auth response).
+  for (const fn of [decryptGcm, decryptCbc]) {
+    try {
+      const plain = fn(maybeEncrypted, secretKey);
+      try { return JSON.parse(plain); } catch (_) { return plain; }
+    } catch (_) { /* try next mode */ }
   }
+  logger.warn("Paywize decrypt failed — neither GCM nor CBC succeeded", {
+    sample: String(maybeEncrypted).slice(0, 40) + "…",
+  });
+  return null;
 }
 
 // ─── Auth token cache (5-min TTL per docs, refresh 30s early) ────────────────
