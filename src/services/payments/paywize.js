@@ -105,9 +105,24 @@ async function getAccessToken() {
     data:    { payload },
   });
   if (!res.ok) {
-    throw new Error(`Paywize token fetch failed [${res.status}]: ${
-      res.body?.respMessage || res.body?.resp_message || res.error || "unknown"
-    }`);
+    // Surface the full server reply — Paywize 400s carry the actual reason
+    // (missing field, bad encryption, IP issue) in body.message or .errors,
+    // and the generic "unknown" fallback hides exactly that signal.
+    const bodyDump = res.body
+      ? (typeof res.body === "object" ? JSON.stringify(res.body) : String(res.body))
+      : (res.error || "no body");
+    const reason = res.body?.respMessage
+                || res.body?.resp_message
+                || res.body?.message
+                || res.body?.error
+                || res.error
+                || "unknown";
+    logger.error("Paywize token fetch — non-2xx response", {
+      status:   res.status,
+      body:     bodyDump.slice(0, 500),
+      baseUrl:  config.paywize.baseUrl,
+    });
+    throw new Error(`Paywize token fetch failed [${res.status}]: ${reason} | body=${bodyDump.slice(0, 200)}`);
   }
 
   // The `data` field is encrypted; decrypt it to extract { token }.
@@ -148,6 +163,14 @@ async function paywizePostEncrypted(path, payloadObj) {
     },
     data:    { payload },
   });
+  if (!res.ok) {
+    const bodyDump = res.body
+      ? (typeof res.body === "object" ? JSON.stringify(res.body) : String(res.body))
+      : (res.error || "no body");
+    logger.warn("Paywize POST non-2xx", {
+      path, status: res.status, body: bodyDump.slice(0, 500),
+    });
+  }
   const decrypted = res.body?.data
     ? tryDecryptToObject(res.body.data, config.paywize.secretKey)
     : null;

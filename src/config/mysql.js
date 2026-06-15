@@ -10,6 +10,11 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
+  // Templates and seller-typed messages contain 4-byte emojis (🔹 ✅ 🙏 etc).
+  // The default `utf8` (alias for utf8mb3) chokes on those with
+  // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD. utf8mb4 is the safe modern charset
+  // for the entire connection — covers all writes from this pool.
+  charset: "utf8mb4",
 });
 
 // Full default chat-template catalog mirrored from src/bot/messages.js.
@@ -1145,6 +1150,38 @@ async function initMysql() {
       { name: 'sent_status',  def: 'VARCHAR(20) NULL' },
       { name: 'created_at',   def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
     ]);
+
+    // ── Charset migration: utf8mb3 → utf8mb4 ──────────────────────────────
+    // Chat templates and seller messages contain 4-byte emojis (🔹 ✅ 🙏).
+    // Legacy tables created under the default utf8 (= utf8mb3) charset
+    // reject those bytes with ER_TRUNCATED_WRONG_VALUE_FOR_FIELD. Convert
+    // the tables that store user-typed or template text to utf8mb4.
+    // Idempotent — ALTER TABLE is a no-op if charset already matches.
+    const utf8mb4Tables = [
+      'order_messages',
+      'template_groups',
+      'template_messages',
+      'orders',
+      'verified_sellers',
+    ];
+    for (const t of utf8mb4Tables) {
+      try {
+        const [info] = await connection.query(
+          `SELECT TABLE_COLLATION FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+          [t]
+        );
+        const collation = info?.[0]?.TABLE_COLLATION || '';
+        if (!collation.startsWith('utf8mb4')) {
+          await connection.query(
+            `ALTER TABLE \`${t}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+          );
+          console.log(`   • migrated ${t}: charset → utf8mb4 (was ${collation || 'default'})`);
+        }
+      } catch (e) {
+        console.warn(`   • skip utf8mb4 migration on ${t}: ${e.message}`);
+      }
+    }
 
     // ── RESET (one-shot via .env flag) ────────────────────────────────────────
     // Set RESET_DATA_ON_BOOT=true in .env, restart once, then set it back to
