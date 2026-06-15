@@ -93,16 +93,19 @@ async function getAccessToken() {
   if (tokenCache.value && Date.now() < tokenCache.expiresAtMs - 30_000) {
     return tokenCache.value;
   }
-  // Auth body is itself encrypted in V2.
-  const payload = encrypt(
-    { apiKey: config.paywize.apiKey, secretKey: config.paywize.secretKey },
-    config.paywize.secretKey,
-  );
+  // Auth endpoint is PLAIN JSON (not encrypted) with snake_case field names —
+  // confirmed against live API which rejects encrypted `payload` with:
+  //   "property payload should not exist"
+  //   "api_key should not be empty"
+  //   "secret_key should not be empty"
   const res = await call({
     method:  "POST",
     url:     `${config.paywize.baseUrl}/api/v1/auth/clients/token`,
     headers: { "Content-Type": "application/json" },
-    data:    { payload },
+    data:    {
+      api_key:    config.paywize.apiKey,
+      secret_key: config.paywize.secretKey,
+    },
   });
   if (!res.ok) {
     // Surface the full server reply — Paywize 400s carry the actual reason
@@ -125,28 +128,50 @@ async function getAccessToken() {
     throw new Error(`Paywize token fetch failed [${res.status}]: ${reason} | body=${bodyDump.slice(0, 200)}`);
   }
 
-  // The `data` field is encrypted; decrypt it to extract { token }.
+  // Extract the JWT — handle every shape the Paywize live API can return:
+  //   1. data is a raw JWT string                          → use as-is
+  //   2. data is { token: "..." }                          → take .token
+  //   3. body.token / body.access_token / body.accessToken → take from root
+  //   4. data is an encrypted blob (legacy V2 spec)        → decrypt → { token }
   let token = null;
-  const dataField = res.body?.data;
-  if (typeof dataField === "string") {
-    const decoded = tryDecryptToObject(dataField, config.paywize.secretKey);
-    token = decoded?.token || (typeof decoded === "string" ? decoded : null);
-  } else if (dataField && typeof dataField === "object") {
-    token = dataField.token || null;
+  const b = res.body || {};
+
+  if (typeof b.token === "string")        token = b.token;
+  else if (typeof b.access_token === "string") token = b.access_token;
+  else if (typeof b.accessToken === "string")  token = b.accessToken;
+  else {
+    const dataField = b.data;
+    if (dataField && typeof dataField === "object") {
+      token = dataField.token || dataField.access_token || null;
+    } else if (typeof dataField === "string") {
+      // Heuristic: a JWT is three base64url segments separated by dots and
+      // ~100+ chars long. Anything else, try decrypt as a fallback.
+      const looksLikeJwt = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(dataField);
+      if (looksLikeJwt) {
+        token = dataField;
+      } else {
+        const decoded = tryDecryptToObject(dataField, config.paywize.secretKey);
+        if (decoded && typeof decoded === "object") {
+          token = decoded.token || decoded.access_token || null;
+        } else if (typeof decoded === "string") {
+          token = decoded;
+        }
+      }
+    }
   }
 
   if (!token) {
-    throw new Error(`Paywize token fetch — could not extract JWT (respCode=${
-      res.body?.respCode ?? res.body?.resp_code ?? "?"
+    throw new Error(`Paywize token fetch — could not extract JWT from response body (keys=${
+      Object.keys(b).join(",")
     })`);
   }
 
-  const ttlSec = Number(res.body?.expiresIn) || 300;
+  const ttlSec = Number(b.expiresIn || b.expires_in) || 300;
   tokenCache = {
     value:       token,
     expiresAtMs: Date.now() + (ttlSec * 1000),
   };
-  logger.info("Paywize token acquired", { ttlSec });
+  logger.info("Paywize token acquired", { ttlSec, jwtPreview: String(token).slice(0, 24) + "…" });
   return token;
 }
 
