@@ -192,7 +192,7 @@ class OrderPoller {
       .filter(o =>
         watchStates.includes(o.state) ||
         // Escalated AFTER payment was sent — keep watching for completion.
-        // Either payoutId (Cashfree auto-pay) OR a real (non-PEND-) UTR
+        // Either payoutId (payment-provider auto-pay) OR a real (non-PEND-) UTR
         // (manual approval) proves money has left, so the seller MAY still
         // release crypto and we must catch the COMPLETED transition.
         (o.state === ORDER_STATE.ESCALATED &&

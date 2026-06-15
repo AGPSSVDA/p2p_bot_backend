@@ -63,9 +63,9 @@ const MESSAGES = {
       preTDS:  inr(tds?.preTDS),
     }),
 
-  // Sent when Cashfree accepted the transfer but the partner bank hasn't
-  // confirmed settlement within the 75-sec poll window. The real UTR will
-  // arrive later via the Cashfree webhook → orderHandler.finalizePayoutSuccess
+  // Sent when the payment provider accepted the transfer but the partner bank
+  // hasn't confirmed settlement within the 75-sec poll window. The real UTR
+  // will arrive later via the provider webhook → orderHandler.finalizePayoutSuccess
   // which then sends the full PAYMENT_SENT template.
   PAYMENT_PROCESSING: (tds, method) =>
     messageService.get("paymentProcessing", {

@@ -25,7 +25,10 @@ const adsRoutes = require("./routes/adsRoutes");
 const paymentsRoutes = require("./routes/paymentsRoutes");
 const tdsRoutes = require("./routes/tdsRoutes");
 const adminRoutes = require("./routes/adminRoutes");
-const { handleWebhook: cashfreeWebhook } = require("./controllers/cashfreeWebhookController");
+const {
+  handleRazorpayWebhook,
+  handlePaywizeWebhook,
+} = require("./controllers/paymentWebhookController");
 const { initMysql } = require("./config/mysql");
 const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
@@ -48,15 +51,21 @@ app.use(cors({
   credentials: true
 }));
 
-// ── Cashfree webhook — MUST be mounted BEFORE express.json() so we can
-//    verify the HMAC signature against the raw request body. Cashfree sends
-//    application/json, and once express.json() parses it the original bytes
-//    are gone (different whitespace / key order makes re-serialization a
-//    different hash). express.raw on this single route preserves the body.
+// ── Payment-provider webhooks — MUST be mounted BEFORE express.json() so we
+//    can verify the HMAC signature against the raw request body. Both
+//    RazorpayX and Paywize send application/json, and once express.json()
+//    parses it the original bytes are gone (different whitespace / key order
+//    makes re-serialization a different hash). express.raw on these routes
+//    preserves the body.
 app.post(
-  "/api/cashfree/webhook",
+  "/api/razorpay/webhook",
   express.raw({ type: "*/*", limit: "1mb" }),
-  cashfreeWebhook
+  handleRazorpayWebhook
+);
+app.post(
+  "/api/paywize/webhook",
+  express.raw({ type: "*/*", limit: "1mb" }),
+  handlePaywizeWebhook
 );
 
 // ── Middleware ──

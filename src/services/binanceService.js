@@ -327,12 +327,13 @@ function extractPaymentDetails(orderDetail) {
   }
 
   // Pick the seller's payment method, preferring bank transfer over UPI so
-  // Cashfree auto-payout can handle it (UPI payouts are platform-disabled).
+  // the active payout provider can handle it (UPI payouts are not supported
+  // by RazorpayX / Paywize bank-payout APIs).
   // Bank-transfer methods include: "Bank Transfer (India)", "IMPS", "IMPS - PAN",
   // "NEFT", "RTGS". UPI is last so it only wins if no bank account is offered.
   //
   // Score reflects auto-payability + speed:
-  //   3 — explicit IMPS-tagged bank methods (fastest, supported by Cashfree)
+  //   3 — explicit IMPS-tagged bank methods (fastest)
   //   2 — generic bank transfer (IMPS/NEFT/RTGS picked dynamically by amount)
   //   1 — UPI (manual fallback)
   //   0 — anything else
@@ -353,8 +354,8 @@ function extractPaymentDetails(orderDetail) {
   // Robust field lookup that ranks candidates and picks the best one.
   // The old substring-match was matching "Account holder name" when asked
   // for "account number" (because both contain "acc"), so the seller's
-  // NAME ended up in the accountNo field and Cashfree auto-payment was
-  // rejected as bad_account.
+  // NAME ended up in the accountNo field and the provider's auto-payment
+  // was rejected as bad_account.
   //
   // patterns: ordered list of {regex, score}. Highest scoring field wins.
   // Negative `excludeRe` removes false positives.

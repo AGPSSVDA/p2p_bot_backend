@@ -677,24 +677,51 @@ async function initMysql() {
         auto_cancel_buffer_ms INT NOT NULL DEFAULT 60000,
         pan_timeout_ms INT NOT NULL DEFAULT 600000,
         pan_reminder_ms INT NOT NULL DEFAULT 300000,
-        cashfree_bank_verify_enabled TINYINT(1) NOT NULL DEFAULT 0,
         imps_max_amount INT NOT NULL DEFAULT 100000,
         neft_max_amount INT NOT NULL DEFAULT 200000,
         imps_daily_cap INT NOT NULL DEFAULT 500000,
+        payment_provider VARCHAR(20) NOT NULL DEFAULT 'razorpay',
+        bank_verify_enabled TINYINT(1) NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
     // Migration: ensure new tunable columns exist on legacy bot_config rows.
+    // payment_provider: which active payout gateway — 'razorpay' (RazorpayX)
+    // or 'paywize'. The admin flips this from the dashboard.
+    // bank_verify_enabled: toggle for the Surepass bank-side name verify
+    // step (legacy column name was cashfree_bank_verify_enabled — provider
+    // was swapped to Surepass long ago, only the column name was stale).
     await ensureColumns(connection, 'bot_config', [
       { name: 'auto_cancel_buffer_ms',        def: 'INT NOT NULL DEFAULT 60000' },
       { name: 'pan_timeout_ms',               def: 'INT NOT NULL DEFAULT 600000' },
       { name: 'pan_reminder_ms',              def: 'INT NOT NULL DEFAULT 300000' },
-      { name: 'cashfree_bank_verify_enabled', def: 'TINYINT(1) NOT NULL DEFAULT 0' },
       { name: 'imps_max_amount',              def: 'INT NOT NULL DEFAULT 100000' },
       { name: 'neft_max_amount',              def: 'INT NOT NULL DEFAULT 200000' },
       { name: 'imps_daily_cap',               def: 'INT NOT NULL DEFAULT 500000' },
+      { name: 'payment_provider',             def: "VARCHAR(20) NOT NULL DEFAULT 'razorpay'" },
+      { name: 'bank_verify_enabled',          def: 'TINYINT(1) NOT NULL DEFAULT 0' },
     ]);
+    // Migration: copy legacy cashfree_bank_verify_enabled → bank_verify_enabled
+    // then drop the old column. Idempotent.
+    try {
+      const [legacyCol] = await connection.query(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME   = 'bot_config'
+            AND COLUMN_NAME  = 'cashfree_bank_verify_enabled'`
+      );
+      if (legacyCol.length > 0) {
+        await connection.query(
+          `UPDATE bot_config SET bank_verify_enabled = cashfree_bank_verify_enabled
+            WHERE cashfree_bank_verify_enabled IS NOT NULL`
+        );
+        await connection.query(`ALTER TABLE bot_config DROP COLUMN cashfree_bank_verify_enabled`);
+        console.log(`   • migrated bot_config.cashfree_bank_verify_enabled → bank_verify_enabled, then dropped`);
+      }
+    } catch (e) {
+      console.warn(`   • skip dropping cashfree_bank_verify_enabled: ${e.message}`);
+    }
 
     // ── orders (DB-persisted lifecycle) ───────────────────────────────────────
     await connection.query(`

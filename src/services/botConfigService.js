@@ -67,9 +67,9 @@ async function updateBotConfig(id, data) {
     fields.push("auto_payout = ?");
     values.push(data.auto_payout ? 1 : 0);
   }
-  if (data.cashfree_bank_verify_enabled !== undefined) {
-    fields.push("cashfree_bank_verify_enabled = ?");
-    values.push(data.cashfree_bank_verify_enabled ? 1 : 0);
+  if (data.bank_verify_enabled !== undefined) {
+    fields.push("bank_verify_enabled = ?");
+    values.push(data.bank_verify_enabled ? 1 : 0);
   }
   if (data.bot_name !== undefined) {
     fields.push("bot_name = ?");
@@ -78,6 +78,15 @@ async function updateBotConfig(id, data) {
   if (data.logo !== undefined) {
     fields.push("logo = ?");
     values.push(data.logo);
+  }
+  if (data.payment_provider !== undefined) {
+    // Whitelist: anything outside the supported set is silently ignored.
+    const allowed = new Set(["razorpay", "paywize"]);
+    const v = String(data.payment_provider).toLowerCase();
+    if (allowed.has(v)) {
+      fields.push("payment_provider = ?");
+      values.push(v);
+    }
   }
   for (const name of Object.keys(TUNABLES)) {
     if (data[name] !== undefined) {
@@ -97,6 +106,11 @@ async function updateBotConfig(id, data) {
     values
   );
   if (result.affectedRows === 0) return null;
+
+  // Invalidate the cached status so the next read picks up the new value
+  // (esp. payment_provider — flipping providers from the UI should be
+  // visible on the very next payout, not 3 seconds later).
+  try { require("./botStatusService").invalidate(); } catch (_) {}
 
   const [rows] = await pool.query("SELECT * FROM bot_config WHERE id = ?", [id]);
   return rows[0] || null;

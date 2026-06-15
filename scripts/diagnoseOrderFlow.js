@@ -6,7 +6,7 @@
  *     • Order row from `orders`
  *     • Whether the seller is in `verified_sellers` (returning vs first-time)
  *     • Bank-info compare (current order vs verified_sellers ledger)
- *     • Current Cashfree Bank Verify toggle status
+ *     • Current Bank Verify toggle status (Surepass) and active payment provider
  *     • Predicted code path (which branch the bot took)
  *
  *   Usage:
@@ -106,15 +106,16 @@ if (!orderNo) {
     });
   }
 
-  // ── 3. Cashfree Bank Verify toggle ────────────────────────────────────
+  // ── 3. Bot config toggles ──────────────────────────────────────────────
   const [cfgRows] = await pool.query(
-    `SELECT cashfree_bank_verify_enabled, auto_payout, bot_status FROM bot_config ORDER BY id ASC LIMIT 1`
+    `SELECT bank_verify_enabled, auto_payout, bot_status, payment_provider FROM bot_config ORDER BY id ASC LIMIT 1`
   );
   const cfg = cfgRows[0] || {};
   console.log("\n[3] BOT CONFIG (dashboard toggles)");
-  console.log("    bot_status                    :", cfg.bot_status, cfg.bot_status === 1 ? "(ON)" : "(OFF)");
-  console.log("    auto_payout                   :", cfg.auto_payout, cfg.auto_payout === 1 ? "(ON)" : "(OFF)");
-  console.log("    cashfree_bank_verify_enabled  :", cfg.cashfree_bank_verify_enabled, cfg.cashfree_bank_verify_enabled === 1 ? "(ON)" : "(OFF — Surepass bank verify SKIPPED)");
+  console.log("    bot_status            :", cfg.bot_status, cfg.bot_status === 1 ? "(ON)" : "(OFF)");
+  console.log("    auto_payout           :", cfg.auto_payout, cfg.auto_payout === 1 ? "(ON)" : "(OFF)");
+  console.log("    bank_verify_enabled   :", cfg.bank_verify_enabled, cfg.bank_verify_enabled === 1 ? "(ON)" : "(OFF — Surepass bank verify SKIPPED)");
+  console.log("    payment_provider      :", cfg.payment_provider || "(razorpay default)");
 
   // ── 4. Bank-info compare (Option B fast path vs re-verify) ────────────
   console.log("\n[4] OPTION B BANK-INFO COMPARE (returning seller only)");
@@ -137,7 +138,7 @@ if (!orderNo) {
     console.log("    bankInfoChanged  :", changed);
 
     console.log("\n[5] PREDICTED CODE PATH");
-    if (cfg.cashfree_bank_verify_enabled !== 1) {
+    if (cfg.bank_verify_enabled !== 1) {
       console.log("    → Toggle OFF → Surepass SKIPPED → fast skip directly to TDS template + payment");
     } else if (!hasCurrentBank) {
       console.log("    → No bank info (UPI only) → Surepass SKIPPED → goes to payment as UPI (manual fallback)");

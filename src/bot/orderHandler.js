@@ -2,7 +2,7 @@ const { stateManager, ORDER_STATE } = require('./stateManager');
 const { chatService }               = require('../services/chatService');
 const messageService                = require('../services/messageService');
 const { verifyPAN }                 = require('../services/panService');
-const { processPayment }            = require('../services/paymentService');
+const { processPayment }            = require('../services/payments');
 const orderDb                       = require('../services/orderDbService');
 const {
   ORDER_STATUS,
@@ -156,7 +156,7 @@ class OrderHandler {
     // the prior order, we must re-run Surepass bank-verification on the
     // new account — otherwise a compromised Binance ad could redirect
     // payment to an attacker's account. Only fires when:
-    //   • Cashfree Bank Verify toggle is ON
+    //   • Bank Verify toggle is ON (Surepass)
     //   • Current order has bank info (not UPI-only)
     //   • account_no or IFSC differs from the verified_sellers ledger
     const currentAccountNo = String(order.paymentDetails?.accountNo || '').trim();
@@ -169,7 +169,7 @@ class OrderHandler {
 
     let bankVerifyEnabled = false;
     try {
-      bankVerifyEnabled = await botStatusService.isCashfreeBankVerifyEnabled();
+      bankVerifyEnabled = await botStatusService.isBankVerifyEnabled();
     } catch (_) { /* default OFF on DB hiccup */ }
 
     if (bankVerifyEnabled && hasCurrentBank && bankInfoChanged) {
@@ -444,15 +444,15 @@ class OrderHandler {
     // Auto-cancel must NEVER fire once we've sent the seller money. The two
     // critical states this protects:
     //
-    //   • PAYMENT_SENT       — Cashfree paid + markOrderAsPaid called on
+    //   • PAYMENT_SENT       — payment-provider paid + markOrderAsPaid called on
     //                           Binance. If we cancel here, we've paid the
     //                           seller but lose our claim on the crypto.
     //   • WAITING_FOR_RELEASE — same, just one state later.
     //
     // Also blocked:
-    //   • PROCESSING_PAYMENT  — Cashfree call is in-flight (can take up to
+    //   • PROCESSING_PAYMENT  — payment-provider call is in-flight (can take up to
     //                           ~75s polling). Cancelling now would race
-    //                           with Cashfree's pending transfer and could
+    //                           with payment-provider's pending transfer and could
     //                           still result in seller getting paid AND the
     //                           order being cancelled.
     //   • COMPLETED           — already done; cancelling is destructive.
@@ -483,7 +483,7 @@ class OrderHandler {
 
     // Belt-and-suspenders data guard. Even if the state somehow isn't in
     // the unsafe list above, the presence of a payout id or a real (non-
-    // PEND-) UTR means Cashfree has paid and/or markOrderAsPaid has been
+    // PEND-) UTR means payment-provider has paid and/or markOrderAsPaid has been
     // called for this order — never cancel in that case.
     const realUtr = order.utr && !String(order.utr).startsWith('PEND-');
     if (order.payoutId || realUtr) {
@@ -688,7 +688,7 @@ class OrderHandler {
 
       case ORDER_STATE.PAYMENT_SENT:
       case ORDER_STATE.WAITING_FOR_RELEASE:
-        // If Cashfree hasn't confirmed the bank settlement yet
+        // If payment-provider hasn't confirmed the bank settlement yet
         // (paymentPending flag set when we entered the pending branch of
         // _processPaymentFlow), the seller MUST see "payment is processing"
         // not "payment has already been sent" — the latter is misleading
@@ -696,7 +696,7 @@ class OrderHandler {
         // the money" / "noo it's not done" / "I'll report you" while the
         // bot keeps insisting payment is done).
         //
-        // Once Cashfree's webhook calls finalizePayoutSuccess(), the flag
+        // Once payment-provider's webhook calls finalizePayoutSuccess(), the flag
         // is cleared and subsequent seller messages get the standard
         // waitRelease template with the real UTR already in chat history.
         if (order.paymentPending) {
@@ -796,12 +796,9 @@ class OrderHandler {
         // OFF (default) → use Binance-provided account holder name only.
         // ON            → call Surepass for the bank-side name, fall back
         //                 to Binance-provided on any failure.
-        // NOTE: the DB column is still named `cashfree_bank_verify_enabled`
-        // for backward compat — provider was swapped to Surepass; the toggle
-        // semantics ("enable bank-side name verification") are unchanged.
         let bankVerifyEnabled = false;
         try {
-          bankVerifyEnabled = await botStatusService.isCashfreeBankVerifyEnabled();
+          bankVerifyEnabled = await botStatusService.isBankVerifyEnabled();
         } catch (_) { /* default OFF on DB hiccup */ }
 
         if (bankVerifyEnabled && acc && ifsc) {
@@ -1058,7 +1055,7 @@ class OrderHandler {
   //   Seller is asked (via bankAccountRequest template) to send their
   //   correct bank account number + IFSC in chat. We parse it, re-run
   //   Surepass bank verification with the new details, and:
-  //     • Match → overwrite paymentDetails (so Cashfree pays the new
+  //     • Match → overwrite paymentDetails (so payment-provider pays the new
   //                 account) and proceed to TDS consent.
   //     • Mismatch / parse fail → incBankRetry. Re-send the template
   //                 until config.bot.maxBankRetries hit, then
@@ -1122,7 +1119,7 @@ class OrderHandler {
 
     // ─── Bank-retry SUCCESS ───────────────────────────────────────────────
     // Overwrite paymentDetails with the seller's freshly-provided info so
-    // Cashfree pays into THIS account, NOT the stale Binance order-detail
+    // payment-provider pays into THIS account, NOT the stale Binance order-detail
     // info. The `paymentDetailsOverridden: true` flag tells _processPaymentFlow
     // to skip its usual re-fetch from Binance and use these details as-is.
     const existingDetails = order.paymentDetails || {};
@@ -1271,8 +1268,8 @@ class OrderHandler {
   //     2. markOrderAsPaid on Binance IMMEDIATELY — without a UTR.
   //        Binance auto-cancel is now disarmed; seller sees the order
   //        flip to "Paid" on their UI. We'll attach the real UTR to the
-  //        chat template once Cashfree confirms.
-  //     3. Call Cashfree (75-sec poll).
+  //        chat template once payment-provider confirms.
+  //     3. Call payment-provider (75-sec poll).
   //     4. Branch on the result:
   //          MANUAL  → AWAITING_MANUAL_PAYMENT, operator pays via admin UI
   //          PENDING → paymentProcessing template, await webhook
@@ -1292,7 +1289,7 @@ class OrderHandler {
       //     1. order.paymentDetails on state IF the bank-retry flow
       //        previously overrode it with seller-provided + Surepass-
       //        verified info (flag: paymentDetailsOverridden=true).
-      //        Cashfree MUST pay to the seller-entered account, not the
+      //        payment-provider MUST pay to the seller-entered account, not the
       //        stale Binance order-detail bank info.
       //     2. Otherwise fetch fresh from Binance via getOrderDetail.
       let payDetails;
@@ -1320,23 +1317,23 @@ class OrderHandler {
       });
 
       // ── EARLY markOrderAsPaid ──────────────────────────────────────────
-      // Fire immediately, before Cashfree. No UTR yet — Binance just shows
+      // Fire immediately, before payment-provider. No UTR yet — Binance just shows
       // the order as "Paid" without a specific reference. The real UTR is
       // delivered to the seller via the paymentSent chat template once
-      // Cashfree confirms. This preempts Binance's notify_pay_end_time
-      // auto-cancel during the 75-sec Cashfree poll.
+      // payment-provider confirms. This preempts Binance's notify_pay_end_time
+      // auto-cancel during the 75-sec payment-provider poll.
       try {
         await markOrderAsPaid(orderNo, payDetails.payId, null);
-        logger.info('Order marked as paid on Binance (early — pre-Cashfree)', {
+        logger.info('Order marked as paid on Binance (early — pre-payment-provider)', {
           orderNo, payId: payDetails.payId,
         });
       } catch (err) {
-        logger.error('Early markOrderAsPaid failed — continuing to Cashfree anyway', {
+        logger.error('Early markOrderAsPaid failed — continuing to payment-provider anyway', {
           orderNo, error: err.message,
         });
       }
 
-      // Req #4: auto-pay via Cashfree (or manual fallback)
+      // Req #4: auto-pay via payment-provider (or manual fallback)
       const result = await processPayment(payDetails, order.tds.postTDS, orderNo);
 
       // Manual fallback. Park the order in AWAITING_MANUAL_PAYMENT and
@@ -1349,7 +1346,7 @@ class OrderHandler {
         orderDb.recordPayoutPending(stateManager.get(orderNo));
 
         // Pick the right message based on WHY auto-payment was skipped:
-        //   upi_only → seller gave UPI only (Cashfree wallet can't pay UPI)
+        //   upi_only → seller gave UPI only (payment-provider wallet can't pay UPI)
         //   else     → generic "payment is being prepared" (no_credentials /
         //              toggle_off / bad_name / bad_ifsc / bad_account)
         // There is no "above_limit" branch any more — IMPS/NEFT/RTGS in
@@ -1375,10 +1372,10 @@ class OrderHandler {
       }
 
       // ── PENDING branch ─────────────────────────────────────────────────
-      // Cashfree accepted the transfer but the bank hasn't confirmed yet.
-      // markOrderAsPaid already fired pre-Cashfree (above) so Binance auto-
+      // payment-provider accepted the transfer but the bank hasn't confirmed yet.
+      // markOrderAsPaid already fired pre-payment-provider (above) so Binance auto-
       // cancel is disarmed. Just record state + send the processing template
-      // and wait for Cashfree's webhook to resolve to success or failed.
+      // and wait for payment-provider's webhook to resolve to success or failed.
       if (result.pending) {
         const placeholderUtr = `PEND-${result.transferId || result.payoutId}`;
 
@@ -1391,7 +1388,7 @@ class OrderHandler {
         this._clearCancelTimer(orderNo);
         orderDb.recordPayoutPending(stateManager.get(orderNo));
 
-        // method passed explicitly so {method} shows the Cashfree mode
+        // method passed explicitly so {method} shows the payment-provider mode
         // (IMPS/NEFT/RTGS) chosen for THIS transfer.
         await this._sendTpl(orderNo, 'paymentProcessing', { method: result.mode });
 
@@ -1399,7 +1396,7 @@ class OrderHandler {
           paymentPending: true,
         });
 
-        logger.info('Payment PENDING — awaiting Cashfree webhook', {
+        logger.info('Payment PENDING — awaiting payment-provider webhook', {
           orderNo,
           transferId: result.transferId || result.payoutId,
           mode:       result.mode,
@@ -1409,9 +1406,7 @@ class OrderHandler {
       }
 
       // Auto-payment succeeded immediately. Mark state, persist payout,
-      // then ensure the auto-cancel timer never fires for this order again
-      // (belt and suspenders — the unsafe-state guard already blocks it,
-      // but freeing the timer is cleaner).
+      // then ensure the auto-cancel timer never fires for this order again.
       stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, {
         payoutId: result.payoutId,
         utr:      result.utr,
@@ -1437,7 +1432,34 @@ class OrderHandler {
         });
       }
 
-      // method + utr passed explicitly so {method} reflects the Cashfree
+      // Race-condition guard: payment-provider can fire TRANSFER_SUCCESS webhook
+      // CONCURRENTLY with this immediate-success poll result. The webhook
+      // handler (finalizePayoutSuccess) and this code both want to send
+      // the same paymentSent template. paymentSentTemplateFired is the
+      // shared flag — whoever wins the race fires once, the loser sees
+      // the flag set and skips. Without this guard the seller gets the
+      // exact same paymentSent template TWICE in chat.
+      //
+      // SET-BEFORE-SEND: we flip the flag BEFORE awaiting the send so any
+      // other tick that lands during the await sees the flag and skips.
+      // If we set it after, both paths could pass their check before either
+      // had a chance to record they're firing.
+      const stateBeforeSend = stateManager.get(orderNo);
+      if (stateBeforeSend?.paymentSentTemplateFired) {
+        logger.info('paymentSent template already fired by webhook race — skipping immediate-success send', {
+          orderNo, utr: result.utr,
+        });
+        stateManager.set(orderNo, ORDER_STATE.WAITING_FOR_RELEASE);
+        return;
+      }
+
+      // Reserve the right to send by flipping the flag synchronously
+      // (Object.assign in stateManager.set is sync), THEN await the send.
+      stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, {
+        paymentSentTemplateFired: true,
+      });
+
+      // method + utr passed explicitly so {method} reflects the payment-provider
       // transfer mode and {utr} the real UTR (both also on the state now).
       await this._sendTpl(orderNo, 'paymentSent', {
         method: result.mode,
@@ -1458,7 +1480,7 @@ class OrderHandler {
       stateManager.set(orderNo, ORDER_STATE.FAILED);
       await this._sendTpl(orderNo, 'paymentFailed');
 
-      // Cashfree returned a HARD failure (FAILED / REJECTED / REVERSED) on
+      // payment-provider returned a HARD failure (FAILED / REJECTED / REVERSED) on
       // the initial poll → cancel the order on Binance per business rule.
       //
       // We DELIBERATELY skip canCancelOrder here. Because markOrderAsPaid
@@ -1472,15 +1494,15 @@ class OrderHandler {
         const picked = pickSellerCancelReason();
         await cancelOrder(orderNo, picked.code, String(picked.info || '').slice(0, 200));
         stateManager.set(orderNo, ORDER_STATE.CANCELLED);
-        logger.warn('Order cancelled on Binance after Cashfree hard fail', {
+        logger.warn('Order cancelled on Binance after payment-provider hard fail', {
           orderNo, reason: err.message, reasonCode: picked.code,
         });
       } catch (cancelErr) {
         // Binance refused — order remains in PAID state on their side.
         // Operator must manually appeal via Binance dashboard.
-        logger.error('💥 CRITICAL: Cancel rejected after early markPaid + Cashfree fail — operator must appeal manually', {
+        logger.error('💥 CRITICAL: Cancel rejected after early markPaid + payment-provider fail — operator must appeal manually', {
           orderNo,
-          cashfreeError: err.message,
+          providerError: err.message,
           cancelError:   cancelErr.message,
           action:        'Open Binance merchant dashboard → Orders → this order → Appeal',
         });
@@ -1488,8 +1510,8 @@ class OrderHandler {
     }
   }
 
-  // ── Finalize a PENDING payout when Cashfree's webhook confirms SUCCESS ──
-  //   Called by cashfreeWebhookController. Idempotent — skips if we've
+  // ── Finalize a PENDING payout when payment-provider's webhook confirms SUCCESS ──
+  //   Called by paymentWebhookController. Idempotent — skips if we've
   //   already finalized (utr no longer starts with PEND-) or if the order
   //   is already in a terminal state.
   //
@@ -1507,13 +1529,26 @@ class OrderHandler {
       });
       return;
     }
-    // Idempotency: already finalized?
-    if (order.utr && !String(order.utr).startsWith('PEND-')) {
-      logger.info('finalizePayoutSuccess: already finalized — skipping', {
-        orderNo, existingUtr: order.utr,
+    // Idempotency #1: chat template already fired (by ourselves via webhook
+    // replay OR by the immediate-success path in _processPaymentFlow).
+    // paymentSentTemplateFired is the shared flag — see _processPaymentFlow
+    // race-condition guard for the full explanation.
+    if (order.paymentSentTemplateFired) {
+      logger.info('finalizePayoutSuccess: paymentSent already fired — skipping (idempotent)', {
+        orderNo, existingUtr: order.utr || '(none)',
       });
+      // Still mirror the real UTR if we have it and the state row didn't
+      // get it yet (extra safety for the immediate-success race where
+      // template fired with utr but webhook arrives with confirming UTR).
+      if (realUtr && (!order.utr || String(order.utr).startsWith('PEND-'))) {
+        stateManager.set(orderNo, order.state, { utr: realUtr, paymentPending: false });
+      }
       return;
     }
+    // Idempotency #2: stored utr is already a real (non-PEND-) value AND
+    // template has been fired (covered above). If utr is real but flag
+    // is somehow unset, we DO still send so the seller gets at least one
+    // confirmation.
     // Skip if state has already moved to a terminal we don't want to disturb
     const terminal = [
       ORDER_STATE.COMPLETED, ORDER_STATE.CANCELLED,
@@ -1529,9 +1564,13 @@ class OrderHandler {
       return;
     }
 
+    // Mark template-fired BEFORE the await so the concurrent immediate-
+    // success path sees the flag and skips. Without this set-before-send
+    // pattern, both paths could pass their guard before either sends.
     stateManager.set(orderNo, order.state, {
-      utr:            realUtr,
-      paymentPending: false,
+      utr:                      realUtr,
+      paymentPending:           false,
+      paymentSentTemplateFired: true,
     });
 
     const effectiveMode = mode || order.paymentMode || 'IMPS';
@@ -1548,8 +1587,8 @@ class OrderHandler {
     });
   }
 
-  // ── Finalize a PENDING payout when Cashfree's webhook reports FAILURE ───
-  //   Called by cashfreeWebhookController. Per business rule:
+  // ── Finalize a PENDING payout when payment-provider's webhook reports FAILURE ───
+  //   Called by paymentWebhookController. Per business rule:
   //     1. Send PAYMENT_FAILED template (so the seller knows what happened)
   //     2. Attempt to cancel the order on Binance — Binance may reject
   //        this if the seller already released crypto, in which case the
@@ -1586,13 +1625,13 @@ class OrderHandler {
     try {
       const picked = pickSellerCancelReason();
       await cancelOrder(orderNo, picked.code,
-        `Cashfree payout failed: ${String(reason || '').slice(0, 150)}`
+        `payment-provider payout failed: ${String(reason || '').slice(0, 150)}`
       );
       cancelled = true;
       stateManager.set(orderNo, ORDER_STATE.CANCELLED, {
-        cancel_reason: `Cashfree payout failed: ${reason || 'n/a'}`,
+        cancel_reason: `payment-provider payout failed: ${reason || 'n/a'}`,
       });
-      logger.warn('Order cancelled on Binance after Cashfree pending → fail', {
+      logger.warn('Order cancelled on Binance after payment-provider pending → fail', {
         orderNo, reason, reasonCode: picked.code,
       });
     } catch (cancelErr) {
@@ -1600,14 +1639,14 @@ class OrderHandler {
       // released crypto, or the order moved into appeal. Mark FAILED locally
       // and emit a critical log so the operator can manually appeal/refund
       // via Binance dashboard.
-      logger.error('Cancel attempt after Cashfree pending → fail FAILED — operator must appeal manually', {
+      logger.error('Cancel attempt after payment-provider pending → fail FAILED — operator must appeal manually', {
         orderNo,
         error:  cancelErr.message,
         reason,
         action: 'Open Binance merchant dashboard → Orders → this order → Appeal',
       });
       stateManager.set(orderNo, ORDER_STATE.FAILED, {
-        cancel_reason: `Cashfree payout failed: ${reason || 'n/a'} (cancel rejected: ${cancelErr.message})`,
+        cancel_reason: `payment-provider payout failed: ${reason || 'n/a'} (cancel rejected: ${cancelErr.message})`,
       });
     }
 

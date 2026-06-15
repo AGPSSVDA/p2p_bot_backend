@@ -46,32 +46,44 @@ const config = {
     nameMismatchBehavior: (process.env.PAN_NAME_MISMATCH_BEHAVIOR || 'block').trim().split(/\s+/)[0],
   },
 
+  // RazorpayX Payouts — HTTP Basic auth (key_id:key_secret), JSON payloads.
+  // Webhook signature: HMAC-SHA256 of raw body with RAZORPAY_WEBHOOK_SECRET,
+  // hex-encoded, sent in the 'x-razorpay-signature' header.
   razorpay: {
     keyId:         process.env.RAZORPAY_KEY_ID,
     keySecret:     process.env.RAZORPAY_KEY_SECRET,
     accountNumber: process.env.RAZORPAY_ACCOUNT_NUMBER,
+    webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET,
     baseUrl:       'https://api.razorpay.com/v1',
   },
 
-  cashfree: {
-    clientId:            process.env.CF_CLIENT_ID,
-    clientSecret:        process.env.CF_CLIENT_SECRET,
-    env:                 process.env.CF_ENV || 'SANDBOX',
-    apiVersion:          process.env.CF_API_VERSION || '2024-01-01',
-    defaultFundsourceId: process.env.CF_DEFAULT_FUNDSOURCE_ID || '',
-    get baseUrl() {
-      return String(this.env).toUpperCase() === 'PROD'
-        ? 'https://api.cashfree.com/payout'
-        : 'https://sandbox.cashfree.com/payout';
-    },
-    // Cashfree's Verifications product (penny-drop bank-account verification).
-    // Requires the Verifications suite to be enabled on the Cashfree account;
-    // the same client_id / client_secret authenticate against it.
-    get verificationBaseUrl() {
-      return String(this.env).toUpperCase() === 'PROD'
-        ? 'https://api.cashfree.com/verification'
-        : 'https://sandbox.cashfree.com/verification';
-    },
+  // Paywize Payouts — V2 (AES-256-GCM) Encryption.
+  //   Endpoints (live API):
+  //     POST /api/v1/auth/clients/token   (JWT, 5 min TTL, encrypted payload)
+  //     POST /api/v1/payout/initiate      (encrypted payload)
+  //     GET  /api/v1/payout/status        (sender_id OR transaction_id)
+  //     GET  /api/v1/payout/balance       (wallet_id)
+  //   Webhook signature: HMAC-SHA256(rawBody, secretKey), hex-encoded.
+  //   Header: 'X-Paywize-Signature: sha256=<hex>'
+  //   Webhook URL is sent per-request as `callback_url` — NO dashboard URL
+  //   to register, Paywize POSTs back to whatever URL we send.
+  //   IP allowlist: every /api/v1/* endpoint is gated on the calling
+  //   server's IP — you MUST add the deploy host's outbound IP via Paywize
+  //   support / dashboard or you'll get 403 "Your IP address is not allowed".
+  paywize: {
+    apiKey:        process.env.PAYWIZE_API_KEY,
+    secretKey:     process.env.PAYWIZE_SECRET_KEY,
+    walletId:      process.env.PAYWIZE_WALLET_ID,
+    webhookSecret: process.env.PAYWIZE_WEBHOOK_SECRET || process.env.PAYWIZE_SECRET_KEY,
+    baseUrl:       process.env.PAYWIZE_BASE_URL || 'https://merchant.paywize.in',
+    // Public URL Paywize calls back when payout status changes. Falls back
+    // to '<APP_PUBLIC_URL>/api/paywize/webhook' if APP_PUBLIC_URL is set.
+    // Without either, callback_url is omitted and Paywize won't notify us
+    // (the poll loop still catches success/failure synchronously).
+    callbackUrl:   process.env.PAYWIZE_CALLBACK_URL
+                || (process.env.APP_PUBLIC_URL
+                      ? `${String(process.env.APP_PUBLIC_URL).replace(/\/$/, "")}/api/paywize/webhook`
+                      : undefined),
   },
 
   bot: {
@@ -84,8 +96,8 @@ const config = {
     // fires when KYC ↔ Bank Holder mismatches but PAN ↔ KYC passed.
     maxBankRetries:         parseInt(process.env.MAX_BANK_RETRIES,         10) || 2,
     // NOTE: the old MAX_PAYMENT_AMOUNT env cap was removed in favour of a
-    // dynamically-derived hard cap (neft_max_amount × 50) inside
-    // paymentService. The IMPS/NEFT/RTGS limits on the Payments page are now
+    // dynamically-derived hard cap (neft_max_amount × 50) inside the payment
+    // provider modules. The IMPS/NEFT/RTGS limits on the Payments page are
     // the only source of truth for payment limits — no env override needed.
     tdsPercent:             parseFloat(process.env.TDS_PERCENT)               || 1,
     tan:                    process.env.TAN || 'JDHT04147D',
@@ -133,17 +145,31 @@ function validateConfig() {
   config.features.panVerification = !!(
     config.surepass.token && !config.surepass.token.startsWith('your_')
   );
-  config.features.autoPayment = !!(
-    config.cashfree.clientId && !config.cashfree.clientId.startsWith('your_') &&
-    config.cashfree.clientSecret
+
+  // Either provider's creds present = auto-payment available. Active provider
+  // is selected at runtime from bot_config.payment_provider; both can be
+  // configured simultaneously and the admin flips between them at will.
+  const razorpayReady = !!(
+    config.razorpay.keyId && !String(config.razorpay.keyId).startsWith('your_') &&
+    config.razorpay.keySecret && config.razorpay.accountNumber
   );
+  const paywizeReady = !!(
+    config.paywize.apiKey && !String(config.paywize.apiKey).startsWith('your_') &&
+    config.paywize.secretKey && config.paywize.walletId
+  );
+  config.features.autoPayment = razorpayReady || paywizeReady;
+
+  const providersConfigured = [
+    razorpayReady ? 'RazorpayX' : null,
+    paywizeReady  ? 'Paywize'   : null,
+  ].filter(Boolean).join(' + ') || 'none';
 
   console.log('\n╔══════════════════════════════════════════════╗');
   console.log('║      Binance P2P Bot — Feature Status        ║');
   console.log('╠══════════════════════════════════════════════╣');
   console.log('║  Binance SAPI v7.4   : ✅ ENABLED             ║');
   console.log(`║  PAN Verification    : ${config.features.panVerification ? '✅ ENABLED (Surepass)  ' : '⏸️  SKIPPED (Phase 2)  '}  ║`);
-  console.log(`║  Auto Payment        : ${config.features.autoPayment     ? `✅ ENABLED (Cashfree ${config.cashfree.env}) ` : '⏸️  SKIPPED (Phase 3)  '} ║`);
+  console.log(`║  Auto Payment        : ${config.features.autoPayment     ? `✅ ENABLED (${providersConfigured})` : '⏸️  SKIPPED (Phase 3)  '}`);
   console.log('╚══════════════════════════════════════════════╝\n');
 }
 
