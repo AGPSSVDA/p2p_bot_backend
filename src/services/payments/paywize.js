@@ -271,55 +271,156 @@ async function getAccessToken() {
   return token;
 }
 
+// ─── Endpoint resolver — self-discovers the live path layout ────────────────
+//   Paywize public docs and the live API don't agree on path prefixes — auth
+//   lives at /api/v1/auth/* but payout lives at /payout/v1/* on some tenants
+//   and /api/v1/payout/* on others. Probe candidates on first call, cache
+//   whichever returns non-404, and reuse for the rest of the process.
+const PATH_CANDIDATES = {
+  initiate: [
+    "/payout/v1/initiate",
+    "/api/v1/payout/initiate",
+    "/api/v1/payout/request-payout",
+  ],
+  status: [
+    "/payout/v1/status",
+    "/api/v1/payout/status",
+    "/api/v1/payout/get-status",
+  ],
+  balance: [
+    "/payout/v1/balance",
+    "/api/v1/payout/balance",
+    "/api/v1/payout/check-balance",
+  ],
+};
+const resolvedPaths = {};   // memoised per process
+
 // ─── HTTP wrappers ──────────────────────────────────────────────────────────
-async function paywizePostEncrypted(path, payloadObj) {
+async function paywizePostEncrypted(kind, payloadObj) {
   const token   = await getAccessToken();
   const payload = encrypt(payloadObj, config.paywize.secretKey);
-  const res = await call({
-    method:  "POST",
-    url:     `${config.paywize.baseUrl}${path}`,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization:  `Bearer ${token}`,
-    },
-    data:    { payload },
-  });
-  if (!res.ok) {
-    const bodyDump = res.body
-      ? (typeof res.body === "object" ? JSON.stringify(res.body) : String(res.body))
-      : (res.error || "no body");
-    logger.warn("Paywize POST non-2xx", {
-      path, status: res.status, body: bodyDump.slice(0, 500),
+
+  const tryPath = async (path) => {
+    const res = await call({
+      method:  "POST",
+      url:     `${config.paywize.baseUrl}${path}`,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization:  `Bearer ${token}`,
+      },
+      data:    { payload },
     });
+    return { path, res };
+  };
+
+  // Fast path: we've already resolved this kind.
+  if (resolvedPaths[kind]) {
+    const { path, res } = await tryPath(resolvedPaths[kind]);
+    if (!res.ok) {
+      const bodyDump = res.body
+        ? (typeof res.body === "object" ? JSON.stringify(res.body) : String(res.body))
+        : (res.error || "no body");
+      logger.warn("Paywize POST non-2xx (cached path)", {
+        path, status: res.status, body: bodyDump.slice(0, 500),
+      });
+    }
+    const decrypted = res.body?.data
+      ? tryDecryptToObject(res.body.data, config.paywize.secretKey)
+      : null;
+    return { ...res, decrypted, path };
   }
-  const decrypted = res.body?.data
-    ? tryDecryptToObject(res.body.data, config.paywize.secretKey)
-    : null;
-  return { ...res, decrypted };
+
+  // Discovery path: walk candidates, skip 404s, lock in the first non-404 hit.
+  const candidates = PATH_CANDIDATES[kind] || [kind];
+  let lastNon404 = null;
+  for (const path of candidates) {
+    const { res } = await tryPath(path);
+    if (res.status === 404) continue;
+    resolvedPaths[kind] = path;
+    logger.info("Paywize endpoint resolved", { kind, path, status: res.status });
+    if (!res.ok) {
+      const bodyDump = res.body
+        ? (typeof res.body === "object" ? JSON.stringify(res.body) : String(res.body))
+        : (res.error || "no body");
+      logger.warn("Paywize POST non-2xx", {
+        path, status: res.status, body: bodyDump.slice(0, 500),
+      });
+    }
+    const decrypted = res.body?.data
+      ? tryDecryptToObject(res.body.data, config.paywize.secretKey)
+      : null;
+    return { ...res, decrypted, path };
+  }
+
+  // Every candidate returned 404 — produce an actionable error.
+  const tried = candidates.join(", ");
+  logger.error("Paywize endpoint discovery failed — every candidate 404'd", {
+    kind, tried,
+  });
+  return {
+    ok:     false,
+    status: 404,
+    body:   { message: `no live path among: ${tried}` },
+    decrypted: null,
+    path:   null,
+  };
 }
 
-async function paywizeGet(path, params = {}) {
+async function paywizeGet(kind, params = {}) {
   const token = await getAccessToken();
-  const res = await call({
-    method:  "GET",
-    url:     `${config.paywize.baseUrl}${path}`,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization:  `Bearer ${token}`,
-    },
-    params,
-  });
-  // `data` field may be encrypted string OR a plain object depending on the
-  // endpoint. Handle both shapes.
-  let decrypted = null;
-  if (res.body?.data) {
-    decrypted = typeof res.body.data === "string"
-      ? tryDecryptToObject(res.body.data, config.paywize.secretKey)
-      : res.body.data;
-  } else if (res.body && typeof res.body === "object" && !res.body.resp_code && !res.body.respCode) {
-    decrypted = res.body;
+
+  const tryPath = async (path) => {
+    const res = await call({
+      method:  "GET",
+      url:     `${config.paywize.baseUrl}${path}`,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization:  `Bearer ${token}`,
+      },
+      params,
+    });
+    return { path, res };
+  };
+
+  const consume = (res, path) => {
+    let decrypted = null;
+    if (res.body?.data) {
+      decrypted = typeof res.body.data === "string"
+        ? tryDecryptToObject(res.body.data, config.paywize.secretKey)
+        : res.body.data;
+    } else if (res.body && typeof res.body === "object" && !res.body.resp_code && !res.body.respCode) {
+      decrypted = res.body;
+    }
+    return { ...res, decrypted, path };
+  };
+
+  // Fast path: cached.
+  if (resolvedPaths[kind]) {
+    const { path, res } = await tryPath(resolvedPaths[kind]);
+    return consume(res, path);
   }
-  return { ...res, decrypted };
+
+  // Discovery: first non-404 wins.
+  const candidates = PATH_CANDIDATES[kind] || [kind];
+  for (const path of candidates) {
+    const { res } = await tryPath(path);
+    if (res.status === 404) continue;
+    resolvedPaths[kind] = path;
+    logger.info("Paywize endpoint resolved", { kind, path, status: res.status });
+    return consume(res, path);
+  }
+
+  const tried = candidates.join(", ");
+  logger.error("Paywize endpoint discovery failed — every candidate 404'd", {
+    kind, tried,
+  });
+  return {
+    ok:     false,
+    status: 404,
+    body:   { message: `no live path among: ${tried}` },
+    decrypted: null,
+    path:   null,
+  };
 }
 
 // ─── Status mapper (Paywize statuses → our normalised form) ──────────────────
@@ -371,7 +472,7 @@ async function processPayment(payDetails, amountINR, orderNo) {
     callback_url:           config.paywize.callbackUrl,
   };
 
-  const initResp = await paywizePostEncrypted("/api/v1/payout/initiate", initBody);
+  const initResp = await paywizePostEncrypted("initiate", initBody);
 
   // Duplicate sender_id (bot retry) → fall through to status polling.
   if (!initResp.ok) {
@@ -403,7 +504,7 @@ async function processPayment(payDetails, amountINR, orderNo) {
   for (const wait of DELAYS_MS) {
     if (isTerminal(lastStatus) || last.utr_number) break;
     await new Promise(r => setTimeout(r, wait));
-    const poll = await paywizeGet("/api/v1/payout/status", { sender_id: senderId });
+    const poll = await paywizeGet("status", { sender_id: senderId });
     if (poll.decrypted) last = poll.decrypted;
     lastStatus = String(last.status || "").toLowerCase();
   }
