@@ -115,18 +115,19 @@ function tryDecryptToObject(maybeEncrypted, secretKey) {
   return null;
 }
 
-// ─── JWT extraction — exhaustive across response-shape variants ──────────────
-//   Paywize live API has shipped at least these auth response shapes:
-//     1. { token: "<JWT>" }
-//     2. { data: "<JWT>" }                                  (raw JWT in data)
-//     3. { data: { token: "<JWT>" } }                       (nested)
-//     4. { data: "<encrypted blob>" }                       (GCM or CBC)
-//   When the blob is encrypted, the key derivation can be SHA-256 of
-//   either secretKey or apiKey. We try every plausible combination — the
-//   first that yields a string that LOOKS like a JWT wins.
+// ─── JWT extraction — Paywize V2 auth response ──────────────────────────────
+//   Confirmed against live API + reference SDK:
+//     1. { token: "<JWT>" }                          (plaintext shape)
+//     2. { data: "<JWT>" }                           (raw JWT in data)
+//     3. { data: { token: "<JWT>" } }                (nested)
+//     4. { data: "<encrypted base64 — AES-256-GCM>" }
+//        → decrypt with SHA-256(secretKey)
+//        → plaintext is a RAW JWT string (Keycloak-issued RS256, not JSON)
 const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 function isJwt(s) {
-  return typeof s === "string" && JWT_RE.test(s) && s.length > 40;
+  if (typeof s !== "string") return false;
+  const t = s.trim();
+  return JWT_RE.test(t) && t.length > 40;
 }
 
 function extractPaywizeToken(body) {
@@ -134,62 +135,54 @@ function extractPaywizeToken(body) {
 
   // Shape 1 — JWT at root of response under various names.
   for (const k of ["token", "access_token", "accessToken", "jwt"]) {
-    if (isJwt(body[k])) return body[k];
+    if (isJwt(body[k])) return String(body[k]).trim();
   }
 
   const dataField = body.data;
   if (!dataField) return null;
 
   // Shape 3 — { data: { token } }
-  if (dataField && typeof dataField === "object") {
+  if (typeof dataField === "object") {
     for (const k of ["token", "access_token", "accessToken", "jwt"]) {
-      if (isJwt(dataField[k])) return dataField[k];
+      if (isJwt(dataField[k])) return String(dataField[k]).trim();
     }
     return null;
   }
 
-  // Shape 2 — data is already a JWT string.
-  if (typeof dataField === "string") {
-    if (isJwt(dataField)) return dataField;
+  if (typeof dataField !== "string") return null;
 
-    // Shape 4 — encrypted blob. Try every plausible key + mode + format.
-    const candidates = [
-      config.paywize.secretKey,
-      config.paywize.apiKey,
-    ].filter(Boolean);
+  // Shape 2 — data is already a JWT string (plaintext mode, rare).
+  if (isJwt(dataField)) return dataField.trim();
 
-    for (const seed of candidates) {
-      for (const decryptFn of [decryptGcm, decryptCbc]) {
+  // Shape 4 — encrypted blob. AES-256-GCM with SHA-256(secretKey) is the
+  // Paywize V2 spec; CBC + apiKey are fallbacks for legacy tenants we
+  // haven't seen in prod but the SDK reference doesn't preclude.
+  const candidates = [
+    config.paywize.secretKey,
+    config.paywize.apiKey,
+  ].filter(Boolean);
+
+  for (const seed of candidates) {
+    for (const decryptFn of [decryptGcm, decryptCbc]) {
+      try {
+        const plain = decryptFn(dataField, seed);
+        const trimmed = plain.trim();
+
+        // Case 4a: plaintext is a raw JWT string (confirmed via live diag).
+        if (isJwt(trimmed)) return trimmed;
+
+        // Case 4b: plaintext is a JSON object wrapping the JWT.
         try {
-          const plain = decryptFn(dataField, seed);
-          // Plain could be a JSON object with token, or the JWT itself.
-          let candidate = plain;
-          try {
-            const parsed = JSON.parse(plain);
-            if (parsed && typeof parsed === "object") {
-              for (const k of ["token", "access_token", "accessToken", "jwt"]) {
-                if (isJwt(parsed[k])) return parsed[k];
-              }
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === "object") {
+            for (const k of ["token", "access_token", "accessToken", "jwt"]) {
+              if (isJwt(parsed[k])) return String(parsed[k]).trim();
             }
-            candidate = typeof parsed === "string" ? parsed : plain;
-          } catch (_) { /* not JSON — treat as raw string */ }
-          if (isJwt(candidate)) return candidate;
-        } catch (_) { /* try next key/mode */ }
-      }
-    }
-
-    // Shape 5 — opaque-token model. Some Paywize tenants treat the encrypted
-    // `data` blob itself as the bearer token (Paywize decrypts it server-side
-    // when we POST it back in Authorization: Bearer). We've exhausted all
-    // decryption variants we know about, and the body's respCode=2000 +
-    // tokenType=Bearer indicate success — so honour the response and use
-    // `data` verbatim as the bearer token. If Paywize rejects it on the next
-    // /payout/* call, we'll see the real error there and revisit.
-    if (body.respCode === 2000 || body.respMessage === "Token generated successfully") {
-      logger.warn("Paywize — using encrypted `data` as opaque bearer token (decrypt unavailable)", {
-        dataLength: dataField.length,
-      });
-      return dataField;
+          } else if (isJwt(parsed)) {
+            return String(parsed).trim();
+          }
+        } catch (_) { /* not JSON — already handled above */ }
+      } catch (_) { /* try next key/mode */ }
     }
   }
 
