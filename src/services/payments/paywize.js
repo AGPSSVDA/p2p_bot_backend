@@ -281,9 +281,11 @@ const PATH_CANDIDATES = {
     "/api/v1/payout/get-status",
   ],
   balance: [
+    // /api/v1/payout/check-balance is the live path (verified) — the
+    // /payout/v1/balance variants from public docs return 404.
+    "/api/v1/payout/check-balance",
     "/payout/v1/balance",
     "/api/v1/payout/balance",
-    "/api/v1/payout/check-balance",
   ],
 };
 const resolvedPaths = {};   // memoised per process
