@@ -177,6 +177,20 @@ function extractPaywizeToken(body) {
         } catch (_) { /* try next key/mode */ }
       }
     }
+
+    // Shape 5 — opaque-token model. Some Paywize tenants treat the encrypted
+    // `data` blob itself as the bearer token (Paywize decrypts it server-side
+    // when we POST it back in Authorization: Bearer). We've exhausted all
+    // decryption variants we know about, and the body's respCode=2000 +
+    // tokenType=Bearer indicate success — so honour the response and use
+    // `data` verbatim as the bearer token. If Paywize rejects it on the next
+    // /payout/* call, we'll see the real error there and revisit.
+    if (body.respCode === 2000 || body.respMessage === "Token generated successfully") {
+      logger.warn("Paywize — using encrypted `data` as opaque bearer token (decrypt unavailable)", {
+        dataLength: dataField.length,
+      });
+      return dataField;
+    }
   }
 
   return null;

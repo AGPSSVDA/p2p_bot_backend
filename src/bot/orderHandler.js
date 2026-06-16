@@ -365,7 +365,14 @@ class OrderHandler {
     } catch (_) {
       buffer = config.bot.autoCancelBufferMs;
     }
-    if (buffer == null || buffer < 0) return;   // disabled
+    // 0 (or null / negative) = auto-cancel disabled. Don't even schedule a
+    // timer. This is the user-facing master switch on the Bot Timers card.
+    if (buffer == null || buffer <= 0) {
+      logger.info('Auto-cancel disabled (auto_cancel_buffer_ms ≤ 0) — no timer scheduled', {
+        orderNo,
+      });
+      return;
+    }
 
     const order = stateManager.get(orderNo);
     if (!order) return;
@@ -424,6 +431,19 @@ class OrderHandler {
   async _autoCancel(orderNo, reason) {
     const order = stateManager.get(orderNo);
     if (!order) return;
+
+    // Master switch: auto_cancel_buffer_ms = 0 disables ALL bot-initiated
+    // auto-cancel, no matter how the cancel was triggered (pre-deadline
+    // timer, PAN timeout, etc.). This is the UI's "0 = disabled" semantics.
+    try {
+      const buffer = await botStatusService.getAutoCancelBufferMs();
+      if (buffer != null && buffer <= 0) {
+        logger.info('Auto-cancel suppressed — auto_cancel_buffer_ms = 0', {
+          orderNo, state: order.state, trigger: reason,
+        });
+        return;
+      }
+    } catch (_) { /* fail-open: if DB read fails, proceed with cancel */ }
 
     // Bot kill-switch — when the operator toggled bot OFF from the dashboard,
     // NO Binance API call should fire. The poller / state machine still run
