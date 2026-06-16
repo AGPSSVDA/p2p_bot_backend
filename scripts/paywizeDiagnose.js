@@ -143,12 +143,30 @@ function decryptDataV2(encryptedData, secretKey) {
   }
 
   const envWalletId = process.env.PAYWIZE_WALLET_ID;
-  const candidates = [
+  // Generate O/0 swap variants so we catch the screenshot-OCR ambiguity.
+  function letterDigitSwap(s) {
+    const out = new Set([s]);
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === "O") out.add(s.slice(0, i) + "0" + s.slice(i + 1));
+      if (s[i] === "0") out.add(s.slice(0, i) + "O" + s.slice(i + 1));
+      if (s[i] === "I") out.add(s.slice(0, i) + "1" + s.slice(i + 1));
+      if (s[i] === "1") out.add(s.slice(0, i) + "I" + s.slice(i + 1));
+      if (s[i] === "l") out.add(s.slice(0, i) + "1" + s.slice(i + 1));
+    }
+    return [...out];
+  }
+
+  const baseValues = [
     envWalletId,
-    `PAYWIZE${envWalletId}`,
-    `pwz_${envWalletId}`,
-    `wallet_${envWalletId}`,
-  ].filter(Boolean);
+    "PAYWIZE517725O60",
+    "PAYWIZE517725060",
+    "PAYWIZE51772506O",
+    "PAYWIZE51772500O",
+    "517725060",
+    "517725O60",
+    "8422436550",
+  ];
+  const candidates = [...new Set(baseValues.flatMap(letterDigitSwap))].filter(Boolean);
 
   console.log("\n=== Probing /payout/balance to find correct wallet_id ===");
   // Also try the endpoint WITHOUT wallet_id to see if Paywize returns the
