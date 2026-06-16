@@ -477,6 +477,23 @@ async function processPayment(payDetails, amountINR, orderNo) {
     const respMsg  = initResp.body?.resp_message || initResp.body?.respMessage || "";
     if (respCode !== 2000) {
       const dupHint = /duplicate|already|exists/i.test(String(respMsg));
+
+      // ── Soft-fallback to manual for known-recoverable rejection codes ────
+      // 4003 = below minimum payout — bot can't fix this, but the OPERATOR
+      //   can pay the small amount manually. Don't cancel the Binance order.
+      // 4004 = above max payout (forward-looking — Paywize uses similar codes)
+      // 4005 = insufficient wallet balance
+      const SOFT_REJECTS = new Set([4003, 4004, 4005]);
+      if (SOFT_REJECTS.has(Number(respCode))) {
+        logger.warn("Paywize rejected payout — falling back to manual", {
+          orderNo, respCode, respMsg, amountINR,
+        });
+        return manual("provider_rejected", amountINR, payDetails, {
+          providerCode: respCode,
+          providerMsg:  respMsg,
+        });
+      }
+
       if (!dupHint) {
         throw new Error(`Paywize initiate failed [${initResp.status}/${respCode}]: ${
           respMsg || initResp.error || "unknown"
