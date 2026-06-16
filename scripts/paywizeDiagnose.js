@@ -121,4 +121,59 @@ function decryptDataV2(encryptedData, secretKey) {
 
   console.log("\nFull blob (for offline analysis):");
   console.log(data);
+
+  // ── Wallet ID probe ────────────────────────────────────────────────────────
+  // Paywize 4023 = "Missing or invalid wallet_id". The value we have in
+  // .env (PAYWIZE_WALLET_ID) isn't recognised. Use the now-valid JWT to hit
+  // /balance with what we have, and also enumerate plausible variants so we
+  // can see exactly what Paywize considers a valid wallet identifier.
+  let workingKey;
+  for (const [label, key] of keys) {
+    try { decryptDataV2(data, key); workingKey = key; break; } catch (_) {}
+  }
+  if (!workingKey) return;
+
+  let token;
+  try {
+    const plain = decryptDataV2(data, workingKey).trim();
+    token = plain.startsWith("eyJ") ? plain : (JSON.parse(plain).token || plain);
+  } catch (e) {
+    console.log("\n(skipping wallet probe — couldn't extract JWT:", e.message + ")");
+    return;
+  }
+
+  const envWalletId = process.env.PAYWIZE_WALLET_ID;
+  const candidates = [
+    envWalletId,
+    `PAYWIZE${envWalletId}`,
+    `pwz_${envWalletId}`,
+    `wallet_${envWalletId}`,
+  ].filter(Boolean);
+
+  console.log("\n=== Probing /payout/balance to find correct wallet_id ===");
+  // Also try the endpoint WITHOUT wallet_id to see if Paywize returns the
+  // list of wallets associated with this account.
+  for (const path of ["/payout/v1/balance", "/api/v1/payout/balance", "/api/v1/payout/check-balance"]) {
+    try {
+      const r = await axios.get(`${baseUrl}${path}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        validateStatus: () => true, timeout: 15000,
+      });
+      const body = typeof r.data === "object" ? JSON.stringify(r.data) : String(r.data);
+      console.log(`[${r.status}] GET ${path.padEnd(35)} (no params)   → ${body.slice(0, 250)}`);
+    } catch (e) { console.log(`err  GET ${path} — ${e.message}`); }
+
+    for (const wid of candidates) {
+      try {
+        const r = await axios.get(`${baseUrl}${path}`, {
+          params:  { wallet_id: wid },
+          headers: { Authorization: `Bearer ${token}` },
+          validateStatus: () => true, timeout: 15000,
+        });
+        const body = typeof r.data === "object" ? JSON.stringify(r.data) : String(r.data);
+        const tag  = r.status === 200 ? "✅" : (r.status === 404 ? "·" : "⚠");
+        console.log(`${tag} [${r.status}] GET ${path.padEnd(35)} wid=${String(wid).padEnd(20)} → ${body.slice(0, 200)}`);
+      } catch (e) { console.log(`err  GET ${path} wid=${wid} — ${e.message}`); }
+    }
+  }
 })();
