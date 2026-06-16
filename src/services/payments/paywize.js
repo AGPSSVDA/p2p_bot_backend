@@ -459,7 +459,9 @@ async function processPayment(payDetails, amountINR, orderNo) {
     beneficiary_name:       safeName,
     beneficiary_ifsc:       ifscNorm,
     beneficiary_acc_number: accountNorm,
-    remarks:                `Order ${String(orderNo)}`.replace(/[^A-Za-z0-9 ]/g, "").slice(0, 70),
+    // Paywize hard limit: 20 chars. orderNo alone can be 20 digits, so
+    // prefer the trailing slice (most distinctive part) over the "Order " prefix.
+    remarks:                `Ord${String(orderNo)}`.replace(/[^A-Za-z0-9]/g, "").slice(-20),
     // Per Paywize docs: no dashboard webhook config exists. The callback URL
     // is passed per-request and Paywize POSTs status updates here.
     callback_url:           config.paywize.callbackUrl,
