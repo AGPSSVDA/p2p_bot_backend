@@ -469,7 +469,29 @@ async function processPayment(payDetails, amountINR, orderNo) {
     callback_url:           config.paywize.callbackUrl,
   };
 
+  // Log the full request body (without bank PII) so we can confirm
+  // callback_url is actually being sent to Paywize. Many webhook-missing
+  // issues turn out to be `callback_url: undefined` reaching the gateway.
+  logger.info("Paywize initiate request body", {
+    orderNo,
+    sender_id:    initBody.sender_id,
+    wallet_id:    initBody.wallet_id,
+    amount:       initBody.amount,
+    payment_mode: initBody.payment_mode,
+    callback_url: initBody.callback_url || "(MISSING — webhook will NEVER fire)",
+  });
+
   const initResp = await paywizePostEncrypted("initiate", initBody);
+
+  // Log the decrypted Paywize response so we can verify Paywize accepted
+  // the request AND whether it echoes back the callback_url it'll use.
+  logger.info("Paywize initiate response", {
+    orderNo,
+    status:    initResp.status,
+    respCode:  initResp.body?.resp_code ?? initResp.body?.respCode,
+    respMsg:   initResp.body?.resp_message ?? initResp.body?.respMessage,
+    decrypted: initResp.decrypted ? JSON.stringify(initResp.decrypted).slice(0, 400) : null,
+  });
 
   // Duplicate sender_id (bot retry) → fall through to status polling.
   if (!initResp.ok) {

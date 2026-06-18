@@ -16,6 +16,9 @@
 //   # Pure URL-reachability check (no auth/sig — confirms route exists):
 //   node scripts/paywizeWebhookTest.js
 //
+//   # List recent Paywize pending orders to pick a real one to test:
+//   node scripts/paywizeWebhookTest.js --list-pending
+//
 //   # Full signed + encrypted webhook for an order ALREADY in PENDING state:
 //   node scripts/paywizeWebhookTest.js --order=<orderNo> --status=success --utr=999888777
 //   node scripts/paywizeWebhookTest.js --order=<orderNo> --status=failed
@@ -52,6 +55,76 @@ if (!secretKey) {
   process.exit(1);
 }
 
+// ── Optional DB modes — read-only inspection of orders table ────────────────
+// These help diagnose order_not_found and find a real pending order to test.
+async function withDb(fn) {
+  let mysql;
+  try { mysql = require("mysql2/promise"); }
+  catch { console.error("mysql2/promise not installed in this dir — run from project root."); process.exit(1); }
+  const conn = await mysql.createConnection({
+    host:     process.env.DB_HOST || "localhost",
+    user:     process.env.DB_USER || "root",
+    password: process.env.DB_PASS || "",
+    database: process.env.DB_NAME || "p2p",
+    port:     process.env.DB_PORT || 3306,
+  });
+  try { return await fn(conn); } finally { await conn.end(); }
+}
+
+async function runListPending() {
+  return withDb(async (conn) => {
+    console.log("\n── Recent orders that may be Paywize-pending ──");
+    const [rows] = await conn.query(
+      `SELECT order_no, state, payout_id, utr_number, updated_at
+         FROM orders
+        WHERE (state IN ('WAITING_FOR_RELEASE','PAYMENT_SENT')
+               OR (utr_number IS NOT NULL AND utr_number LIKE 'PEND-%'))
+          AND payout_id IS NOT NULL
+          AND payout_id LIKE 'tx_%'
+        ORDER BY updated_at DESC
+        LIMIT 20`
+    );
+    if (rows.length === 0) {
+      console.log("(no pending Paywize orders found)");
+    } else {
+      console.log("Pick one of these order_no values for the --order arg:\n");
+      console.table(rows.map(r => ({
+        order_no:   r.order_no,
+        state:      r.state,
+        payout_id:  r.payout_id,
+        utr:        r.utr_number,
+        updated_at: r.updated_at,
+      })));
+    }
+  });
+}
+
+async function runInspect(targetOrderNo) {
+  return withDb(async (conn) => {
+    console.log(`\n── Inspecting order ${targetOrderNo} ──`);
+    const [rows] = await conn.query(
+      `SELECT order_no, state, payout_id, utr_number, cancel_reason, processed_by, updated_at
+         FROM orders
+        WHERE order_no = ?`,
+      [targetOrderNo]
+    );
+    if (rows.length === 0) {
+      console.log("❌ order not found in DB.");
+      return;
+    }
+    console.log(rows[0]);
+    const senderId = `tx_${crypto.createHash("sha256").update(`p2p|${targetOrderNo}`).digest("hex").slice(0, 24)}`;
+    console.log("\nDeterministic senderId for this orderNo:", senderId);
+    if (rows[0].payout_id === senderId) {
+      console.log("✓ payout_id MATCHES — webhook lookup will find this order.");
+    } else if (!rows[0].payout_id) {
+      console.log("✗ payout_id is NULL — the bot never wrote it (Paywize call failed pre-initiate, or order went through manual fallback).");
+    } else {
+      console.log("✗ payout_id MISMATCH — order was processed differently. Check `processed_by` and `state`.");
+    }
+  });
+}
+
 // ── helpers (must match paywize.js exactly) ──────────────────────────────────
 function encryptV2(data, sk) {
   if (typeof data === "object") data = JSON.stringify(data);
@@ -68,6 +141,18 @@ function senderIdFromOrderNo(orderNo) {
 }
 
 (async () => {
+  // ── DB-only modes (skip webhook test entirely) ────────────────────────────
+  if (args["list-pending"]) {
+    try { await runListPending(); }
+    catch (e) { console.error("DB error:", e.message); process.exit(2); }
+    return;
+  }
+  if (args.inspect) {
+    try { await runInspect(args.inspect); }
+    catch (e) { console.error("DB error:", e.message); process.exit(2); }
+    return;
+  }
+
   console.log("\n=== Paywize webhook tester ===");
   console.log("target URL :", webhookUrl);
   console.log("order      :", orderNo || "(none — running URL reachability only)");
