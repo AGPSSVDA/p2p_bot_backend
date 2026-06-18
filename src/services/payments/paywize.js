@@ -574,7 +574,15 @@ async function processPayment(payDetails, amountINR, orderNo) {
     };
   }
 
-  // Pending — the webhook will resolve to success or failed later.
+  // Pending — webhook is preferred. But Paywize webhook delivery has been
+  // unreliable in prod (no `paywize webhook received` log lines observed
+  // despite confirmed-success payouts), so kick off a background poll that
+  // keeps checking /payout/status every 30s for up to 15 min and drives
+  // finalizePayoutSuccess/Failed when the status flips terminal. The webhook
+  // and this background poll race; whichever wins first finalises the order
+  // (idempotency guards inside finalizePayout* handle the race cleanly).
+  startBackgroundStatusPoll({ orderNo, senderId, mode: modeDecision.mode });
+
   return {
     payoutId:   String(last.transaction_id || senderId),
     transferId: senderId,
@@ -584,6 +592,75 @@ async function processPayment(payDetails, amountINR, orderNo) {
     utr:        null,
     pending:    true,
   };
+}
+
+// ─── Background poll — webhook delivery fallback ─────────────────────────────
+//   Paywize webhook delivery isn't 100% reliable, so for every order that
+//   returns pending, we spawn a fire-and-forget poll loop that runs for up
+//   to 15 min at 30-sec intervals. Calls orderHandler.finalize* when status
+//   flips terminal — same code path the webhook controller drives, so the
+//   chat template / state transition is identical.
+//
+//   Concurrency: one poll task per senderId; duplicate triggers no-op.
+const _backgroundPollsInflight = new Set();
+
+function startBackgroundStatusPoll({ orderNo, senderId, mode }) {
+  if (_backgroundPollsInflight.has(senderId)) return;
+  _backgroundPollsInflight.add(senderId);
+
+  const POLL_INTERVAL_MS = 30_000;
+  const POLL_MAX_MS      = 15 * 60_000;        // 15 minutes
+  const startedAt = Date.now();
+
+  // Lazy-load to avoid circular require at module init.
+  const { orderHandler } = require("../../bot/orderHandler");
+
+  const tick = async () => {
+    if (Date.now() - startedAt > POLL_MAX_MS) {
+      logger.warn("Paywize background poll timed out — webhook never arrived", {
+        orderNo, senderId, elapsedMs: Date.now() - startedAt,
+      });
+      _backgroundPollsInflight.delete(senderId);
+      return;
+    }
+
+    try {
+      const r = await paywizeGet("status", { sender_id: senderId });
+      const status = String(r.decrypted?.status || "").toLowerCase();
+      const utr    = r.decrypted?.utr_number || null;
+
+      logger.info("Paywize background poll tick", {
+        orderNo, senderId, status: status.toUpperCase() || "(none)", utr,
+      });
+
+      if ((status === "success" || status === "completed") && utr) {
+        logger.info("Paywize background poll → SUCCESS — finalising", { orderNo, utr });
+        _backgroundPollsInflight.delete(senderId);
+        await orderHandler.finalizePayoutSuccess(orderNo, utr, mode);
+        return;
+      }
+      if (status === "failed" || status === "rejected" || status === "reversed" || status === "refunded") {
+        const reason = r.decrypted?.status_message || r.decrypted?.remarks || status.toUpperCase();
+        logger.warn("Paywize background poll → FAILED — finalising", { orderNo, reason });
+        _backgroundPollsInflight.delete(senderId);
+        await orderHandler.finalizePayoutFailed(orderNo, reason);
+        return;
+      }
+    } catch (e) {
+      logger.warn("Paywize background poll tick threw — will retry", {
+        orderNo, error: e.message,
+      });
+    }
+
+    setTimeout(tick, POLL_INTERVAL_MS);
+  };
+
+  setTimeout(tick, POLL_INTERVAL_MS);
+  logger.info("Paywize background poll started", {
+    orderNo, senderId,
+    intervalSec: POLL_INTERVAL_MS / 1000,
+    maxMinutes:  POLL_MAX_MS / 60_000,
+  });
 }
 
 // ─── Webhook signature verification ──────────────────────────────────────────
