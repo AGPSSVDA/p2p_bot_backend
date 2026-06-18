@@ -565,12 +565,17 @@ async function processPayment(payDetails, amountINR, orderNo) {
 
   if (isSuccess) {
     return {
-      payoutId: String(last.transaction_id || senderId),
-      status:   "SUCCESS",
-      mode:     modeDecision.mode,
-      amount:   amountINR,
-      utr:      last.utr_number,
-      pending:  false,
+      // KEEP payoutId = senderId (our deterministic id). Paywize's
+      // transaction_id is informational and goes into providerTxnId — the
+      // webhook handler and background poll look orders up by senderId
+      // (= orders.payout_id), so this MUST stay deterministic.
+      payoutId:     senderId,
+      providerTxnId: last.transaction_id || null,
+      status:       "SUCCESS",
+      mode:         modeDecision.mode,
+      amount:       amountINR,
+      utr:          last.utr_number,
+      pending:      false,
     };
   }
 
@@ -584,13 +589,17 @@ async function processPayment(payDetails, amountINR, orderNo) {
   startBackgroundStatusPoll({ orderNo, senderId, mode: modeDecision.mode });
 
   return {
-    payoutId:   String(last.transaction_id || senderId),
-    transferId: senderId,
-    status:     "PENDING",
-    mode:       modeDecision.mode,
-    amount:     amountINR,
-    utr:        null,
-    pending:    true,
+    // KEEP payoutId = senderId. Both the webhook handler (which finds
+    // the order via orders.payout_id = sender_id) and the background
+    // status poll depend on this being deterministic.
+    payoutId:      senderId,
+    providerTxnId: last.transaction_id || null,
+    transferId:    senderId,
+    status:        "PENDING",
+    mode:          modeDecision.mode,
+    amount:        amountINR,
+    utr:           null,
+    pending:       true,
   };
 }
 
