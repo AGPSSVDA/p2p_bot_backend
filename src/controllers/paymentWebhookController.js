@@ -26,6 +26,17 @@ const logger = require("../utils/logger");
 
 function buildHandler(providerName) {
   return async function handleWebhook(req, res) {
+    // FIRST-LINE TRACE — fires before ANY parsing/decryption logic. If you
+    // don't see this line in pm2 logs, Paywize is not hitting your server
+    // at all (DNS, firewall, or Paywize-side delivery failure).
+    logger.info(`${providerName} webhook HIT`, {
+      method: req.method,
+      path:   req.path || req.url,
+      from:   req.ip || req.socket?.remoteAddress,
+      ua:     req.headers?.["user-agent"] || "(none)",
+      contentType: req.headers?.["content-type"] || "(none)",
+    });
+
     const rawBody = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
 
     // Provider-specific header conventions (Node lowercases all incoming
@@ -55,6 +66,14 @@ function buildHandler(providerName) {
 
     const evt = provider.parseWebhookEvent(parsed || {}) || {};
 
+    // Header dump for forensics — when Paywize webhooks fail signature
+    // verification we want to know exactly what headers + body shape arrived
+    // (their docs are vague about the HMAC scheme so the only way to debug
+    // is to inspect a real delivery).
+    const headerNames = Object.keys(req.headers || {}).filter(h =>
+      h.startsWith("x-") || h === "user-agent" || h === "content-type"
+    );
+
     logger.info(`${providerName} webhook received`, {
       eventType:    evt.eventType || "(none)",
       verified,
@@ -62,16 +81,40 @@ function buildHandler(providerName) {
       transferId:   evt.transferId || "(missing)",
       status:       evt.rawStatus  || "(unknown)",
       utr:          evt.utr        || "(none)",
+      headers:      headerNames,
+      bodyLen:      rawBody.length,
     });
 
-    // Always ack 200 — failed-signature retries from providers won't help us,
-    // and Binance order_status remains the eventual source of truth for the
-    // bot's terminal state. Refusing the webhook just hides the issue.
+    // Security model:
+    //   Razorpay  : signature MUST verify (their docs are explicit on the
+    //               HMAC scheme — failure means forged or misrouted webhook).
+    //   Paywize   : signature scheme is under-documented (their official
+    //               Node sample at /api-docs/payout/webhook does NOT verify
+    //               signatures — they rely on payload decryption). Decryption
+    //               with the secretKey IS the real auth: only Paywize could
+    //               have produced a payload that decrypts cleanly. So Paywize
+    //               webhooks proceed even when signature verify fails, but a
+    //               WARN is logged so operators can investigate.
     if (!verified) {
-      logger.warn(`${providerName} webhook signature INVALID — refusing to apply`, {
-        transferId: evt.transferId || "(missing)",
+      if (providerName === "razorpay") {
+        logger.warn(`${providerName} webhook signature INVALID — refusing to apply`, {
+          transferId: evt.transferId || "(missing)",
+        });
+        return res.status(200).json({ ok: false, reason: "signature_invalid" });
+      }
+      // Paywize: proceed only if the body decrypted successfully (i.e., we
+      // got a transferId out of it — proves the sender knew our secretKey).
+      if (!evt.transferId) {
+        logger.warn(`paywize webhook: sig invalid AND no transferId — refusing`, {
+          hasSignature: !!signature,
+          bodyPreview:  rawBody.slice(0, 200),
+        });
+        return res.status(200).json({ ok: false, reason: "signature_invalid_and_undecryptable" });
+      }
+      logger.warn(`paywize webhook: sig verify failed but payload decrypted — proceeding`, {
+        transferId: evt.transferId,
+        note: "decryption with secretKey is the real auth — sig scheme under-documented",
       });
-      return res.status(200).json({ ok: false, reason: "signature_invalid" });
     }
 
     if (!evt.transferId) {

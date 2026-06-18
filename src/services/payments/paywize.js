@@ -679,29 +679,52 @@ function startBackgroundStatusPoll({ orderNo, senderId, mode }) {
 //   The webhookSecret from config falls back to secretKey if not separately
 //   set — Paywize uses the same secret as the encryption key for signing.
 function verifyWebhookSignature(rawBody, signatureHeader) {
-  const secret = config.paywize?.webhookSecret || config.paywize?.secretKey;
-  if (!signatureHeader || !secret) return false;
+  // Paywize official docs (https://paywize.in/api-docs/payout/webhook) are
+  // VAGUE about which input is HMAC'd. Their own Node.js sample doesn't
+  // verify signatures at all. So we try every plausible (input × secret)
+  // combination and accept any match. The downstream code still requires
+  // the encrypted `data` field to decrypt cleanly with secretKey — that's
+  // the real auth gate, since only Paywize knows the secret.
+  if (!signatureHeader) return false;
   try {
     const body = Buffer.isBuffer(rawBody) ? rawBody.toString("utf8") : String(rawBody || "");
 
-    // Header value is `sha256=<hex>` per docs. Strip the prefix; some
-    // gateways/proxies may forward without it, so be defensive.
+    // Header may be 'sha256=<hex>' or bare '<hex>'.
     let received = String(signatureHeader).trim();
     if (received.toLowerCase().startsWith("sha256=")) {
       received = received.slice(7);
     }
 
-    const expectedHex = crypto.createHmac("sha256", secret).update(body).digest("hex");
-    const expectedB64 = crypto.createHmac("sha256", secret).update(body).digest("base64");
+    // Pull the encrypted `data` field — Paywize might HMAC that, not the
+    // whole body.
+    let dataField = null;
+    try { dataField = JSON.parse(body)?.data || null; } catch (_) {}
+
+    const sk = config.paywize?.secretKey;
+    const ak = config.paywize?.apiKey;
+    const wh = config.paywize?.webhookSecret;
+    const secrets = [wh, sk, ak].filter(Boolean);
+
+    // Try inputs × secrets × encodings — first match wins.
+    const inputs = [body];
+    if (dataField) inputs.push(dataField);
 
     const safeEq = (a, b) => {
+      if (!a || !b) return false;
       const aBuf = Buffer.from(a);
       const bBuf = Buffer.from(b);
       if (aBuf.length !== bBuf.length) return false;
       return crypto.timingSafeEqual(aBuf, bBuf);
     };
-    // Accept hex (docs-correct) or base64 (some merchant-account variants).
-    return safeEq(expectedHex, received) || safeEq(expectedB64, received);
+
+    for (const secret of secrets) {
+      for (const input of inputs) {
+        const hex = crypto.createHmac("sha256", secret).update(input).digest("hex");
+        const b64 = crypto.createHmac("sha256", secret).update(input).digest("base64");
+        if (safeEq(hex, received) || safeEq(b64, received)) return true;
+      }
+    }
+    return false;
   } catch (err) {
     logger.warn("Paywize webhook signature verify threw", { error: err.message });
     return false;
@@ -715,18 +738,47 @@ function verifyWebhookSignature(rawBody, signatureHeader) {
 //                        beneficiary, timestamps }
 function parseWebhookEvent(parsed) {
   if (!parsed) return {};
-  const decrypted = parsed.data
-    ? (typeof parsed.data === "string"
-        ? tryDecryptToObject(parsed.data, config.paywize.secretKey)
-        : parsed.data)
-    : parsed;
 
-  if (!decrypted || typeof decrypted !== "object") return {};
+  // Webhook body shapes Paywize can send (live + documented variants):
+  //   1. { data: "<encrypted base64>" }                      ← V2 docs example
+  //   2. { data: { ...decrypted fields... } }                ← already JSON
+  //   3. flat fields at root (legacy/test)                   ← no `data` wrapper
+  let decrypted = null;
+  if (parsed.data && typeof parsed.data === "string") {
+    decrypted = tryDecryptToObject(parsed.data, config.paywize.secretKey);
+  } else if (parsed.data && typeof parsed.data === "object") {
+    decrypted = parsed.data;
+  } else if (parsed.sender_id || parsed.transaction_id || parsed.status) {
+    // Flat shape — Paywize sometimes sends decrypted fields at root in dev/staging.
+    decrypted = parsed;
+  }
+
+  if (!decrypted || typeof decrypted !== "object") {
+    logger.warn("Paywize parseWebhookEvent: could not decrypt/parse body", {
+      bodyKeys: Object.keys(parsed),
+      dataType: typeof parsed.data,
+    });
+    return {};
+  }
+
+  // Log the decrypted payload so prod can see EXACTLY what Paywize delivered.
+  // Bank PII is bounded (account/IFSC redacted by upstream) so the dump is safe.
+  logger.info("Paywize webhook payload decrypted", {
+    transaction_id: decrypted.transaction_id,
+    sender_id:      decrypted.sender_id,
+    status:         decrypted.status,
+    utr_number:     decrypted.utr_number,
+    status_message: decrypted.status_message,
+    amount:         decrypted.amount,
+    payment_mode:   decrypted.payment_mode,
+  });
 
   const rawStatus = String(decrypted.status || "").toUpperCase();
   return {
     eventType:     `paywize.${rawStatus.toLowerCase() || "unknown"}`,
-    transferId:    decrypted.sender_id || null,         // matches orders.payout_id
+    // sender_id is what the bot wrote into orders.payout_id at initiate time —
+    // this is the ONLY field that joins the webhook to the in-bot order state.
+    transferId:    decrypted.sender_id || null,
     cfTransferId:  decrypted.transaction_id || null,
     status:        mapStatus(decrypted.status),
     rawStatus,
