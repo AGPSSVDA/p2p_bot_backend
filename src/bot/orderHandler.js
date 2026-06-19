@@ -461,56 +461,60 @@ class OrderHandler {
     // ──────────────────────────────────────────────────────────────────────
     // STRICT NO-CANCEL ZONE (per business rule — no loophole)
     //
-    // Auto-cancel must NEVER fire once we've sent the seller money. The two
-    // critical states this protects:
+    // Auto-cancel must NEVER fire if ANY of these hold:
     //
-    //   • PAYMENT_SENT       — payment-provider paid + markOrderAsPaid called on
-    //                           Binance. If we cancel here, we've paid the
-    //                           seller but lose our claim on the crypto.
-    //   • WAITING_FOR_RELEASE — same, just one state later.
+    //   1. Order is in (or past) a payment-related state:
+    //        • PROCESSING_PAYMENT   — provider call in-flight (race risk)
+    //        • PAYMENT_SENT         — provider paid + markPaid called
+    //        • WAITING_FOR_RELEASE  — same, awaiting seller release
+    //        • AWAITING_MANUAL_PAYMENT — operator pays manually; bot must
+    //                                    never cancel a manual-payment order
+    //                                    (per business rule). Operator's
+    //                                    window is unlimited from the bot's
+    //                                    side — Binance's own deadline still
+    //                                    applies on their side, but the bot
+    //                                    does not contribute to it.
+    //        • COMPLETED            — already done
+    //        • CANCELLED            — idempotent no-op
     //
-    // Also blocked:
-    //   • PROCESSING_PAYMENT  — payment-provider call is in-flight (can take up to
-    //                           ~75s polling). Cancelling now would race
-    //                           with payment-provider's pending transfer and could
-    //                           still result in seller getting paid AND the
-    //                           order being cancelled.
-    //   • COMPLETED           — already done; cancelling is destructive.
-    //   • CANCELLED           — idempotent; nothing to do.
+    //   2. markOrderAsPaid was already called on Binance (paidOnBinance flag).
+    //      Once we've told Binance "we paid", cancelling from our side would
+    //      strand the seller's funds AND lose our claim on the crypto.
+    //      ONLY a confirmed PAYMENT-PROVIDER FAILURE (finalizePayoutFailed)
+    //      may cancel a paid order, and that path goes through a separate
+    //      cancel-after-fail flow — never through _autoCancel.
     //
-    // States where auto-cancel SHOULD fire (per dashboard timing):
+    //   3. A payout was initiated (payoutId present) or a REAL UTR exists.
+    //      Belt-and-suspenders data guard for any state-tracking glitch.
+    //
+    // States where auto-cancel SHOULD fire (PRE-payment only):
     //   NEW_ORDER, WAITING_FOR_PAN, VALIDATING_PAN, PAN_VERIFIED,
-    //   WAITING_TDS_CONSENT, TDS_ACCEPTED, AWAITING_MANUAL_PAYMENT,
-    //   ESCALATED, FAILED.
-    //
-    // Note: AWAITING_MANUAL_PAYMENT is intentionally NOT in the unsafe list.
-    // In that state, the operator has been told to pay but hasn't yet (no
-    // markOrderAsPaid call), so cancelling is safe — no money has left.
+    //   WAITING_TDS_CONSENT, TDS_ACCEPTED, ESCALATED, FAILED.
     // ──────────────────────────────────────────────────────────────────────
     const unsafe = [
       ORDER_STATE.PROCESSING_PAYMENT,
       ORDER_STATE.PAYMENT_SENT,
       ORDER_STATE.WAITING_FOR_RELEASE,
+      ORDER_STATE.AWAITING_MANUAL_PAYMENT,
       ORDER_STATE.COMPLETED,
       ORDER_STATE.CANCELLED,
     ];
     if (unsafe.includes(order.state)) {
-      logger.warn('Auto-cancel skipped — past safe point (post-payment)', {
+      logger.warn('Auto-cancel skipped — past safe point (post-payment / manual)', {
         orderNo, state: order.state, reason,
       });
       return;
     }
 
-    // Belt-and-suspenders data guard. Even if the state somehow isn't in
-    // the unsafe list above, the presence of a payout id or a real (non-
-    // PEND-) UTR means payment-provider has paid and/or markOrderAsPaid has been
-    // called for this order — never cancel in that case.
+    // Belt-and-suspenders data guards. Any of these means we've already
+    // committed to paying (or marked paid on Binance) — never cancel.
     const realUtr = order.utr && !String(order.utr).startsWith('PEND-');
-    if (order.payoutId || realUtr) {
-      logger.warn('Auto-cancel skipped — payout already initiated (data guard)', {
+    if (order.payoutId || realUtr || order.paidOnBinance) {
+      logger.warn('Auto-cancel skipped — payment already committed (data guard)', {
         orderNo, state: order.state, reason,
-        payoutId: order.payoutId || null,
-        utr:      order.utr || null,
+        payoutId:       order.payoutId      || null,
+        utr:            order.utr           || null,
+        paidOnBinance:  order.paidOnBinance || false,
       });
       return;
     }
@@ -1342,8 +1346,16 @@ class OrderHandler {
       // delivered to the seller via the paymentSent chat template once
       // payment-provider confirms. This preempts Binance's notify_pay_end_time
       // auto-cancel during the 75-sec payment-provider poll.
+      //
+      // Sets `paidOnBinance: true` in state so _autoCancel's data-guard sees
+      // this commit and refuses to cancel the order from this point on
+      // (per business rule: once markPaid is called, only an explicit payout
+      // failure may cancel — never the timeout-driven auto-cancel).
       try {
         await markOrderAsPaid(orderNo, payDetails.payId, null);
+        stateManager.set(orderNo, stateManager.get(orderNo)?.state, {
+          paidOnBinance: true,
+        });
         logger.info('Order marked as paid on Binance (early — pre-payment-provider)', {
           orderNo, payId: payDetails.payId,
         });
