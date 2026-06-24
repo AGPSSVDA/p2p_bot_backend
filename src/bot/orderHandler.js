@@ -2002,6 +2002,17 @@ class OrderHandler {
     //   name_match_status = 'MATCH'.
     // Fire-and-forget — DB hiccup must not break the live flow.
     orderDb.promoteToVerifiedIfEligible(orderNo);
+
+    // Auto-convert the just-released crypto into the configured target
+    // asset (e.g. ETH → USDT). Completely silent — no chat messages, no
+    // state transitions. Gated by auto_convert_enabled in bot_config.
+    // Fire-and-forget — any failure is recorded in the `conversions` table
+    // and surfaced on the Convert page, never blocks the order lifecycle.
+    require('../services/convertService')
+      .convertAfterRelease(order)
+      .catch((err) => logger.error('convertAfterRelease threw', {
+        orderNo, error: err.message,
+      }));
   }
 }
 

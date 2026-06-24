@@ -687,6 +687,8 @@ async function initMysql() {
         imps_daily_cap INT NOT NULL DEFAULT 500000,
         payment_provider VARCHAR(20) NOT NULL DEFAULT 'razorpay',
         bank_verify_enabled TINYINT(1) NOT NULL DEFAULT 0,
+        auto_convert_enabled TINYINT(1) NOT NULL DEFAULT 0,
+        convert_target_asset VARCHAR(16) NOT NULL DEFAULT 'USDT',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
@@ -697,6 +699,9 @@ async function initMysql() {
     // bank_verify_enabled: toggle for the Surepass bank-side name verify
     // step (legacy column name was cashfree_bank_verify_enabled — provider
     // was swapped to Surepass long ago, only the column name was stale).
+    // auto_convert_enabled + convert_target_asset: when ON, the bot calls
+    // Binance Convert API to swap the just-received crypto from a P2P
+    // completion into the configured target asset (USDT by default).
     await ensureColumns(connection, 'bot_config', [
       { name: 'auto_cancel_buffer_ms',        def: 'INT NOT NULL DEFAULT 60000' },
       { name: 'pan_timeout_ms',               def: 'INT NOT NULL DEFAULT 600000' },
@@ -706,6 +711,8 @@ async function initMysql() {
       { name: 'imps_daily_cap',               def: 'INT NOT NULL DEFAULT 500000' },
       { name: 'payment_provider',             def: "VARCHAR(20) NOT NULL DEFAULT 'razorpay'" },
       { name: 'bank_verify_enabled',          def: 'TINYINT(1) NOT NULL DEFAULT 0' },
+      { name: 'auto_convert_enabled',         def: 'TINYINT(1) NOT NULL DEFAULT 0' },
+      { name: 'convert_target_asset',         def: "VARCHAR(16) NOT NULL DEFAULT 'USDT'" },
     ]);
     // Migration: copy legacy cashfree_bank_verify_enabled → bank_verify_enabled
     // then drop the old column. Idempotent.
@@ -727,6 +734,86 @@ async function initMysql() {
     } catch (e) {
       console.warn(`   • skip dropping cashfree_bank_verify_enabled: ${e.message}`);
     }
+
+    // ── convert_assets (allowed target coins for Auto-Convert dropdown) ──────
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS convert_assets (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        symbol VARCHAR(16) UNIQUE NOT NULL,
+        name VARCHAR(64) NULL,
+        enabled TINYINT(1) NOT NULL DEFAULT 1,
+        sort_order INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    await ensureColumns(connection, 'convert_assets', [
+      { name: 'symbol',     def: 'VARCHAR(16) NOT NULL' },
+      { name: 'name',       def: 'VARCHAR(64) NULL' },
+      { name: 'enabled',    def: 'TINYINT(1) NOT NULL DEFAULT 1' },
+      { name: 'sort_order', def: 'INT NOT NULL DEFAULT 0' },
+    ]);
+
+    // Seed default convert-target options. Idempotent — only inserts symbols
+    // that don't already exist. Admin can add more via POST /api/convert/assets.
+    const DEFAULT_CONVERT_ASSETS = [
+      { symbol: 'USDT', name: 'Tether',         sort: 1 },
+      { symbol: 'USDC', name: 'USD Coin',       sort: 2 },
+      { symbol: 'BTC',  name: 'Bitcoin',        sort: 3 },
+      { symbol: 'ETH',  name: 'Ethereum',       sort: 4 },
+      { symbol: 'BNB',  name: 'BNB',            sort: 5 },
+      { symbol: 'SOL',  name: 'Solana',         sort: 6 },
+      { symbol: 'XRP',  name: 'Ripple',         sort: 7 },
+      { symbol: 'ADA',  name: 'Cardano',        sort: 8 },
+      { symbol: 'MATIC', name: 'Polygon',       sort: 9 },
+      { symbol: 'DOGE', name: 'Dogecoin',       sort: 10 },
+      { symbol: 'DOT',  name: 'Polkadot',       sort: 11 },
+      { symbol: 'AVAX', name: 'Avalanche',      sort: 12 },
+      { symbol: 'TRX',  name: 'TRON',           sort: 13 },
+      { symbol: 'LTC',  name: 'Litecoin',       sort: 14 },
+      { symbol: 'LINK', name: 'Chainlink',      sort: 15 },
+    ];
+    for (const a of DEFAULT_CONVERT_ASSETS) {
+      await connection.query(
+        `INSERT IGNORE INTO convert_assets (symbol, name, enabled, sort_order)
+         VALUES (?, ?, 1, ?)`,
+        [a.symbol, a.name, a.sort]
+      );
+    }
+
+    // ── conversions (history of every auto-convert attempt) ──────────────────
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS conversions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        order_no VARCHAR(64) NOT NULL,
+        from_asset VARCHAR(16) NOT NULL,
+        to_asset VARCHAR(16) NOT NULL,
+        from_amount DECIMAL(28, 8) NOT NULL,
+        to_amount DECIMAL(28, 8) NULL,
+        rate DECIMAL(28, 12) NULL,
+        binance_quote_id VARCHAR(64) NULL,
+        binance_order_id VARCHAR(64) NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        error_message VARCHAR(500) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_conv_order   (order_no),
+        INDEX idx_conv_status  (status),
+        INDEX idx_conv_created (created_at)
+      )
+    `);
+    await ensureColumns(connection, 'conversions', [
+      { name: 'order_no',         def: 'VARCHAR(64) NOT NULL' },
+      { name: 'from_asset',       def: 'VARCHAR(16) NOT NULL' },
+      { name: 'to_asset',         def: 'VARCHAR(16) NOT NULL' },
+      { name: 'from_amount',      def: 'DECIMAL(28, 8) NOT NULL' },
+      { name: 'to_amount',        def: 'DECIMAL(28, 8) NULL' },
+      { name: 'rate',             def: 'DECIMAL(28, 12) NULL' },
+      { name: 'binance_quote_id', def: 'VARCHAR(64) NULL' },
+      { name: 'binance_order_id', def: 'VARCHAR(64) NULL' },
+      { name: 'status',           def: "VARCHAR(20) NOT NULL DEFAULT 'PENDING'" },
+      { name: 'error_message',    def: 'VARCHAR(500) NULL' },
+    ]);
 
     // ── orders (DB-persisted lifecycle) ───────────────────────────────────────
     await connection.query(`

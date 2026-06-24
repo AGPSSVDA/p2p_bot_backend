@@ -29,6 +29,8 @@ const DEFAULTS = {
   imps_daily_cap:  500000,   // ₹5 lakh — total IMPS sent in last 24h
   payment_provider: "razorpay",
   bank_verify_enabled: 0,    // Surepass bank-name re-verify (returning seller)
+  auto_convert_enabled: 0,   // Binance Convert API auto-swap on completion
+  convert_target_asset: "USDT",
 };
 
 async function refresh() {
@@ -39,7 +41,8 @@ async function refresh() {
         `SELECT bot_status, auto_payout,
                 auto_cancel_buffer_ms, pan_timeout_ms, pan_reminder_ms,
                 imps_max_amount, neft_max_amount, imps_daily_cap,
-                payment_provider, bank_verify_enabled
+                payment_provider, bank_verify_enabled,
+                auto_convert_enabled, convert_target_asset
          FROM bot_config ORDER BY id ASC LIMIT 1`
       );
       cachedStatus = rows[0] ? { ...DEFAULTS, ...rows[0] } : { ...DEFAULTS };
@@ -107,6 +110,19 @@ async function isBankVerifyEnabled() {
   return Number(s?.bank_verify_enabled) === 1;
 }
 
+// Auto-convert toggle (Binance Convert API after P2P release).
+async function isAutoConvertEnabled() {
+  const s = await getStatus();
+  return Number(s?.auto_convert_enabled) === 1;
+}
+
+// Target asset for auto-convert (e.g. 'USDT', 'BTC', 'BNB'...).
+async function getConvertTargetAsset() {
+  const s = await getStatus();
+  const raw = String(s?.convert_target_asset || DEFAULTS.convert_target_asset).trim().toUpperCase();
+  return raw || DEFAULTS.convert_target_asset;
+}
+
 // Returns the three payment-mode tier thresholds as raw rupee amounts.
 // Caller is responsible for handling them as integers (no decimal paisa).
 async function getPaymentLimits() {
@@ -136,6 +152,8 @@ module.exports = {
   getPanReminderMs,
   getActivePaymentProvider,
   isBankVerifyEnabled,
+  isAutoConvertEnabled,
+  getConvertTargetAsset,
   getPaymentLimits,
   invalidate,
 };

@@ -479,6 +479,67 @@ async function getMyAds() {
   }
 }
 
+// ─── 10. Binance Convert API ─────────────────────────────────────────────────
+//   POST /sapi/v1/convert/getQuote        — request a quote (~10 sec validity)
+//   POST /sapi/v1/convert/acceptQuote     — execute by quoteId
+//   GET  /sapi/v1/convert/orderStatus     — verify the conversion outcome
+//
+//   All endpoints are signed (SAPI). API key needs "Spot & Margin Trading"
+//   OR "Convert" permission enabled in Binance API Management.
+
+// Request a quote for converting `fromAmount` of `fromAsset` → `toAsset`.
+// Returns { quoteId, ratio, inverseRatio, validTime, toAmount, ... }.
+async function getConvertQuote(fromAsset, toAsset, fromAmount) {
+  const qs = buildSignedQuery({
+    fromAsset,
+    toAsset,
+    fromAmount: String(fromAmount),
+  });
+  const res = await axios.post(
+    `${url('/sapi/v1/convert/getQuote')}?${qs}`,
+    null,
+    { headers: headers(), timeout: 12000 }
+  );
+  return res.data?.data || res.data;
+}
+
+// Execute a previously-quoted conversion. Returns { orderId, createTime,
+// orderStatus: 'PROCESS' | 'SUCCESS' | ... }.
+async function acceptConvertQuote(quoteId) {
+  const qs = buildSignedQuery({ quoteId });
+  const res = await axios.post(
+    `${url('/sapi/v1/convert/acceptQuote')}?${qs}`,
+    null,
+    { headers: headers(), timeout: 12000 }
+  );
+  return res.data?.data || res.data;
+}
+
+// Fetch the final state of a conversion order — used to confirm SUCCESS
+// after acceptQuote (which may return PROCESS initially).
+async function getConvertOrderStatus({ orderId, quoteId } = {}) {
+  const qs = buildSignedQuery(orderId ? { orderId } : { quoteId });
+  const res = await axios.get(
+    `${url('/sapi/v1/convert/orderStatus')}?${qs}`,
+    { headers: headers(), timeout: 12000 }
+  );
+  return res.data?.data || res.data;
+}
+
+// Read the live spot wallet balance for a single asset. Used right after a
+// P2P release to confirm the just-released crypto has actually landed
+// before we attempt to convert it.
+async function getSpotBalance(asset) {
+  const qs = buildSignedQuery({});
+  const res = await axios.get(
+    `${url('/api/v3/account')}?${qs}`,
+    { headers: headers(), timeout: 12000 }
+  );
+  const balances = res.data?.balances || [];
+  const row = balances.find((b) => String(b.asset).toUpperCase() === String(asset).toUpperCase());
+  return row ? { free: Number(row.free) || 0, locked: Number(row.locked) || 0 } : { free: 0, locked: 0 };
+}
+
 module.exports = {
   ORDER_STATUS,
   CANCEL_REASON,
@@ -496,4 +557,8 @@ module.exports = {
   extractPaymentDetails,
   getMyAds,
   getOrdersByStatus,
+  getConvertQuote,
+  acceptConvertQuote,
+  getConvertOrderStatus,
+  getSpotBalance,
 };

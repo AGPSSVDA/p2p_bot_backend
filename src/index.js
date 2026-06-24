@@ -25,6 +25,7 @@ const adsRoutes = require("./routes/adsRoutes");
 const paymentsRoutes = require("./routes/paymentsRoutes");
 const tdsRoutes = require("./routes/tdsRoutes");
 const adminRoutes = require("./routes/adminRoutes");
+const convertRoutes = require("./routes/convertRoutes");
 const {
   handleRazorpayWebhook,
   handlePaywizeWebhook,
@@ -90,6 +91,7 @@ app.use("/api/ads", adsRoutes);
 app.use("/api/payments", paymentsRoutes);
 app.use("/api/tds", tdsRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/convert", convertRoutes);
 
 app.get("/api/health", (req, res) => {
   res.json({

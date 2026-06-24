@@ -71,6 +71,24 @@ async function updateBotConfig(id, data) {
     fields.push("bank_verify_enabled = ?");
     values.push(data.bank_verify_enabled ? 1 : 0);
   }
+  if (data.auto_convert_enabled !== undefined) {
+    fields.push("auto_convert_enabled = ?");
+    values.push(data.auto_convert_enabled ? 1 : 0);
+  }
+  if (data.convert_target_asset !== undefined) {
+    // Whitelist against convert_assets table — only enabled symbols allowed.
+    const sym = String(data.convert_target_asset || "").trim().toUpperCase();
+    if (sym) {
+      const [rows] = await pool.query(
+        "SELECT symbol FROM convert_assets WHERE symbol = ? AND enabled = 1 LIMIT 1",
+        [sym]
+      );
+      if (rows.length > 0) {
+        fields.push("convert_target_asset = ?");
+        values.push(sym);
+      }
+    }
+  }
   if (data.bot_name !== undefined) {
     fields.push("bot_name = ?");
     values.push(data.bot_name);
