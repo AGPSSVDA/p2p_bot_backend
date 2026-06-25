@@ -11,22 +11,45 @@ const logger = require("../utils/logger");
 // ─────────────────────────────────────────────────────────────────────────────
 //  convertService — Auto-convert after a P2P order completes.
 //
+//  SEMANTICS (new):
+//    - Target asset is FIXED = USDT (system-wide).
+//    - User selects a list of SOURCE coins on the frontend (the convert_assets
+//      table — rows with enabled=1 are "auto-convert me" sources).
+//    - When an order completes, the bot checks: is the released asset in the
+//      enabled source list? If yes → convert to USDT. If no → SKIPPED.
+//
 //  Flow (single attempt, no retry — per user requirement):
-//    1. Skip if auto_convert_enabled = 0 in bot_config.
-//    2. Skip if order asset already equals the target asset.
-//    3. Insert a PENDING row into `conversions` immediately (so the UI shows
+//    1. Skip if auto_convert_enabled = 0 in bot_config (master switch).
+//    2. Skip if order asset is already USDT (nothing to convert).
+//    3. Skip if order asset is NOT in the enabled convert_assets list.
+//    4. Insert a PENDING row into `conversions` immediately (so the UI shows
 //       the attempt even if it later fails).
-//    4. Poll the spot wallet for up to ~10s to confirm the released crypto
+//    5. Poll the spot wallet for up to ~10s to confirm the released crypto
 //       has actually landed (Binance can lag 1-5s after status=COMPLETED).
-//    5. Request a quote, accept it, verify orderStatus.
-//    6. Update the conversions row with SUCCESS + to_amount/rate/ref ids
+//    6. Request a quote, accept it, verify orderStatus.
+//    7. Update the conversions row with SUCCESS + to_amount/rate/ref ids
 //       OR FAILED + error_message.
 //
 //  Chat messages: NONE. This module is completely silent to the seller.
 // ─────────────────────────────────────────────────────────────────────────────
 
+const FIXED_TARGET = "USDT";
 const BALANCE_POLL_TIMEOUT_MS = 10_000;
 const BALANCE_POLL_INTERVAL_MS = 1_500;
+
+// Returns true if `symbol` is in the enabled source list. False otherwise.
+async function isSourceEnabled(symbol) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT id FROM convert_assets WHERE symbol = ? AND enabled = 1 LIMIT 1",
+      [String(symbol).toUpperCase()]
+    );
+    return rows.length > 0;
+  } catch (err) {
+    logger.warn("isSourceEnabled query failed", { symbol, error: err.message });
+    return false;
+  }
+}
 
 async function insertPending(orderNo, fromAsset, toAsset, fromAmount) {
   const [result] = await pool.query(
@@ -85,7 +108,6 @@ async function waitForBalance(asset, minAmount, timeoutMs = BALANCE_POLL_TIMEOUT
     }
     await new Promise((r) => setTimeout(r, BALANCE_POLL_INTERVAL_MS));
   }
-  // Last-ditch read so the caller sees what we ended with
   try {
     const bal = await getSpotBalance(asset);
     return bal.free;
@@ -101,6 +123,7 @@ async function convertAfterRelease(order) {
   const orderNo = order?.orderNo;
   const fromAsset = String(order?.asset || "").toUpperCase();
   const fromAmount = Number(order?.cryptoAmount) || 0;
+  const toAsset = FIXED_TARGET;
 
   if (!orderNo || !fromAsset || !(fromAmount > 0)) {
     logger.debug("convertService: nothing to convert (missing fields)", {
@@ -109,30 +132,40 @@ async function convertAfterRelease(order) {
     return;
   }
 
-  // Read current config
+  // ── Gate 1: Master switch (auto_convert_enabled) ───────────────────────────
   let enabled = false;
-  let toAsset = "USDT";
   try {
     enabled = await botStatusService.isAutoConvertEnabled();
-    toAsset = (await botStatusService.getConvertTargetAsset()) || "USDT";
   } catch (err) {
-    logger.warn("convertService: failed to read bot_config — skipping convert", {
+    logger.warn("convertService: failed to read auto_convert_enabled — skipping", {
       orderNo, error: err.message,
     });
     return;
   }
-
   if (!enabled) {
     logger.info("convertService: auto-convert disabled — skipping", { orderNo });
     return;
   }
 
-  toAsset = String(toAsset).toUpperCase();
+  // ── Gate 2: Source equals target (USDT → USDT is a no-op) ──────────────────
   if (fromAsset === toAsset) {
-    logger.info("convertService: source == target — nothing to convert", {
-      orderNo, asset: fromAsset,
+    logger.info("convertService: source already USDT — nothing to convert", {
+      orderNo,
     });
-    await markSkipped(orderNo, fromAsset, toAsset, fromAmount, "Source asset equals target asset").catch(() => {});
+    await markSkipped(orderNo, fromAsset, toAsset, fromAmount, "Source asset is already USDT").catch(() => {});
+    return;
+  }
+
+  // ── Gate 3: Source coin must be in the enabled convert_assets list ─────────
+  const inSourceList = await isSourceEnabled(fromAsset);
+  if (!inSourceList) {
+    logger.info("convertService: source coin not in enabled list — skipping", {
+      orderNo, fromAsset,
+    });
+    await markSkipped(
+      orderNo, fromAsset, toAsset, fromAmount,
+      `Source asset ${fromAsset} is not enabled in the auto-convert list`
+    ).catch(() => {});
     return;
   }
 
@@ -201,7 +234,6 @@ async function convertAfterRelease(order) {
   let finalToAmount = expectedToAmount;
   if (orderId && initialStatus !== "SUCCESS") {
     try {
-      // brief delay before status check
       await new Promise((r) => setTimeout(r, 1500));
       const status = await getConvertOrderStatus({ orderId });
       finalStatus = String(status?.orderStatus || finalStatus).toUpperCase();
@@ -232,4 +264,4 @@ async function convertAfterRelease(order) {
   }
 }
 
-module.exports = { convertAfterRelease };
+module.exports = { convertAfterRelease, FIXED_TARGET };

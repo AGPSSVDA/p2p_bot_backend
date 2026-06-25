@@ -116,11 +116,12 @@ async function isAutoConvertEnabled() {
   return Number(s?.auto_convert_enabled) === 1;
 }
 
-// Target asset for auto-convert (e.g. 'USDT', 'BTC', 'BNB'...).
+// Target asset for auto-convert is HARDCODED to USDT system-wide.
+// The convert_target_asset column is retained for backwards-compat only;
+// it's no longer read by the convert flow. The frontend lets the operator
+// select SOURCE coins (in convert_assets) — not the target.
 async function getConvertTargetAsset() {
-  const s = await getStatus();
-  const raw = String(s?.convert_target_asset || DEFAULTS.convert_target_asset).trim().toUpperCase();
-  return raw || DEFAULTS.convert_target_asset;
+  return "USDT";
 }
 
 // Returns the three payment-mode tier thresholds as raw rupee amounts.

@@ -73,17 +73,26 @@ async function addAsset(req, res) {
       });
     }
 
+    // Default enabled=0 (opt-in). Operator explicitly toggles each coin ON
+    // from the Convert page to start auto-converting it.
+    const initialEnabled = req.body.enabled === true ? 1 : 0;
     const [result] = await pool.query(
       `INSERT INTO convert_assets (symbol, name, enabled, sort_order)
-       VALUES (?, ?, 1, ?)`,
-      [symbol, name, finalSortOrder]
+       VALUES (?, ?, ?, ?)`,
+      [symbol, name, initialEnabled, finalSortOrder]
     );
 
-    logger.info("Convert asset added", { symbol, name, user: req.user?.email });
+    logger.info("Convert asset added", { symbol, name, enabled: initialEnabled, user: req.user?.email });
     res.status(201).json({
       success: true,
-      message: `Added ${symbol} to convert-target list`,
-      data: { id: result.insertId, symbol, name, enabled: true, sort_order: finalSortOrder },
+      message: `Added ${symbol} to the source-coin list`,
+      data: {
+        id:         result.insertId,
+        symbol,
+        name,
+        enabled:    initialEnabled === 1,
+        sort_order: finalSortOrder,
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message, data: null });
@@ -130,23 +139,13 @@ async function updateAsset(req, res) {
 }
 
 // ── DELETE /api/convert/assets/:symbol ───────────────────────────────────────
+//   Removes a source coin from the auto-convert list. Target is hardcoded to
+//   USDT system-wide, so there's no "active target" to protect against here.
 async function deleteAsset(req, res) {
   try {
     const symbol = String(req.params.symbol || "").trim().toUpperCase();
     if (!symbol) {
       return res.status(400).json({ success: false, message: "symbol path param required", data: null });
-    }
-
-    // Guard: don't delete the symbol that's currently selected as target
-    const [[cfg]] = await pool.query(
-      "SELECT convert_target_asset FROM bot_config ORDER BY id ASC LIMIT 1"
-    );
-    if (cfg && String(cfg.convert_target_asset || "").toUpperCase() === symbol) {
-      return res.status(409).json({
-        success: false,
-        message: `Cannot delete ${symbol} — it's currently the active convert target`,
-        data: null,
-      });
     }
 
     const [result] = await pool.query(

@@ -754,29 +754,30 @@ async function initMysql() {
       { name: 'sort_order', def: 'INT NOT NULL DEFAULT 0' },
     ]);
 
-    // Seed default convert-target options. Idempotent — only inserts symbols
-    // that don't already exist. Admin can add more via POST /api/convert/assets.
+    // Seed default SOURCE coin catalog. enabled=0 by default — the operator
+    // explicitly opts each coin in via the Convert page. USDT is excluded
+    // since it's the fixed target (converting USDT→USDT is a no-op).
+    // Idempotent — only inserts symbols that don't already exist.
     const DEFAULT_CONVERT_ASSETS = [
-      { symbol: 'USDT', name: 'Tether',         sort: 1 },
-      { symbol: 'USDC', name: 'USD Coin',       sort: 2 },
-      { symbol: 'BTC',  name: 'Bitcoin',        sort: 3 },
-      { symbol: 'ETH',  name: 'Ethereum',       sort: 4 },
-      { symbol: 'BNB',  name: 'BNB',            sort: 5 },
-      { symbol: 'SOL',  name: 'Solana',         sort: 6 },
-      { symbol: 'XRP',  name: 'Ripple',         sort: 7 },
-      { symbol: 'ADA',  name: 'Cardano',        sort: 8 },
-      { symbol: 'MATIC', name: 'Polygon',       sort: 9 },
-      { symbol: 'DOGE', name: 'Dogecoin',       sort: 10 },
-      { symbol: 'DOT',  name: 'Polkadot',       sort: 11 },
-      { symbol: 'AVAX', name: 'Avalanche',      sort: 12 },
-      { symbol: 'TRX',  name: 'TRON',           sort: 13 },
-      { symbol: 'LTC',  name: 'Litecoin',       sort: 14 },
-      { symbol: 'LINK', name: 'Chainlink',      sort: 15 },
+      { symbol: 'BTC',  name: 'Bitcoin',     sort: 1 },
+      { symbol: 'ETH',  name: 'Ethereum',    sort: 2 },
+      { symbol: 'BNB',  name: 'BNB',         sort: 3 },
+      { symbol: 'SOL',  name: 'Solana',      sort: 4 },
+      { symbol: 'XRP',  name: 'Ripple',      sort: 5 },
+      { symbol: 'ADA',  name: 'Cardano',     sort: 6 },
+      { symbol: 'MATIC', name: 'Polygon',    sort: 7 },
+      { symbol: 'DOGE', name: 'Dogecoin',    sort: 8 },
+      { symbol: 'DOT',  name: 'Polkadot',    sort: 9 },
+      { symbol: 'AVAX', name: 'Avalanche',   sort: 10 },
+      { symbol: 'TRX',  name: 'TRON',        sort: 11 },
+      { symbol: 'LTC',  name: 'Litecoin',    sort: 12 },
+      { symbol: 'LINK', name: 'Chainlink',   sort: 13 },
+      { symbol: 'USDC', name: 'USD Coin',    sort: 14 },
     ];
     for (const a of DEFAULT_CONVERT_ASSETS) {
       await connection.query(
         `INSERT IGNORE INTO convert_assets (symbol, name, enabled, sort_order)
-         VALUES (?, ?, 1, ?)`,
+         VALUES (?, ?, 0, ?)`,
         [a.symbol, a.name, a.sort]
       );
     }
