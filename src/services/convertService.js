@@ -5,6 +5,7 @@ const {
   acceptConvertQuote,
   getConvertOrderStatus,
   getSpotBalance,
+  getFundingBalance,
 } = require("./binanceService");
 const logger = require("../utils/logger");
 
@@ -34,8 +35,10 @@ const logger = require("../utils/logger");
 // ─────────────────────────────────────────────────────────────────────────────
 
 const FIXED_TARGET = "USDT";
-const BALANCE_POLL_TIMEOUT_MS = 10_000;
-const BALANCE_POLL_INTERVAL_MS = 1_500;
+// Binance can take 10-30 sec to credit the wallet after a P2P release in
+// some merchant scenarios — give a generous 45-second window.
+const BALANCE_POLL_TIMEOUT_MS = 45_000;
+const BALANCE_POLL_INTERVAL_MS = 2_000;
 
 // Returns true if `symbol` is in the enabled source list. False otherwise.
 async function isSourceEnabled(symbol) {
@@ -94,26 +97,49 @@ async function markSkipped(orderNo, fromAsset, toAsset, fromAmount, reason) {
   );
 }
 
-// Poll spot balance until at least `minAmount` of `asset` is free, or timeout.
+// Poll BOTH spot AND funding wallets until at least `minAmount` of `asset`
+// is free in one of them, or timeout. Returns the first wallet that has the
+// balance so the caller can target the convert against the correct wallet.
+//
+//   For Binance merchant accounts, P2P releases are credited to the FUNDING
+//   wallet by default — checking Spot only (the old behaviour) is why
+//   conversions were failing with "have 0, need X".
+//
+// Returns: { walletType: 'SPOT' | 'FUNDING' | null, available: number,
+//           spot: number, funding: number }
 async function waitForBalance(asset, minAmount, timeoutMs = BALANCE_POLL_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
+  let lastSpot = 0;
+  let lastFunding = 0;
+
   while (Date.now() < deadline) {
     try {
-      const bal = await getSpotBalance(asset);
-      if (bal.free >= minAmount) return bal.free;
+      const spot = await getSpotBalance(asset);
+      lastSpot = spot.free;
+      if (spot.free >= minAmount) {
+        return { walletType: 'SPOT', available: spot.free, spot: spot.free, funding: lastFunding };
+      }
     } catch (err) {
-      logger.warn("convertService: balance poll failed (will retry)", {
+      logger.warn("convertService: spot balance poll failed (will retry)", {
+        asset, error: err.message,
+      });
+    }
+    try {
+      const funding = await getFundingBalance(asset);
+      lastFunding = funding.free;
+      if (funding.free >= minAmount) {
+        return { walletType: 'FUNDING', available: funding.free, spot: lastSpot, funding: funding.free };
+      }
+    } catch (err) {
+      logger.warn("convertService: funding balance poll failed (will retry)", {
         asset, error: err.message,
       });
     }
     await new Promise((r) => setTimeout(r, BALANCE_POLL_INTERVAL_MS));
   }
-  try {
-    const bal = await getSpotBalance(asset);
-    return bal.free;
-  } catch (_) {
-    return 0;
-  }
+
+  // Timed out — last-ditch reads so the caller sees the final state in logs
+  return { walletType: null, available: 0, spot: lastSpot, funding: lastFunding };
 }
 
 // Main entry point — called from orderHandler.complete() right after the
@@ -132,7 +158,25 @@ async function convertAfterRelease(order) {
     return;
   }
 
-  // ── Gate 1: Master switch (auto_convert_enabled) ───────────────────────────
+  // ── Gate 0: Master bot kill-switch (bot_status) ────────────────────────────
+  //   When the operator toggles Bot Status OFF from the Overview page, the
+  //   entire bot is considered paused — including auto-convert. This is the
+  //   first gate, ahead of even the auto-convert toggle.
+  let botEnabled = false;
+  try {
+    botEnabled = await botStatusService.isBotEnabled();
+  } catch (err) {
+    logger.warn("convertService: failed to read bot_status — assuming OFF, skipping", {
+      orderNo, error: err.message,
+    });
+    return;
+  }
+  if (!botEnabled) {
+    logger.info("convertService: bot is OFF — conversion suppressed", { orderNo });
+    return;
+  }
+
+  // ── Gate 1: Auto-convert master switch (auto_convert_enabled) ──────────────
   let enabled = false;
   try {
     enabled = await botStatusService.isAutoConvertEnabled();
@@ -185,25 +229,37 @@ async function convertAfterRelease(order) {
     orderNo, fromAsset, toAsset, fromAmount, rowId,
   });
 
-  // Wait for the released crypto to actually appear in spot wallet
-  const available = await waitForBalance(fromAsset, fromAmount);
-  if (available < fromAmount) {
-    const msg = `Spot balance after release was insufficient (have ${available}, need ${fromAmount})`;
+  // Wait for the released crypto to actually appear in spot OR funding wallet.
+  // P2P releases credit the FUNDING wallet by default on merchant accounts;
+  // converting from FUNDING requires `walletType: 'FUNDING'` on the quote.
+  const balance = await waitForBalance(fromAsset, fromAmount);
+  logger.info("convertService: post-release balance check", {
+    orderNo,
+    fromAsset,
+    needed: fromAmount,
+    spotFree: balance.spot,
+    fundingFree: balance.funding,
+    chose: balance.walletType || '(none)',
+  });
+  if (!balance.walletType) {
+    const msg = `Released crypto did not appear in time. Spot=${balance.spot} Funding=${balance.funding} need=${fromAmount}`;
     logger.warn("convertService: balance never landed in time — marking FAILED", {
-      orderNo, fromAsset, fromAmount, available,
+      orderNo, fromAsset, fromAmount,
+      spotFree: balance.spot, fundingFree: balance.funding,
     });
     await markFailed(rowId, msg).catch(() => {});
     return;
   }
+  const walletType = balance.walletType;
 
-  // SINGLE-ATTEMPT QUOTE + ACCEPT
+  // SINGLE-ATTEMPT QUOTE + ACCEPT (using the wallet that actually has the funds)
   let quote;
   try {
-    quote = await getConvertQuote(fromAsset, toAsset, fromAmount);
+    quote = await getConvertQuote(fromAsset, toAsset, fromAmount, { walletType });
   } catch (err) {
     const msg = err.response?.data?.msg || err.message || "getQuote failed";
-    logger.error("convertService: getQuote failed", { orderNo, error: msg });
-    await markFailed(rowId, `getQuote: ${msg}`).catch(() => {});
+    logger.error("convertService: getQuote failed", { orderNo, walletType, error: msg });
+    await markFailed(rowId, `getQuote (${walletType}): ${msg}`).catch(() => {});
     return;
   }
   const quoteId = quote?.quoteId;

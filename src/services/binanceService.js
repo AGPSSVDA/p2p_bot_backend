@@ -488,12 +488,16 @@ async function getMyAds() {
 //   OR "Convert" permission enabled in Binance API Management.
 
 // Request a quote for converting `fromAmount` of `fromAsset` → `toAsset`.
+// walletType: 'SPOT' (default) or 'FUNDING'. P2P releases land in FUNDING
+// for merchant accounts — pass that when the released crypto is in funding.
 // Returns { quoteId, ratio, inverseRatio, validTime, toAmount, ... }.
-async function getConvertQuote(fromAsset, toAsset, fromAmount) {
+async function getConvertQuote(fromAsset, toAsset, fromAmount, opts = {}) {
+  const walletType = String(opts.walletType || 'SPOT').toUpperCase();
   const qs = buildSignedQuery({
     fromAsset,
     toAsset,
     fromAmount: String(fromAmount),
+    walletType,
   });
   const res = await axios.post(
     `${url('/sapi/v1/convert/getQuote')}?${qs}`,
@@ -526,9 +530,7 @@ async function getConvertOrderStatus({ orderId, quoteId } = {}) {
   return res.data?.data || res.data;
 }
 
-// Read the live spot wallet balance for a single asset. Used right after a
-// P2P release to confirm the just-released crypto has actually landed
-// before we attempt to convert it.
+// Read the live spot wallet balance for a single asset.
 async function getSpotBalance(asset) {
   const qs = buildSignedQuery({});
   const res = await axios.get(
@@ -538,6 +540,23 @@ async function getSpotBalance(asset) {
   const balances = res.data?.balances || [];
   const row = balances.find((b) => String(b.asset).toUpperCase() === String(asset).toUpperCase());
   return row ? { free: Number(row.free) || 0, locked: Number(row.locked) || 0 } : { free: 0, locked: 0 };
+}
+
+// Read the funding wallet balance for a single asset. P2P releases are
+// credited to the FUNDING wallet by default for most merchant accounts,
+// not the spot wallet — so post-release auto-convert MUST check here too.
+async function getFundingBalance(asset) {
+  const qs = buildSignedQuery({ asset: String(asset).toUpperCase() });
+  const res = await axios.post(
+    `${url('/sapi/v1/asset/get-funding-asset')}?${qs}`,
+    null,
+    { headers: headers(), timeout: 12000 }
+  );
+  const list = Array.isArray(res.data) ? res.data : (res.data?.data || []);
+  const row = list.find((r) => String(r.asset).toUpperCase() === String(asset).toUpperCase());
+  return row
+    ? { free: Number(row.free) || 0, locked: Number(row.locked) || 0 }
+    : { free: 0, locked: 0 };
 }
 
 module.exports = {
@@ -561,4 +580,5 @@ module.exports = {
   acceptConvertQuote,
   getConvertOrderStatus,
   getSpotBalance,
+  getFundingBalance,
 };
