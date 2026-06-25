@@ -39,6 +39,14 @@ const FIXED_TARGET = "USDT";
 // some merchant scenarios — give a generous 45-second window.
 const BALANCE_POLL_TIMEOUT_MS = 45_000;
 const BALANCE_POLL_INTERVAL_MS = 2_000;
+// Binance deducts a small P2P merchant fee on release (typically 0.05-0.5%),
+// so wallet credit is slightly LESS than the order's advertised cryptoAmount.
+// We accept any balance ≥ 95% of expected as "landed", then convert whatever
+// actually arrived.
+const FEE_TOLERANCE = 0.95;
+// After detecting the balance, wait a short extra delay so any final
+// settlement updates land before we read the convert amount.
+const POST_LAND_SETTLE_MS = 2_000;
 
 // Returns true if `symbol` is in the enabled source list. False otherwise.
 async function isSourceEnabled(symbol) {
@@ -97,48 +105,81 @@ async function markSkipped(orderNo, fromAsset, toAsset, fromAmount, reason) {
   );
 }
 
-// Poll BOTH spot AND funding wallets until at least `minAmount` of `asset`
-// is free in one of them, or timeout. Returns the first wallet that has the
-// balance so the caller can target the convert against the correct wallet.
+// Poll BOTH spot AND funding wallets until at least `threshold` of `asset`
+// is free in one of them, or timeout. Threshold uses FEE_TOLERANCE so a
+// Binance P2P fee deduction (typically 0.05-0.5%) doesn't trip a false
+// "balance never arrived" failure.
 //
 //   For Binance merchant accounts, P2P releases are credited to the FUNDING
 //   wallet by default — checking Spot only (the old behaviour) is why
 //   conversions were failing with "have 0, need X".
 //
+// After a wallet crosses the threshold, we wait POST_LAND_SETTLE_MS and
+// re-read once so the returned `available` is the final settled balance
+// (which is what we'll actually convert).
+//
 // Returns: { walletType: 'SPOT' | 'FUNDING' | null, available: number,
 //           spot: number, funding: number }
-async function waitForBalance(asset, minAmount, timeoutMs = BALANCE_POLL_TIMEOUT_MS) {
+async function waitForBalance(asset, expectedAmount, timeoutMs = BALANCE_POLL_TIMEOUT_MS) {
+  const threshold = expectedAmount * FEE_TOLERANCE;
   const deadline = Date.now() + timeoutMs;
   let lastSpot = 0;
   let lastFunding = 0;
 
-  while (Date.now() < deadline) {
+  const readSpot = async () => {
     try {
-      const spot = await getSpotBalance(asset);
-      lastSpot = spot.free;
-      if (spot.free >= minAmount) {
-        return { walletType: 'SPOT', available: spot.free, spot: spot.free, funding: lastFunding };
-      }
+      const b = await getSpotBalance(asset);
+      lastSpot = b.free;
+      return b.free;
     } catch (err) {
       logger.warn("convertService: spot balance poll failed (will retry)", {
         asset, error: err.message,
       });
+      return 0;
     }
+  };
+  const readFunding = async () => {
     try {
-      const funding = await getFundingBalance(asset);
-      lastFunding = funding.free;
-      if (funding.free >= minAmount) {
-        return { walletType: 'FUNDING', available: funding.free, spot: lastSpot, funding: funding.free };
-      }
+      const b = await getFundingBalance(asset);
+      lastFunding = b.free;
+      return b.free;
     } catch (err) {
       logger.warn("convertService: funding balance poll failed (will retry)", {
         asset, error: err.message,
       });
+      return 0;
+    }
+  };
+
+  while (Date.now() < deadline) {
+    const spotFree = await readSpot();
+    if (spotFree >= threshold) {
+      // Give Binance a moment to finish any post-release accounting, then
+      // re-read so we convert the final settled amount.
+      await new Promise((r) => setTimeout(r, POST_LAND_SETTLE_MS));
+      const finalSpot = await readSpot();
+      return {
+        walletType: 'SPOT',
+        available:  finalSpot >= threshold ? finalSpot : spotFree,
+        spot:       finalSpot,
+        funding:    lastFunding,
+      };
+    }
+    const fundingFree = await readFunding();
+    if (fundingFree >= threshold) {
+      await new Promise((r) => setTimeout(r, POST_LAND_SETTLE_MS));
+      const finalFunding = await readFunding();
+      return {
+        walletType: 'FUNDING',
+        available:  finalFunding >= threshold ? finalFunding : fundingFree,
+        spot:       lastSpot,
+        funding:    finalFunding,
+      };
     }
     await new Promise((r) => setTimeout(r, BALANCE_POLL_INTERVAL_MS));
   }
 
-  // Timed out — last-ditch reads so the caller sees the final state in logs
+  // Timed out — return whatever the last polls saw so caller logs are useful
   return { walletType: null, available: 0, spot: lastSpot, funding: lastFunding };
 }
 
@@ -236,13 +277,14 @@ async function convertAfterRelease(order) {
   logger.info("convertService: post-release balance check", {
     orderNo,
     fromAsset,
-    needed: fromAmount,
-    spotFree: balance.spot,
+    advertised: fromAmount,
+    spotFree:   balance.spot,
     fundingFree: balance.funding,
-    chose: balance.walletType || '(none)',
+    chose:      balance.walletType || '(none)',
+    available:  balance.available,
   });
   if (!balance.walletType) {
-    const msg = `Released crypto did not appear in time. Spot=${balance.spot} Funding=${balance.funding} need=${fromAmount}`;
+    const msg = `Released crypto did not appear in time. Spot=${balance.spot} Funding=${balance.funding} need≥${(fromAmount * FEE_TOLERANCE).toFixed(8)}`;
     logger.warn("convertService: balance never landed in time — marking FAILED", {
       orderNo, fromAsset, fromAmount,
       spotFree: balance.spot, fundingFree: balance.funding,
@@ -252,13 +294,36 @@ async function convertAfterRelease(order) {
   }
   const walletType = balance.walletType;
 
-  // SINGLE-ATTEMPT QUOTE + ACCEPT (using the wallet that actually has the funds)
+  // Use the ACTUAL settled balance for the conversion. Binance deducts a
+  // small P2P fee on release, so wallet credit is always a touch less than
+  // the order's advertised cryptoAmount. We convert what's truly available.
+  const convertAmount = Number(balance.available) || 0;
+  if (convertAmount <= 0) {
+    const msg = `Detected wallet (${walletType}) but available amount was 0`;
+    logger.warn("convertService: zero available after detect — FAILED", { orderNo, msg });
+    await markFailed(rowId, msg).catch(() => {});
+    return;
+  }
+
+  // Patch the PENDING row's from_amount to the real amount being converted
+  // (might differ slightly from the advertised cryptoAmount due to fees).
+  try {
+    await pool.query(
+      "UPDATE conversions SET from_amount = ? WHERE id = ?",
+      [convertAmount, rowId]
+    );
+  } catch (_) { /* non-fatal — display will catch up on next poll */ }
+
+  // SINGLE-ATTEMPT QUOTE + ACCEPT (using the wallet that actually has the funds
+  // and the actual settled amount, not the advertised gross).
   let quote;
   try {
-    quote = await getConvertQuote(fromAsset, toAsset, fromAmount, { walletType });
+    quote = await getConvertQuote(fromAsset, toAsset, convertAmount, { walletType });
   } catch (err) {
     const msg = err.response?.data?.msg || err.message || "getQuote failed";
-    logger.error("convertService: getQuote failed", { orderNo, walletType, error: msg });
+    logger.error("convertService: getQuote failed", {
+      orderNo, walletType, convertAmount, error: msg,
+    });
     await markFailed(rowId, `getQuote (${walletType}): ${msg}`).catch(() => {});
     return;
   }
@@ -309,7 +374,11 @@ async function convertAfterRelease(order) {
       orderId,
     }).catch(() => {});
     logger.info("convertService: conversion SUCCESS", {
-      orderNo, fromAsset, toAsset, fromAmount, toAmount: finalToAmount, rate, orderId,
+      orderNo, fromAsset, toAsset,
+      advertised: fromAmount,
+      actual:     convertAmount,
+      toAmount:   finalToAmount,
+      rate, orderId, walletType,
     });
   } else {
     const msg = `Binance returned orderStatus=${finalStatus || "(unknown)"}`;
