@@ -44,10 +44,12 @@ async function addAsset(req, res) {
       ? Math.round(Number(req.body.sort_order))
       : null;
 
-    if (!symbol || !/^[A-Z0-9]{2,16}$/.test(symbol)) {
+    // 1-16 chars — Binance has single-letter tickers (e.g. "U" = United
+    // Stables) so a minimum of 1 is correct, not 2.
+    if (!symbol || !/^[A-Z0-9]{1,16}$/.test(symbol)) {
       return res.status(400).json({
         success: false,
-        message: "symbol is required (2-16 alphanumeric uppercase chars)",
+        message: "symbol is required (1-16 alphanumeric uppercase chars)",
         data: null,
       });
     }
