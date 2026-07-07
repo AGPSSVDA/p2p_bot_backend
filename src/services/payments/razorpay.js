@@ -74,6 +74,24 @@ async function findOrCreateContact({ payDetails, orderNo }) {
     logger.debug("RazorpayX contact reused", { orderNo, contactId: find.body.items[0].id });
     return find.body.items[0].id;
   }
+  // If FIND failed (typically 401/403/network), log the full raw response —
+  // that's where the actual auth-mode / IP-block / product-not-enabled
+  // reason lives. Then fall through to the create attempt (which will
+  // also 401 with the same reason, but at least we get two data points).
+  if (!find.ok) {
+    logger.error("RazorpayX contact FIND failed — full response", {
+      orderNo,
+      status:  find.status,
+      body:    typeof find.body === "object" ? JSON.stringify(find.body) : String(find.body || find.error || "(no body)"),
+      headers: find.headers ? {
+        "x-razorpay-request-id": find.headers["x-razorpay-request-id"] || find.headers["X-Razorpay-Request-Id"],
+      } : null,
+      keyIdPrefix: String(config.razorpay.keyId || "").slice(0, 12),
+      keyIdMode:   String(config.razorpay.keyId || "").startsWith("rzp_live_") ? "LIVE"
+                : String(config.razorpay.keyId || "").startsWith("rzp_test_") ? "TEST"
+                : "UNKNOWN",
+    });
+  }
 
   // Not found — create.
   const create = await call({
@@ -91,8 +109,32 @@ async function findOrCreateContact({ payDetails, orderNo }) {
     logger.info("RazorpayX contact created", { orderNo, contactId: create.body.id });
     return create.body.id;
   }
+  // Full-fidelity error dump so we can distinguish:
+  //   401 with { error.description: "Authentication failed" }             — bad keys
+  //   401 with { error.description: "The api key provided is invalid" }   — bad keys
+  //   401 with { error.description: "IP not whitelisted for this key" }   — dashboard IP restriction
+  //   400 with { error.description: "RazorpayX is not enabled..." }       — product not activated
+  //   400 with { error.reason: "test_mode_..." }                          — test/live mismatch
+  const errDump = typeof create.body === "object"
+    ? JSON.stringify(create.body)
+    : String(create.body || create.error || "(no body)");
+  logger.error("RazorpayX contact CREATE failed — full response", {
+    orderNo,
+    status:      create.status,
+    body:        errDump,
+    keyIdPrefix: String(config.razorpay.keyId || "").slice(0, 12),
+    keyIdMode:   String(config.razorpay.keyId || "").startsWith("rzp_live_") ? "LIVE"
+              : String(config.razorpay.keyId || "").startsWith("rzp_test_") ? "TEST"
+              : "UNKNOWN",
+    hasSecret:   !!config.razorpay.keySecret,
+    secretLen:   String(config.razorpay.keySecret || "").length,
+  });
   throw new Error(`RazorpayX contact create failed [${create.status}]: ${
-    create.body?.error?.description || create.error || "unknown"
+    create.body?.error?.description
+      || create.body?.error?.reason
+      || create.body?.message
+      || create.error
+      || errDump.slice(0, 200)
   }`);
 }
 
