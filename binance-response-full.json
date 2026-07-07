@@ -1,0 +1,68 @@
+{
+  "code": "000000",
+  "message": "success",
+  "data": [
+    {
+      "advNo": "13901080340483514368",
+      "classify": "profession",
+      "tradeType": "SELL",
+      "asset": "BTC",
+      "fiatUnit": "INR",
+      "advStatus": 3,
+      "priceType": 2,
+      "priceFloatingRatio": "114.00000000",
+      "rateFloatingRatio": "0.00000000",
+      "price": "6856196.87",
+      "initAmount": "0.00025501",
+      "surplusAmount": "0.00001330",
+      "maxSingleTransAmount": "210",
+      "minSingleTransAmount": "200",
+      "buyerKycLimit": 1,
+      "buyerRegDaysLimit": 90,
+      "buyerBtcPositionLimit": "0.00000000",
+      "remarks": "Welcome to AGPSS GLOBAL,\n\n🛑 No third party payment.\n🚫 In case Third party payment received means refund processed 48 hours or refund denied.\n1. Open any of the UPI applications. \n2. Scan the UPI QR code provided here. \n3. Make sure you are paying through your own bank account linked to the UPI application. \n4. Authorize your payment transfer using your UPI pin.\n 5. Order will be automatically released once you complete the payment. \n6. The order will not be released against 3rd party payments/ payment made using someone else's UPI account. \n7. Please do not make multiple payments to the same QR code. \n8. Please reach out to the customer support team in case the UPI payment gets stuck in pending status and the P2P order gets canceled after timeout.\n\n**your Binance name and bank account name is matched then instantly released. Otherwise not released.** \n\nStrictly Note👇\n❗➡️**Only one order per day**❗\n\nAfter completing trading please give me positive feedback. \n\nThanks.",
+      "autoReplyMsg": "🛑 𝙉𝙤 𝙩𝙝𝙞𝙧𝙙 𝙥𝙖𝙧𝙩𝙮 𝙥𝙖𝙮𝙢𝙚𝙣𝙩.\n\n🚫 In case Third party payment received means 𝙍𝙚𝙛𝙪𝙣𝙙 𝙥𝙧𝙤𝙘𝙚𝙨𝙨𝙚𝙙 48 𝙝𝙤𝙪𝙧𝙨, else refund denied. your responsibility for losses. \n\n**your Binance name and bank account name is matched then instantly released. Otherwise not released.**\n\n𝗦𝘁𝗿𝗶𝗰𝘁𝗹𝘆 𝗡𝗼𝘁𝗲👇\n❗➡️**Only one order per day**❗\n\nAfter completing trading please give me positive feedback. \nThanks.",
+      "payTimeLimit": 15,
+      "tradeMethods": [
+        {
+          "payId": 73161742,
+          "payType": "UPIQRCode",
+          "identifier": "UPIQRCode",
+          "iconUrlColor": "https://bin.bnbstatic.com/image/admin_mgs_image_upload/20220908/fd48e0a4-32da-4858-bcd9-08dfb89effa0.png",
+          "tradeMethodName": "Lightning UPI"
+        }
+      ],
+      "createTime": 1781828298713,
+      "advUpdateTime": 1782896402439,
+      "userBuyTradeCountMin": 0,
+      "userBuyTradeCountMax": 99999,
+      "userSellTradeCountMin": 0,
+      "userSellTradeCountMax": 99999,
+      "userAllTradeCountMin": 0,
+      "userAllTradeCountMax": 99999,
+      "userTradeCompleteCountMin": 0,
+      "userTradeCompleteRateMin": "0.00000000",
+      "userTradeType": 2,
+      "userTradeVolumeMin": "0.00000000",
+      "userTradeVolumeMax": "99999.00000000",
+      "offlineReason": "OFFLINE_FREE_AMOUNT_INSUFFICIENT",
+      "tradableQuantity": "0",
+      "commissionRate": "0.0012",
+      "tradeMethodCommissionRateVoList": [
+        {
+          "tradeMethodIdentifier": "UPIQRCode",
+          "tradeMethodName": "Lightning UPI",
+          "commissionRate": "0.0012"
+        }
+      ],
+      "takerAdditionalKycRequired": 0,
+      "assetLogo": "https://bin.bnbstatic.com/images/20191211/8fe832bb-8cd0-48a2-95ba-ebc5e9c40d4a.png",
+      "assetScale": 8,
+      "fiatScale": 2,
+      "priceScale": 2,
+      "fiatSymbol": "₹"
+    }
+  ],
+  "total": 9,
+  "success": true
+}

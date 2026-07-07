@@ -26,10 +26,16 @@ const paymentsRoutes = require("./routes/paymentsRoutes");
 const tdsRoutes = require("./routes/tdsRoutes");
 const adminRoutes = require("./routes/adminRoutes");
 const convertRoutes = require("./routes/convertRoutes");
+const sellerRoutes = require("./seller/routes/sellerRoutes");
+const sellerOrderPoller = require("./seller/bot/sellerOrderPoller");
 const {
   handleRazorpayWebhook,
   handlePaywizeWebhook,
 } = require("./controllers/paymentWebhookController");
+const {
+  handleSellerRazorpayWebhook,
+  handleSellerPaywizeWebhook,
+} = require("./seller/controllers/sellerPaymentWebhookController");
 const { initMysql } = require("./config/mysql");
 const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
@@ -69,6 +75,18 @@ app.post(
   handlePaywizeWebhook
 );
 
+// ── Seller payment webhooks ──
+app.post(
+  "/api/seller/razorpay/webhook",
+  express.raw({ type: "*/*", limit: "1mb" }),
+  handleSellerRazorpayWebhook
+);
+app.post(
+  "/api/seller/paywize/webhook",
+  express.raw({ type: "*/*", limit: "1mb" }),
+  handleSellerPaywizeWebhook
+);
+
 // ── Middleware ──
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
@@ -92,6 +110,7 @@ app.use("/api/payments", paymentsRoutes);
 app.use("/api/tds", tdsRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/convert", convertRoutes);
+app.use("/api/seller", sellerRoutes);
 
 app.get("/api/health", (req, res) => {
   res.json({
@@ -122,6 +141,12 @@ async function main() {
 
   // Start order poller (detects new orders + fallback chat polling)
   orderPoller.start();
+
+  // Start seller order poller (if SELLER_MODE is enabled)
+  if (process.env.SELLER_MODE === 'true' || process.env.SELLER_MODE === '1') {
+    sellerOrderPoller.start();
+    logger.info('🏪 Seller order poller started');
+  }
 
   // Stats every 2 minutes
   setInterval(() => stateManager.printStats(), 2 * 60 * 1000);
