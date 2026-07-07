@@ -6,7 +6,6 @@ const {
   call,
   manual,
   deterministicTransferId,
-  deterministicBeneficiaryId,
   chooseTransferMode,
   runCommonPreflightGates,
 } = require("./common");
@@ -175,10 +174,24 @@ async function getPayout(payoutId) {
   });
 }
 
-// RazorpayX statuses we treat as terminal-success / terminal-failure / pending.
-// Reference: https://razorpay.com/docs/api/x/payouts/#payout-status-life-cycle
+// RazorpayX payout statuses — verified against live docs
+// (https://razorpay.com/docs/webhooks/payloads/x/ + create-payout API):
+//
+//   pending      — awaiting processing / low balance
+//   queued       — held due to insufficient balance (queue_if_low_balance)
+//   scheduled    — future-dated
+//   processing   — sent to banking system, awaiting UTR
+//   processed    — SUCCESS (only true terminal success)
+//   reversed     — bank returned money to us         → FAILED
+//   rejected     — beneficiary bank declined          → FAILED
+//   failed       — banking network error              → FAILED
+//   cancelled    — merchant cancelled from RZP UI     → FAILED
+//
+// Anything else (including "updated", "downtime.*") is treated as PENDING
+// so the bot keeps waiting rather than treating an intermediate state
+// as terminal.
 const TERMINAL_SUCCESS = new Set(["processed"]);
-const TERMINAL_FAILURE = new Set(["reversed", "cancelled", "failed", "rejected"]);
+const TERMINAL_FAILURE = new Set(["reversed", "rejected", "failed", "cancelled"]);
 
 // Status mapper exported for the webhook controller.
 function mapStatus(rzpStatus) {
@@ -194,6 +207,19 @@ async function processPayment(payDetails, amountINR, orderNo) {
     payDetails, amountINR, orderNo, providerName: PROVIDER,
   });
   if (gateResult) return gateResult;
+
+  // Extra RazorpayX-specific gate — the common pre-flight only checks that
+  // keyId/keySecret/accountNumber are present, but a numeric account number
+  // typed with hyphens/spaces / mistaken length is still a common .env mistake.
+  const acct = String(config.razorpay.accountNumber || "").trim();
+  if (!/^[0-9]{6,}$/.test(acct)) {
+    logger.error("RazorpayX RAZORPAY_ACCOUNT_NUMBER looks malformed — falling back to manual", {
+      orderNo, accountNumber: acct || "(empty)",
+    });
+    return manual("bad_provider_config", amountINR, payDetails, {
+      hint: "RAZORPAY_ACCOUNT_NUMBER must be the numeric virtual account (find it on RazorpayX dashboard → Accounts)",
+    });
+  }
 
   const referenceId  = deterministicTransferId(orderNo);
   const modeDecision = await chooseTransferMode(amountINR);
@@ -239,7 +265,10 @@ async function processPayment(payDetails, amountINR, orderNo) {
     }`);
   }
 
-  // Persist our deterministic payout_id ASAP so the webhook can find this order.
+  // Persist RZP's payout id ASAP so the webhook can find this order via
+  // orders.payout_id (webhook events include the same id in payload.payout.entity.id).
+  // Fire-and-forget — DB hiccup must not block payment. `updateOrder`
+  // internally logs errors, so we don't await here.
   orderDbService.updateOrder(orderNo, { payout_id: payout.id });
 
   // ── Poll ────────────────────────────────────────────────────────────────
@@ -276,7 +305,17 @@ async function processPayment(payDetails, amountINR, orderNo) {
     };
   }
 
-  // Pending — webhook will resolve to success/failed later.
+  // Pending — webhook will resolve to success/failed later. Also spawn a
+  // background status poll as a defence-in-depth measure in case the webhook
+  // fails to arrive (misconfigured URL, transient network, etc). The poll
+  // and webhook race; whichever finalises first wins, and finalize* is
+  // idempotent so the loser silently no-ops.
+  startBackgroundStatusPoll({
+    orderNo,
+    payoutId: String(last.id),
+    mode:     modeDecision.mode,
+  });
+
   return {
     payoutId:   String(last.id),
     transferId: String(last.id),
@@ -288,19 +327,96 @@ async function processPayment(payDetails, amountINR, orderNo) {
   };
 }
 
+// ─── Background poll — webhook delivery fallback ─────────────────────────────
+//   Runs after processPayment returns pending. Polls GET /v1/payouts/:id
+//   every 30s for up to 15 min and drives finalizePayoutSuccess/Failed when
+//   the status flips terminal. Idempotency inside finalize* handles the
+//   webhook-vs-poll race cleanly.
+const _backgroundPollsInflight = new Set();
+
+function startBackgroundStatusPoll({ orderNo, payoutId, mode }) {
+  if (_backgroundPollsInflight.has(payoutId)) return;
+  _backgroundPollsInflight.add(payoutId);
+
+  const POLL_INTERVAL_MS = 30_000;
+  const POLL_MAX_MS      = 15 * 60_000;
+  const startedAt = Date.now();
+
+  // Lazy-load to avoid a circular require at module init.
+  const { orderHandler } = require("../../bot/orderHandler");
+
+  const tick = async () => {
+    if (Date.now() - startedAt > POLL_MAX_MS) {
+      logger.warn("RazorpayX background poll timed out — webhook never arrived", {
+        orderNo, payoutId, elapsedMs: Date.now() - startedAt,
+      });
+      _backgroundPollsInflight.delete(payoutId);
+      return;
+    }
+
+    try {
+      const r = await getPayout(payoutId);
+      const p = r.body || {};
+      const status = String(p.status || "").toLowerCase();
+      const utr    = p.utr || null;
+
+      logger.info("RazorpayX background poll tick", {
+        orderNo, payoutId, status: status.toUpperCase() || "(none)", utr,
+      });
+
+      if (TERMINAL_SUCCESS.has(status) && utr) {
+        logger.info("RazorpayX background poll → SUCCESS — finalising", { orderNo, utr });
+        _backgroundPollsInflight.delete(payoutId);
+        await orderHandler.finalizePayoutSuccess(orderNo, utr, mode);
+        return;
+      }
+      if (TERMINAL_FAILURE.has(status)) {
+        const reason = p.failure_reason
+                    || p.status_details?.description
+                    || p.status_details?.reason
+                    || status.toUpperCase();
+        logger.warn("RazorpayX background poll → FAILED — finalising", { orderNo, reason });
+        _backgroundPollsInflight.delete(payoutId);
+        await orderHandler.finalizePayoutFailed(orderNo, reason);
+        return;
+      }
+    } catch (e) {
+      logger.warn("RazorpayX background poll tick threw — will retry", {
+        orderNo, error: e.message,
+      });
+    }
+
+    setTimeout(tick, POLL_INTERVAL_MS);
+  };
+
+  setTimeout(tick, POLL_INTERVAL_MS);
+  logger.info("RazorpayX background poll started", {
+    orderNo, payoutId,
+    intervalSec: POLL_INTERVAL_MS / 1000,
+    maxMinutes:  POLL_MAX_MS / 60_000,
+  });
+}
+
 // ─── Webhook signature verification ──────────────────────────────────────────
-//   Razorpay signs the RAW request body (no timestamp prefix, unlike CF v2).
+//   Razorpay: HMAC-SHA256(rawBody, RAZORPAY_WEBHOOK_SECRET), hex-encoded.
+//   Header: X-Razorpay-Signature (no prefix — just the raw hex).
 //   Reference: https://razorpay.com/docs/webhooks/validate-test/
 function verifyWebhookSignature(rawBody, signatureHeader) {
-  if (!signatureHeader || !config.razorpay?.webhookSecret) return false;
+  if (!signatureHeader) return false;
+  const secret = config.razorpay?.webhookSecret;
+  if (!secret) {
+    logger.warn("RazorpayX webhook — RAZORPAY_WEBHOOK_SECRET not configured, rejecting");
+    return false;
+  }
   try {
     const body = Buffer.isBuffer(rawBody) ? rawBody.toString("utf8") : String(rawBody || "");
     const expected = crypto
-      .createHmac("sha256", config.razorpay.webhookSecret)
+      .createHmac("sha256", secret)
       .update(body)
-      .digest("hex");           // RZP signature is hex, NOT base64
+      .digest("hex");
+    const received = String(signatureHeader).trim();
     const expectedBuf = Buffer.from(expected);
-    const receivedBuf = Buffer.from(String(signatureHeader));
+    const receivedBuf = Buffer.from(received);
     if (expectedBuf.length !== receivedBuf.length) return false;
     return crypto.timingSafeEqual(expectedBuf, receivedBuf);
   } catch (err) {
@@ -310,20 +426,42 @@ function verifyWebhookSignature(rawBody, signatureHeader) {
 }
 
 // Extract our normalised event shape from a RZP webhook payload.
-//   Events of interest: payout.processed, payout.failed, payout.reversed
+//
+// RazorpayX payout event names (verified against live docs):
+//   payout.pending, payout.queued, payout.initiated, payout.processed,
+//   payout.rejected, payout.reversed, payout.failed, payout.updated,
+//   payout.downtime.started, payout.downtime.resolved
+//
+// Body shape:
+//   { event: "payout.processed",
+//     payload: { payout: { entity: { id, status, utr, mode,
+//                                    reference_id, failure_reason,
+//                                    status_details: { reason, description, source } } } } }
 function parseWebhookEvent(parsed) {
   const eventType = String(parsed?.event || "").toLowerCase();
-  const payout    = parsed?.payload?.payout?.entity || parsed?.payload?.payout || parsed?.payload || {};
+  const payout    = parsed?.payload?.payout?.entity
+                 || parsed?.payload?.payout
+                 || parsed?.payload
+                 || {};
+
+  // failure_reason is preferred; status_details.description is the newer
+  // (post-deprecation) home for the same info; payout.error was the legacy
+  // field name.
+  const failureReason = payout.failure_reason
+                     || payout.status_details?.description
+                     || payout.status_details?.reason
+                     || payout.error?.description
+                     || null;
 
   return {
     eventType,
-    transferId:     payout.id || null,           // matches what we stored in orders.payout_id
-    cfTransferId:   payout.id || null,
-    status:         mapStatus(payout.status),
-    rawStatus:      String(payout.status || "").toUpperCase(),
-    utr:            payout.utr || null,
-    failureReason:  payout.failure_reason || payout.error?.description || null,
-    referenceId:    payout.reference_id || null,
+    transferId:    payout.id || null,          // matches orders.payout_id
+    cfTransferId:  payout.id || null,          // (legacy field name — kept for compat with webhook controller)
+    status:        mapStatus(payout.status),
+    rawStatus:     String(payout.status || "").toUpperCase(),
+    utr:           payout.utr || null,
+    failureReason,
+    referenceId:   payout.reference_id || null,
   };
 }
 
