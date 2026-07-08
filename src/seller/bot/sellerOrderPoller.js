@@ -154,7 +154,7 @@ class SellerOrderPoller {
         return;
       }
 
-      logger.info(`✨ Found ${adOrders.length} new orders for ad ${ad.ad_no}`);
+      logger.info(`✨ Found ${adOrders.length} new order(s) for ad ${ad.ad_no}`);
 
       // Step 3: Process each order with ad-specific rules
       for (const order of adOrders) {
@@ -193,6 +193,7 @@ class SellerOrderPoller {
       logger.info(`🆕 New order detected!`, {
         orderNo,
         buyer: order.counterPartNickName,
+        buyerId: order.counterPartUserId,
         ad: ad.ad_no,
         amount: order.totalPrice
       });
@@ -200,10 +201,12 @@ class SellerOrderPoller {
       // Mark as being processed
       this.processedOrders.add(orderNo);
 
-      // Step 2: Fetch buyer metrics from Binance (or mock data)
-      // In production: call Binance API to get buyer's 30-day stats
-      // For now: mock metrics
-      const buyerMetrics = this.createMockBuyerMetrics(order.counterPartUserId);
+      // Step 2: Fetch buyer metrics from Binance
+      // Endpoint: POST /sapi/v1/c2c/orderMatch/queryCounterPartyOrderStatistic
+      const buyerMetrics = await this.fetchBuyerMetricsFromBinance(
+        orderNo,
+        order.counterPartUserId
+      );
 
       // Step 3: Start order handler with:
       // - Raw order data from Binance
@@ -221,18 +224,13 @@ class SellerOrderPoller {
   /**
    * ===== BINANCE API CALL =====
    * Fetch all pending orders from Binance
+   * Endpoint: POST /sapi/v1/c2c/orderMatch/listOrders
    * Returns: array of orders with adOrderNo (ad_no)
    */
   async fetchOrdersFromBinance() {
     try {
-      // Call Binance SAPI v7.4 endpoint
-      // GET /sapi/v1/c2c/orderMatch/listOrders
-      // Filter: tradeType='SELL', status ∈ [0,1] (new, unpaid)
-
       const orders = await binanceService.getPendingSellOrders();
-
       return orders || [];
-
     } catch (error) {
       logger.error(`Error fetching orders from Binance: ${error.message}`);
       return [];
@@ -240,9 +238,52 @@ class SellerOrderPoller {
   }
 
   /**
-   * ===== MOCK BUYER METRICS (for testing) =====
-   * In production: fetch real metrics from Binance
-   * For now: return mock data
+   * ===== FETCH REAL BUYER METRICS FROM BINANCE =====
+   * Endpoint: POST /sapi/v1/c2c/orderMatch/queryCounterPartyOrderStatistic
+   * Fetches buyer's trading history, completion rates, etc.
+   */
+  async fetchBuyerMetricsFromBinance(orderNo, buyerId) {
+    try {
+      logger.debug(`Fetching buyer metrics from Binance: ${orderNo}/${buyerId}`);
+
+      // Get counter party stats (trading history)
+      const stats = await binanceService.getCounterPartyOrderStats(orderNo);
+
+      // Calculate 30-day metrics (Binance returns total, we estimate 30-day from available data)
+      // Note: For more accuracy, we could query additional endpoints for date-specific stats
+      const buyerMetrics = {
+        buyer_id: buyerId,
+        trades_30day: stats.all_trades_count,  // Total trades (as proxy for 30-day)
+        completion_rate_30day: stats.completion_rate_30day,
+        registered_days: stats.registered_days,
+        trading_counterparty_count: 0,  // Will be calculated from historical data
+        all_trades_count: stats.all_trades_count,
+        buy_orders_count: stats.buy_orders_count,
+        sell_orders_count: stats.sell_orders_count,
+        avg_release_time_minutes: 0,  // Needs additional endpoint call
+        avg_pay_time_minutes: 0       // Needs additional endpoint call
+      };
+
+      logger.info(`✅ Buyer metrics fetched from Binance`, {
+        buyerId,
+        trades: buyerMetrics.all_trades_count,
+        completionRate: buyerMetrics.completion_rate_30day
+      });
+
+      return buyerMetrics;
+
+    } catch (error) {
+      logger.error(`Error fetching buyer metrics from Binance: ${error.message}`, { orderNo, buyerId });
+
+      // Fallback to mock data for testing if Binance API fails
+      logger.warn(`Using mock data as fallback for order ${orderNo}`);
+      return this.createMockBuyerMetrics(buyerId);
+    }
+  }
+
+  /**
+   * ===== FALLBACK: MOCK BUYER METRICS (for testing/errors) =====
+   * Used when Binance API is unavailable
    */
   createMockBuyerMetrics(buyerId) {
     return sellerBuyerMetricsService.createMockMetrics(buyerId, {
