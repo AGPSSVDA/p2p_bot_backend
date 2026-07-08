@@ -54,7 +54,7 @@ class SellerOrdersController {
         currentState: order.current_state,
         eligibilityCheckPassed: order.eligibility_check_passed,
         livenessCompleted: order.liveness_completed_at ? true : false,
-        documentsVerified: order.documents_verified_at ? true : false,
+        documentsVerified: order.pan_verified_at || order.aadhaar_verified_at ? true : false,
         orderVerifiedAt: order.order_verified_at,
         paymentReceivedAt: order.payment_received_at,
         createdAt: order.created_at,
@@ -62,7 +62,7 @@ class SellerOrdersController {
         timeline: {
           eligibilityCheckAt: order.eligibility_check_completed_at,
           livenessRequestedAt: order.liveness_requested_at,
-          documentsRequestedAt: order.documents_requested_at,
+          documentsRequestedAt: order.pan_upload_requested_at || order.aadhaar_upload_requested_at,
           orderVerifyAttemptedAt: order.order_verify_attempted_at,
           paymentLinkSentAt: order.payment_link_sent_at
         }
@@ -168,9 +168,9 @@ class SellerOrdersController {
           passed: order.liveness_completed_at ? true : false
         },
         documents: {
-          requestedAt: order.documents_requested_at,
-          uploadedAt: order.documents_uploaded_at,
-          verifiedAt: order.documents_verified_at,
+          requestedAt: order.pan_upload_requested_at || order.aadhaar_upload_requested_at,
+          uploadedAt: order.pan_uploaded_at || order.aadhaar_uploaded_at,
+          verifiedAt: order.pan_verified_at || order.aadhaar_verified_at,
           documents: documents.map(d => ({
             type: d.document_type,
             verifiedAt: d.verified_at,
@@ -262,7 +262,7 @@ class SellerOrdersController {
           COUNT(*) as totalOrders,
           SUM(IF(eligibility_check_passed = true, 1, 0)) as eligibleOrders,
           SUM(IF(eligibility_check_passed = false, 1, 0)) as ineligibleOrders,
-          SUM(IF(documents_verified_at IS NOT NULL, 1, 0)) as documentsVerifiedOrders,
+          SUM(IF(pan_verified_at IS NOT NULL OR aadhaar_verified_at IS NOT NULL, 1, 0)) as documentsVerifiedOrders,
           SUM(IF(payment_received_at IS NOT NULL, 1, 0)) as completedOrders,
           SUM(fiat_amount) as totalFiatProcessed,
           SUM(crypto_amount) as totalCryptoProcessed
@@ -374,12 +374,12 @@ class SellerOrdersController {
         });
       }
 
-      if (order.documents_requested_at) {
+      if (order.pan_upload_requested_at || order.aadhaar_upload_requested_at) {
         timeline.push({
           step: '3B',
           event: 'Documents Requested',
-          timestamp: order.documents_requested_at,
-          status: order.documents_verified_at ? 'verified' : 'pending'
+          timestamp: order.pan_upload_requested_at || order.aadhaar_upload_requested_at,
+          status: order.pan_verified_at || order.aadhaar_verified_at ? 'verified' : 'pending'
         });
       }
 
