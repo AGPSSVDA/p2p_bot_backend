@@ -559,103 +559,12 @@ async function getFundingBalance(asset) {
     : { free: 0, locked: 0 };
 }
 
-// ─── SELLER: Query Counter Party Order Statistic (Buyer Metrics) ──────────────
-// Fetch buyer's trading history and metrics
-async function getCounterPartyOrderStats(orderNo) {
-  return withRetry(async () => {
-    const qs = buildSignedQuery({ orderNumber: orderNo });
-    const res = await axios.post(
-      `${url(config.binance.endpoints.queryCounterPartyOrderStatistic)}?${qs}`,
-      { orderNumber: orderNo },
-      { headers: headers(), timeout: 12000 }
-    );
-
-    const data = res.data?.data || res.data;
-    return {
-      buy_orders_count: data?.purchaseOrderCount || 0,
-      buy_orders_complete: data?.purchaseOrderCompleteCount || 0,
-      buy_orders_complete_rate: parseFloat(data?.purchaseOrderCompleteRate) || 0,
-      sell_orders_count: data?.saleOrderCount || 0,
-      sell_orders_complete: data?.saleOrderCompleteCount || 0,
-      sell_orders_complete_rate: parseFloat(data?.saleOrderCompleteRate) || 0,
-      all_trades_count: data?.totalCompleteOrderCount || 0,
-      completion_rate_30day: parseFloat(data?.totalCompleteRate) || 0,
-      registered_days: data?.tradeDay || 0
-    };
-  }, 3, 3000, `getCounterPartyOrderStats:${orderNo}`);
-}
-
-// ─── SELLER: Get User Details (for buyer info) ────────────────────────────────
-// Fetch buyer's basic details
-async function getUserDetails(userId) {
-  return withRetry(async () => {
-    const qs = buildSignedQuery({ userId });
-    const res = await axios.get(
-      `${url(config.binance.endpoints.queryUser)}?${qs}`,
-      { headers: headers(), timeout: 12000 }
-    );
-
-    const data = res.data?.data || res.data;
-    return {
-      id: data?.id,
-      name: data?.name,
-      email: data?.email,
-      mobile: data?.mobile
-    };
-  }, 3, 3000, `getUserDetails:${userId}`);
-}
-
-// ─── SELLER: Get Pending Sell Orders (for seller polling) ──────────────────────
-// Fetch pending orders on seller's ads (where seller is receiving buy orders)
-async function getPendingSellOrders() {
-  return withRetry(async () => {
-    const qs = buildSignedQuery({});
-    const res = await axios.post(
-      `${url(config.binance.endpoints.listOrders)}?${qs}`,
-      {
-        orderStatusList: [ORDER_STATUS.WAIT_PAYMENT, ORDER_STATUS.WAIT_RELEASE],
-        tradeType: 'SELL',  // Seller receiving buy orders
-        page: 1,
-        rows: 20,
-      },
-      { headers: headers(), timeout: 12000 }
-    );
-
-    const data = res.data?.data || res.data;
-    const list = Array.isArray(data) ? data : (data?.orderList || data?.data || []);
-    // Only SELL orders (where we are the seller receiving payment)
-    return list.filter(o => !o.tradeType || String(o.tradeType).toUpperCase() === 'SELL');
-  }, 3, 3000, 'getPendingSellOrders');
-}
-
-// ─── SELLER: Verify Additional KYC (for liveness after eligibility check) ──────
-// Trigger verification process after eligibility criteria are met
-async function verifyAdditionalKyc(orderNo) {
-  return withRetry(async () => {
-    const qs = buildSignedQuery({ orderNumber: orderNo });
-    const res = await axios.post(
-      `${url(config.binance.endpoints.verifiedAdditionalKyc)}?${qs}`,
-      { orderNumber: orderNo },
-      { headers: headers(), timeout: 12000 }
-    );
-
-    return {
-      success: res.data?.code === 0 || res.status === 200,
-      message: res.data?.message || 'Verification requested'
-    };
-  }, 3, 3000, `verifyAdditionalKyc:${orderNo}`);
-}
-
 module.exports = {
   ORDER_STATUS,
   CANCEL_REASON,
   SELLER_CANCEL_REASONS,
   pickSellerCancelReason,
   getPendingOrders,
-  getPendingSellOrders,
-  getCounterPartyOrderStats,
-  getUserDetails,
-  verifyAdditionalKyc,
   getOrderDetail,
   getChatCredential,
   getChatMessages,

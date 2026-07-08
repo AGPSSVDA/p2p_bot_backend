@@ -1,5 +1,5 @@
 const logger = require('../../utils/logger');
-const binanceService = require('../../services/binanceService');
+const sellerBinanceService = require('../services/sellerBinanceService');
 const sellerOrderDbService = require('../services/sellerOrderDbService');
 const sellerAdService = require('../services/sellerAdService');
 const sellerBuyerMetricsService = require('../services/sellerBuyerMetricsService');
@@ -226,10 +226,11 @@ class SellerOrderPoller {
    * Fetch all pending orders from Binance
    * Endpoint: POST /sapi/v1/c2c/orderMatch/listOrders
    * Returns: array of orders with adOrderNo (ad_no)
+   * Uses seller-specific Binance config and API keys
    */
   async fetchOrdersFromBinance() {
     try {
-      const orders = await binanceService.getPendingSellOrders();
+      const orders = await sellerBinanceService.getPendingSellOrders();
       return orders || [];
     } catch (error) {
       logger.error(`Error fetching orders from Binance: ${error.message}`);
@@ -241,13 +242,14 @@ class SellerOrderPoller {
    * ===== FETCH REAL BUYER METRICS FROM BINANCE =====
    * Endpoint: POST /sapi/v1/c2c/orderMatch/queryCounterPartyOrderStatistic
    * Fetches buyer's trading history, completion rates, etc.
+   * Uses seller-specific Binance config and API keys
    */
   async fetchBuyerMetricsFromBinance(orderNo, buyerId) {
     try {
       logger.debug(`Fetching buyer metrics from Binance: ${orderNo}/${buyerId}`);
 
       // Get counter party stats (trading history)
-      const stats = await binanceService.getCounterPartyOrderStats(orderNo);
+      const stats = await sellerBinanceService.getCounterPartyOrderStats(orderNo);
 
       // Calculate 30-day metrics (Binance returns total, we estimate 30-day from available data)
       // Note: For more accuracy, we could query additional endpoints for date-specific stats
