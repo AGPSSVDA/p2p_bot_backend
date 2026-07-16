@@ -1,5 +1,7 @@
 const logger = require('../../utils/logger');
-const { binanceService } = require('../../services/binanceService');
+// Seller operations must use the SELLER API key — seller ads/orders live under
+// that account. Never use the buyer binanceService here.
+const sellerBinanceService = require('./sellerBinanceService');
 const { panService } = require('../../services/panService');
 const sellerOrderDbService = require('./sellerOrderDbService');
 
@@ -383,7 +385,8 @@ class SellerVerificationService {
       // Get latest order detail from Binance
       // Check if livenessStatus = 'COMPLETED'
 
-      const orderDetail = await binanceService.getOrderDetail(orderNo);
+      // Must use the SELLER service — seller orders live under the seller API key.
+      const orderDetail = await sellerBinanceService.getOrderDetail(orderNo);
 
       if (!orderDetail) {
         return { success: false, reason: 'Order not found on Binance' };

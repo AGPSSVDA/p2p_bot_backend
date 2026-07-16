@@ -7,10 +7,16 @@
  */
 
 const axios = require('axios');
+const https = require('https');
 const crypto = require('crypto');
 const sellerBinanceConfig = require('../config/sellerBinanceConfig');
 const { buildSignedQuery, withRetry } = require('../utils/helpers');
 const logger = require('../utils/logger');
+
+// Force IPv4 for all Binance calls. Binance API-key IP whitelists are IPv4, but
+// on dual-stack networks Node may connect over IPv6, which Binance then rejects
+// with -2015 "Invalid API-key, IP, or permissions". family:4 pins it to IPv4.
+const ipv4Agent = new https.Agent({ family: 4, keepAlive: true });
 
 // Build signature for seller with body parameters
 // IMPORTANT: This must match test-seller-api.js logic for consistency
@@ -87,7 +93,8 @@ async function getSellerAds(page = 1, rows = 50) {
           'Content-Type': 'application/json',
           'clientType': 'PC'  // ← REQUIRED by Binance SAPI v7.4!
         },
-        timeout: 8000
+        timeout: 8000,
+        httpsAgent: ipv4Agent
       }
     );
 
@@ -197,7 +204,7 @@ async function getSellerAdDetail(advNo) {
     const res = await axios.post(
       `${url(sellerBinanceConfig.endpoints.queryAd)}?${qs}`,
       {},
-      { headers: headers(), timeout: 12000 }
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
     );
 
     const d = res.data?.data || res.data;
@@ -234,7 +241,7 @@ async function getSellerOrders(page = 1, rows = 50, tradeType = 'SELL') {
         page,
         rows,
       },
-      { headers: headers(), timeout: 12000 }
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
     );
 
     const d = res.data?.data || res.data;

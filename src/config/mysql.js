@@ -774,12 +774,16 @@ async function initMysql() {
       { symbol: 'LINK', name: 'Chainlink',   sort: 13 },
       { symbol: 'USDC', name: 'USD Coin',    sort: 14 },
     ];
-    for (const a of DEFAULT_CONVERT_ASSETS) {
-      await connection.query(
-        `INSERT IGNORE INTO convert_assets (symbol, name, enabled, sort_order)
-         VALUES (?, ?, 0, ?)`,
-        [a.symbol, a.name, a.sort]
-      );
+    try {
+      for (const a of DEFAULT_CONVERT_ASSETS) {
+        await connection.query(
+          `INSERT IGNORE INTO convert_assets (symbol, name, enabled, sort_order)
+           VALUES (?, ?, 0, ?)`,
+          [a.symbol, a.name, a.sort]
+        );
+      }
+    } catch (e) {
+      console.warn(`   • skip seeding convert_assets: ${e.message}`);
     }
 
     // ── conversions (history of every auto-convert attempt) ──────────────────
@@ -1329,19 +1333,24 @@ async function initMysql() {
     }
 
     // ── Seed default bot_config row if empty ──────────────────────────────────
-    const [botCfgRows] = await connection.query("SELECT id FROM bot_config LIMIT 1");
-    if (botCfgRows.length === 0) {
-      await connection.query(
-        "INSERT INTO bot_config (bot_status, auto_payout, bot_name, logo) VALUES (?, ?, ?, ?)",
-        [0, 0, "P2P Trade Bot", null]
-      );
-      console.log("✅ Seeded default bot_config row.");
+    try {
+      const [botCfgRows] = await connection.query("SELECT id FROM bot_config LIMIT 1");
+      if (botCfgRows.length === 0) {
+        await connection.query(
+          "INSERT INTO bot_config (bot_status, auto_payout, bot_name, logo) VALUES (?, ?, ?, ?)",
+          [0, 0, "P2P Trade Bot", null]
+        );
+        console.log("✅ Seeded default bot_config row.");
+      }
+    } catch (e) {
+      console.warn(`   • skip seeding bot_config: ${e.message}`);
     }
 
     connection.release();
     console.log("✅ MySQL schema initialized.");
   } catch (err) {
     console.error("❌ MySQL Connection Failed:", err.message);
+    console.error("Stack:", err.stack);
   }
 }
 

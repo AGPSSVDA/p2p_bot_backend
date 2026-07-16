@@ -140,12 +140,32 @@ class SellerSyncController {
       });
 
     } catch (error) {
-      console.error('❌ [SELLER SYNC] Error:', error.message);
-      console.error('📍 [SELLER SYNC] Error Stack:', error.stack);
-      logger.error(`❌ [SELLER SYNC] Sync error: ${error.message}`, { error, stack: error.stack });
-      res.status(500).json({
+      // Surface Binance's real error code, not the generic axios "400" string.
+      const binanceCode = error.response?.data?.code;
+      const binanceMsg = error.response?.data?.msg;
+
+      let friendly = error.message || 'Failed to sync ads';
+      if (binanceCode === -2015) {
+        friendly =
+          'Binance rejected the API key (-2015). Check the SELLER API key on Binance: ' +
+          'is it active/not expired, does its IP whitelist include this server\'s IP, ' +
+          'and is the C2C/P2P permission enabled?';
+      } else if (binanceCode) {
+        friendly = `Binance error ${binanceCode}: ${binanceMsg || 'unknown'}`;
+      }
+
+      console.error('❌ [SELLER SYNC] Error:', friendly);
+      console.error('📍 [SELLER SYNC] Binance code/msg:', binanceCode, binanceMsg);
+      logger.error(`❌ [SELLER SYNC] Sync error: ${friendly}`, {
+        binanceCode,
+        binanceMsg,
+        message: error.message,
+      });
+
+      res.status(binanceCode === -2015 ? 502 : 500).json({
         success: false,
-        error: error.message || 'Failed to sync ads'
+        error: friendly,
+        binanceCode: binanceCode || null,
       });
     }
   }

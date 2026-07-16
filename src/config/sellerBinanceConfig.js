@@ -38,6 +38,11 @@ const sellerBinanceConfig = {
 
     // Payment methods
     paymentMethods:  '/sapi/v1/c2c/paymentMethod/getPayMethodByUserId',
+
+    // Seller-specific endpoints for eligibility checking
+    queryCounterPartyOrderStatistic: '/sapi/v1/c2c/orderMatch/queryCounterPartyOrderStatistic',
+    queryUser:                       '/sapi/v1/c2c/user/queryUser',
+    verifiedAdditionalKyc:           '/sapi/v1/c2c/orderMatch/verifiedAdditionalKyc',
   }
 };
 

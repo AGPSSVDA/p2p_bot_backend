@@ -1,9 +1,10 @@
 const logger = require('../../utils/logger');
-const binanceService = require('../../services/binanceService');
+const sellerBinanceService = require('../services/sellerBinanceService');
 const sellerOrderDbService = require('../services/sellerOrderDbService');
 const sellerAdService = require('../services/sellerAdService');
 const sellerBuyerMetricsService = require('../services/sellerBuyerMetricsService');
 const { SellerOrderHandler } = require('./sellerOrderHandler');
+const { SELLER_ORDER_STATES } = require('./sellerStateManager');
 const { sellerConfig } = require('../config/sellerConfig');
 
 /**
@@ -27,6 +28,7 @@ class SellerOrderPoller {
     this.pollInterval = sellerConfig.orderPollInterval;
     this.processedOrders = new Set(); // Track orders already started
     this.sellerId = process.env.SELLER_ID; // Get from env or config
+    this.orderHandler = new SellerOrderHandler(); // Create instance for handling orders
   }
 
   /**
@@ -34,22 +36,56 @@ class SellerOrderPoller {
    */
   start() {
     if (this.running) {
+      console.log('⚠️ [SellerPoller] Already running');
       logger.warn('Seller order poller already running');
       return;
     }
 
     if (!this.sellerId) {
+      console.error('❌ [SellerPoller] SELLER_ID not set in env');
       logger.error('SELLER_ID not configured in environment');
       return;
     }
 
     this.running = true;
+    console.log(`\n🚀 [SellerPoller] STARTED (Seller ID: ${this.sellerId}, Interval: ${this.pollInterval}ms)\n`);
     logger.info('🚀 Seller Order Poller started', {
       interval: `${this.pollInterval}ms`,
       sellerId: this.sellerId
     });
 
+    // Polling intervals live in memory, so a restart orphans any in-flight
+    // document collection and images uploaded afterwards are lost forever.
+    // Resume watching orders that were left in WAITING_DOCUMENTS.
+    this.resumeDocumentCollection();
+
     this.poll();
+  }
+
+  /**
+   * Resume Method 2 chat-image collection for orders stuck in WAITING_DOCUMENTS
+   * (e.g. after a server restart).
+   */
+  async resumeDocumentCollection() {
+    try {
+      const pending = await sellerOrderDbService.getOrdersByState(
+        SELLER_ORDER_STATES.WAITING_DOCUMENTS
+      );
+
+      if (!pending.length) return;
+
+      console.log(`[SellerPoller] 🔄 Resuming document collection for ${pending.length} order(s) in WAITING_DOCUMENTS`);
+      logger.info(`Resuming document image collection after restart`, {
+        count: pending.length,
+      });
+
+      for (const order of pending) {
+        console.log(`[SellerPoller]    ↻ ${order.order_number} (ad ${order.ad_no})`);
+        await this.orderHandler.startDocumentImageCollection(order.order_number);
+      }
+    } catch (error) {
+      logger.error(`Failed to resume document collection: ${error.message}`, { error });
+    }
   }
 
   /**
@@ -90,10 +126,11 @@ class SellerOrderPoller {
       );
 
       if (ads.length === 0) {
-        logger.debug('No active ads found for seller', { sellerId: this.sellerId });
+        console.log(`[SellerPoller] ⚠️ No active ads found for seller ${this.sellerId}`);
         return;
       }
 
+      console.log(`[SellerPoller] 📋 Found ${ads.length} active ads: ${ads.map(a => a.ad_no).join(', ')}`);
       logger.debug(`📋 Found ${ads.length} active ads`, {
         ads: ads.map(a => a.ad_no)
       });
@@ -104,6 +141,7 @@ class SellerOrderPoller {
       }
 
     } catch (error) {
+      console.error(`[SellerPoller] ❌ Error polling ads:`, error.message);
       logger.error(`Error polling ads: ${error.message}`, { error });
     }
   }
@@ -123,7 +161,13 @@ class SellerOrderPoller {
       const adRules = await sellerOrderDbService.getAdRules(ad.ad_no);
 
       if (!adRules) {
-        logger.warn(`No rules configured for ad ${ad.ad_no}`, {
+        // Make this LOUD: with no rules row we skip the ad entirely, so every
+        // order placed on it is silently ignored and nothing else is logged.
+        console.log(`[SellerPoller] ⚠️  SKIPPING ad ${ad.ad_no} — no rules configured.`);
+        console.log(`               Any order placed on this ad will NOT be detected.`);
+        console.log(`               Fix: open this ad in the dashboard and save its verification methods.`);
+        logger.warn(`No rules configured for ad ${ad.ad_no} - orders on this ad are ignored`, {
+          adNo: ad.ad_no,
           message: 'Ad has no eligibility rules or verification methods set'
         });
         return; // Skip this ad if not configured
@@ -142,18 +186,30 @@ class SellerOrderPoller {
       const allOrders = await this.fetchOrdersFromBinance();
 
       if (allOrders.length === 0) {
-        logger.debug(`No orders found in Binance for ad ${ad.ad_no}`);
+        console.log(`[SellerPoller] 📭 No orders found in Binance for ad ${ad.ad_no}`);
         return;
       }
+
+      console.log(`[SellerPoller] 📦 Got ${allOrders.length} total orders from Binance`);
 
       // Filter: only orders for THIS ad
-      const adOrders = allOrders.filter(o => o.adOrderNo === ad.ad_no);
+      // Try multiple field names since Binance response might vary
+      const adOrders = allOrders.filter(o => {
+        const orderAdId = o.adOrderNo || o.advNo || o.advOrderNo;
+        return orderAdId === ad.ad_no;
+      });
 
       if (adOrders.length === 0) {
-        logger.debug(`No new orders for ad ${ad.ad_no}`);
+        const orderAdIds = allOrders.map(o => o.adOrderNo || o.advNo || o.advOrderNo || 'UNKNOWN');
+        console.log(`[SellerPoller] 🔍 Ad ${ad.ad_no}:`);
+        console.log(`    Expected Ad ID: ${ad.ad_no}`);
+        console.log(`    Orders found: ${orderAdIds.join(', ')}`);
+        console.log(`    ❌ NO MATCH`);
         return;
       }
 
+      console.log(`[SellerPoller] ✨ Found ${adOrders.length} new order(s) for ad ${ad.ad_no}:`,
+        adOrders.map(o => ({ orderNo: o.orderNumber, buyer: o.counterPartNickName })));
       logger.info(`✨ Found ${adOrders.length} new order(s) for ad ${ad.ad_no}`);
 
       // Step 3: Process each order with ad-specific rules
@@ -170,19 +226,14 @@ class SellerOrderPoller {
    * ===== PER-ORDER PROCESSING =====
    * For ONE order on ONE ad:
    * 1. Check if already being processed
-   * 2. Get buyer metrics from Binance
-   * 3. Start orderHandler with ad-specific rules
+   * 2. Fetch full order details + buyer info from Binance
+   * 3. Get buyer metrics from Binance
+   * 4. Start orderHandler with ad-specific rules
    */
   async processOrderForAd(order, ad, adRules) {
     const orderNo = order.orderNumber;
 
     try {
-      // Step 1: Check if already processing this order
-      if (this.processedOrders.has(orderNo)) {
-        logger.debug(`Order ${orderNo} already being processed, skipping`);
-        return;
-      }
-
       // Check if order already in database
       const existingOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
       if (existingOrder) {
@@ -190,46 +241,150 @@ class SellerOrderPoller {
         return;
       }
 
+      // Mark as being processed (to prevent duplicate DB inserts)
+      if (this.processedOrders.has(orderNo)) {
+        logger.debug(`Order ${orderNo} already being processed, skipping...`);
+        return; // ← IMPORTANT: Don't process same order multiple times!
+      }
+
+      this.processedOrders.add(orderNo);
+
+      console.log(`\n[SellerPoller] 🔍 Processing order ${orderNo}...`);
+
+      // IMPORTANT: listOrders may return cached data
+      // Fetch latest order details directly using getUserOrderDetail
+      console.log(`  📡 Fetching LATEST order details from Binance...`);
+      let latestOrderDetail = null;
+      try {
+        const orderStatusResponse = await sellerBinanceService.getOrderStatusByOrderNumber(orderNo);
+        if (orderStatusResponse.success) {
+          latestOrderDetail = orderStatusResponse;
+          console.log(`  ✅ Got latest order status from Binance`);
+
+          // Additional-KYC ("liveness") detection is READ-ONLY.
+          // The handler polls the order and waits for additionalKycVerify to change 1 -> 2.
+          // We never call verifyAdditionalKyc() — that endpoint has a side effect of
+          // marking the order verified, so calling it would skip the real buyer check.
+          if (orderStatusResponse.additionalKycVerify === 1) {
+            console.log(`  ⏳ Liveness pending (additionalKycVerify = 1)`);
+            console.log(`     Handler will poll and wait for additionalKycVerify to become 2`);
+          }
+        }
+      } catch (err) {
+        console.log(`  ⚠️ Could not fetch latest details, using listOrders data`);
+      }
+
+      // Use latest data if available, otherwise use listOrders data
+      const orderData = latestOrderDetail || order;
+      const additionalKycVerify = latestOrderDetail?.additionalKycVerify || order.additionalKycVerify;
+
+      // Step 2: Extract buyer info from order (available fields)
+      const buyerNickname = order.buyerNickname || 'Unknown Buyer';
+      const sellerNickname = order.sellerNickname || 'Unknown Seller';
+
+      console.log(`  📋 Order Info:`);
+      console.log(`     Buyer: ${buyerNickname}`);
+      console.log(`     Seller: ${sellerNickname}`);
+      console.log(`     Amount: ${order.totalPrice} ${order.fiat}`);
+      console.log(`     Asset: ${order.amount} ${order.asset}`);
+      console.log(`     Status: ${order.orderStatus} (1=WAIT_PAYMENT, 2=WAIT_RELEASE)`);
+      console.log(`     Additional KYC: ${additionalKycVerify} (0=none, 1=liveness, 2=docs) [LATEST]`);
+      console.log(`     Ad No: ${order.advNo}`);
+
       logger.info(`🆕 New order detected!`, {
         orderNo,
-        buyer: order.counterPartNickName,
-        buyerId: order.counterPartUserId,
+        buyer: buyerNickname,
         ad: ad.ad_no,
         amount: order.totalPrice
       });
 
-      // Mark as being processed
-      this.processedOrders.add(orderNo);
+      // NOTE: Eligibility check is done by Binance BEFORE order is placed
+      // When buyer tries to place order on this ad, Binance checks if buyer meets
+      // the criteria set for this ad. If not eligible, Binance rejects the order
+      // with a message like: "Your registration time is less than 90 days..."
+      //
+      // Since order reached our poller, it means Binance already approved it.
+      // We just need to process it.
 
-      // Step 2: Fetch buyer metrics from Binance
-      // Endpoint: POST /sapi/v1/c2c/orderMatch/queryCounterPartyOrderStatistic
-      const buyerMetrics = await this.fetchBuyerMetricsFromBinance(
-        orderNo,
-        order.counterPartUserId
-      );
+      console.log(`  ✅ Order passed Binance eligibility check`);
+      console.log(`  📊 Fetching buyer metrics for record...`);
 
-      // Step 3: Start order handler with:
-      // - Raw order data from Binance
-      // - Ad object (ad_no, seller_id, etc)
-      // - Ad-specific rules (conditions + methods)
-      // - Buyer metrics
-      await SellerOrderHandler.start(order, ad, adRules, buyerMetrics);
+      // Fetch full order details from Binance (includes buyer ID and other info)
+      console.log(`  📡 Fetching full order details...`);
+      const orderDetail = await this.fetchOrderDetail(orderNo);
+
+      // Fetch buyer metrics for record-keeping
+      const buyerMetrics = await this.fetchBuyerMetricsFromBinance(orderNo, buyerNickname);
+
+      if (buyerMetrics) {
+        console.log(`  ✅ Buyer profile:`);
+        console.log(`     Trades (30d): ${buyerMetrics.trades_30day}`);
+        console.log(`     Completion Rate: ${buyerMetrics.completion_rate_30day}%`);
+        console.log(`     Registered Days: ${buyerMetrics.registered_days}`);
+        console.log(`     All Trades: ${buyerMetrics.all_trades_count}`);
+
+        // Store metrics in database for reference
+        await sellerBuyerMetricsService.storeBuyerMetrics(buyerNickname, buyerMetrics);
+      }
+
+      // Start order handler to proceed with verification/payment flow
+      console.log(`  ⚙️ Starting order handler...`);
+      console.log(`  📋 Ad Rules Configuration:`, {
+        method1_liveness_enabled: adRules?.method1_liveness_enabled,
+        method2_documents_enabled: adRules?.method2_documents_enabled,
+        method3_full_enabled: adRules?.method3_full_enabled
+      });
+      const enrichedOrder = {
+        ...order,
+        ...orderDetail,  // Merge full order details (includes counterPartUserId)
+        additionalKycVerify: additionalKycVerify,  // ← Use LATEST value
+        counterPartNickName: buyerNickname,
+        buyerNickname: buyerNickname
+      };
+      await this.orderHandler.start(enrichedOrder, ad, adRules, buyerMetrics);
+      console.log(`  ✨ Order processing started\n`);
 
     } catch (error) {
+      console.error(`[SellerPoller] ❌ Error processing order ${orderNo}:`, error.message);
       logger.error(`Error processing order ${orderNo}: ${error.message}`, { error });
       this.processedOrders.delete(orderNo); // Remove from processing set so it can retry
     }
   }
 
   /**
+   * Fetch full order details including buyer information
+   * Endpoint: POST /sapi/v1/c2c/orderMatch/getUserOrderDetail
+   * Takes the ORDER NUMBER (not the ad/adv number).
+   */
+  async fetchOrderDetail(orderNumber) {
+    try {
+      if (!orderNumber) return {};
+      const detail = await sellerBinanceService.getOrderDetail(orderNumber);
+      return detail || {};
+    } catch (error) {
+      logger.warn(`Error fetching order detail for ${orderNumber}: ${error.message}`);
+      return {};
+    }
+  }
+
+
+  /**
    * ===== BINANCE API CALL =====
    * Fetch all pending orders from Binance
    * Endpoint: POST /sapi/v1/c2c/orderMatch/listOrders
    * Returns: array of orders with adOrderNo (ad_no)
+   * Uses seller-specific Binance config and API keys
    */
   async fetchOrdersFromBinance() {
     try {
-      const orders = await binanceService.getPendingSellOrders();
+      const orders = await sellerBinanceService.getPendingSellOrders();
+
+      // Disabled verbose order logging - only enabled during debug
+      // if (orders && orders.length > 0) {
+      //   console.log(`\n[SellerPoller] 📋 Raw Orders from Binance (${orders.length}):`);
+      //   orders.forEach((o, idx) => { ... });
+      // }
+
       return orders || [];
     } catch (error) {
       logger.error(`Error fetching orders from Binance: ${error.message}`);
@@ -241,18 +396,21 @@ class SellerOrderPoller {
    * ===== FETCH REAL BUYER METRICS FROM BINANCE =====
    * Endpoint: POST /sapi/v1/c2c/orderMatch/queryCounterPartyOrderStatistic
    * Fetches buyer's trading history, completion rates, etc.
+   * Uses seller-specific Binance config and API keys
    */
-  async fetchBuyerMetricsFromBinance(orderNo, buyerId) {
+  async fetchBuyerMetricsFromBinance(orderNo, buyerNickname) {
     try {
-      logger.debug(`Fetching buyer metrics from Binance: ${orderNo}/${buyerId}`);
+      console.log(`     Calling queryCounterPartyOrderStatistic for order ${orderNo}...`);
 
       // Get counter party stats (trading history)
-      const stats = await binanceService.getCounterPartyOrderStats(orderNo);
+      const stats = await sellerBinanceService.getCounterPartyOrderStats(orderNo);
+
+      console.log(`     Raw stats from Binance:`, JSON.stringify(stats, null, 2));
 
       // Calculate 30-day metrics (Binance returns total, we estimate 30-day from available data)
       // Note: For more accuracy, we could query additional endpoints for date-specific stats
       const buyerMetrics = {
-        buyer_id: buyerId,
+        buyer_nickname: buyerNickname,
         trades_30day: stats.all_trades_count,  // Total trades (as proxy for 30-day)
         completion_rate_30day: stats.completion_rate_30day,
         registered_days: stats.registered_days,
@@ -265,7 +423,7 @@ class SellerOrderPoller {
       };
 
       logger.info(`✅ Buyer metrics fetched from Binance`, {
-        buyerId,
+        buyer: buyerNickname,
         trades: buyerMetrics.all_trades_count,
         completionRate: buyerMetrics.completion_rate_30day
       });
@@ -273,11 +431,13 @@ class SellerOrderPoller {
       return buyerMetrics;
 
     } catch (error) {
-      logger.error(`Error fetching buyer metrics from Binance: ${error.message}`, { orderNo, buyerId });
+      console.error(`     ❌ Error fetching metrics:`, error.message);
+      logger.error(`Error fetching buyer metrics from Binance: ${error.message}`, { orderNo, buyer: buyerNickname });
 
       // Fallback to mock data for testing if Binance API fails
+      console.log(`     Using mock data as fallback...`);
       logger.warn(`Using mock data as fallback for order ${orderNo}`);
-      return this.createMockBuyerMetrics(buyerId);
+      return this.createMockBuyerMetrics(buyerNickname);
     }
   }
 

@@ -29,12 +29,19 @@ class SellerOrderDbService {
         updated_at = NOW()
     `;
 
-    return safe(
-      pool.query(query, [
+    // Guard NOT NULL columns so a missing field can never silently drop the row.
+    const buyerId = orderData.buyerId || `unknown-${orderData.orderNumber}`;
+    const buyerNickname = orderData.buyerNickname || 'Unknown';
+
+    // NOTE: do NOT wrap this in safe(). Persisting the order is load-bearing —
+    // every downstream step (liveness, verify, payment) reads it back from the DB.
+    // If it fails we must know, not swallow it.
+    try {
+      await pool.query(query, [
         orderData.orderNumber,
         orderData.sellerId,
-        orderData.buyerId,
-        orderData.buyerNickname,
+        buyerId,
+        buyerNickname,
         orderData.adNo,
         orderData.cryptoAmount,
         orderData.fiatAmount,
@@ -42,9 +49,15 @@ class SellerOrderDbService {
         orderData.fiatUnit,
         orderData.buyerKycName,
         'NEW_ORDER'
-      ]),
-      `upsertOrder:${orderData.orderNumber}`
-    );
+      ]);
+      return true;
+    } catch (err) {
+      logger.error(`❌ CRITICAL: upsertOrder failed for ${orderData.orderNumber} - order NOT persisted`, {
+        code: err.code,
+        sqlMessage: err.sqlMessage,
+      });
+      throw err;
+    }
   }
 
   /**
@@ -159,6 +172,67 @@ class SellerOrderDbService {
       pool.query(query, [passed, orderNumber]),
       `recordLivenessCompleted:${orderNumber}`
     );
+  }
+
+  // ===== METHOD 2 / PHASE 1: DOCUMENT IMAGES FROM BINANCE CHAT =====
+
+  /**
+   * Save one image the buyer uploaded in the Binance order chat.
+   *
+   * Idempotent: a unique index on (order_number, chat_message_id) means
+   * re-polling the chat will not insert the same image twice.
+   * Phase 1 stores the Binance image URL + metadata only — no download,
+   * and document_type stays NULL (classification is a later phase).
+   *
+   * Returns true if a new image row was inserted, false if it already existed.
+   */
+  async saveChatImage(orderNumber, buyerId, image) {
+    // INSERT IGNORE + the unique index on (order_number, chat_message_id) makes
+    // this idempotent: re-polling the chat silently skips images already stored.
+    // We use IGNORE (not ON DUPLICATE KEY UPDATE) because MariaDB reports
+    // affectedRows=0 for a no-op update, which makes "was it new?" ambiguous.
+    const query = `
+      INSERT IGNORE INTO seller_verification_documents (
+        order_number, buyer_id, image_url, thumbnail_url, image_type,
+        image_width, image_height, chat_message_id, chat_message_uuid,
+        uploaded_at, verification_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    const uploadedAt = image.createTime ? new Date(image.createTime) : new Date();
+
+    const [result] = await pool.query(query, [
+      orderNumber,
+      buyerId || `unknown-${orderNumber}`,
+      image.imageUrl,
+      image.thumbnailUrl || null,
+      image.imageType || null,
+      image.width || null,
+      image.height || null,
+      String(image.id),
+      image.uuid || null,
+      uploadedAt,
+      'UPLOADED',
+    ]);
+
+    // INSERT IGNORE: affectedRows === 1 => newly inserted, 0 => already existed
+    return result.affectedRows === 1;
+  }
+
+  /**
+   * Get all chat images stored for an order (oldest first).
+   */
+  async getChatImages(orderNumber) {
+    const query = `
+      SELECT id, order_number, buyer_id, document_type, image_url, thumbnail_url,
+             image_type, image_width, image_height, chat_message_id, uploaded_at,
+             verification_status
+      FROM seller_verification_documents
+      WHERE order_number = ? AND image_url IS NOT NULL
+      ORDER BY uploaded_at ASC, id ASC
+    `;
+    const [rows] = await pool.query(query, [orderNumber]);
+    return rows;
   }
 
   // ===== STEP 3B: DOCUMENT VERIFICATION =====
@@ -369,11 +443,46 @@ class SellerOrderDbService {
         total_orders, completed_orders, failed_orders
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
+        -- Refresh EVERY Binance-sourced column so a re-sync reflects the latest
+        -- ad state (remarks, limits, pay time, etc.), not just price/status.
+        -- Deliberately NOT updated: is_active, total_orders, completed_orders,
+        -- failed_orders, binance_create_time — these are local/bot-owned and a
+        -- re-sync must not reset them.
         ad_name = VALUES(ad_name),
         ad_status = VALUES(ad_status),
+        classify = VALUES(classify),
+        trade_type = VALUES(trade_type),
+        asset = VALUES(asset),
+        fiat_unit = VALUES(fiat_unit),
+        fiat_symbol = VALUES(fiat_symbol),
         price_rate = VALUES(price_rate),
-        surplus_amount = VALUES(surplus_amount),
+        price_type = VALUES(price_type),
+        price_floating_ratio = VALUES(price_floating_ratio),
         commission_rate = VALUES(commission_rate),
+        min_order_amount = VALUES(min_order_amount),
+        max_order_amount = VALUES(max_order_amount),
+        surplus_amount = VALUES(surplus_amount),
+        init_amount = VALUES(init_amount),
+        buyer_kyc_required = VALUES(buyer_kyc_required),
+        buyer_reg_days_limit = VALUES(buyer_reg_days_limit),
+        buyer_btc_position_limit = VALUES(buyer_btc_position_limit),
+        user_buy_trade_count_min = VALUES(user_buy_trade_count_min),
+        user_buy_trade_count_max = VALUES(user_buy_trade_count_max),
+        user_sell_trade_count_min = VALUES(user_sell_trade_count_min),
+        user_sell_trade_count_max = VALUES(user_sell_trade_count_max),
+        user_all_trade_count_min = VALUES(user_all_trade_count_min),
+        user_all_trade_count_max = VALUES(user_all_trade_count_max),
+        user_trade_complete_count_min = VALUES(user_trade_complete_count_min),
+        user_trade_complete_rate_min = VALUES(user_trade_complete_rate_min),
+        user_trade_volume_min = VALUES(user_trade_volume_min),
+        user_trade_volume_max = VALUES(user_trade_volume_max),
+        pay_time_limit = VALUES(pay_time_limit),
+        remarks = VALUES(remarks),
+        auto_reply_msg = VALUES(auto_reply_msg),
+        offline_reason = VALUES(offline_reason),
+        asset_scale = VALUES(asset_scale),
+        fiat_scale = VALUES(fiat_scale),
+        price_scale = VALUES(price_scale),
         binance_update_time = VALUES(binance_update_time),
         updated_at = NOW()
     `;
@@ -417,32 +526,101 @@ class SellerOrderDbService {
 
   // ===== AD RULES =====
 
-  async upsertAdRules(sellerId, adNo, rulesData) {
+  /**
+   * Update ONLY the verification-method columns for an ad.
+   *
+   * Deliberately separate from upsertAdRules(), which writes every column —
+   * using that for a methods-only save would clobber the eligibility criteria.
+   * Methods are bot-side behaviour and never sync to Binance.
+   */
+  async updateAdMethods(sellerId, adNo, methods) {
+    // INSERT ... ON DUPLICATE KEY UPDATE on (seller_id, ad_no):
+    //  - creates the rules row (methods set, all other columns default) if the ad
+    //    has no rules yet — a plain UPDATE would match 0 rows and "fail" here.
+    //  - if the row exists, updates ONLY the method columns, leaving the
+    //    eligibility criteria untouched.
     const query = `
       INSERT INTO seller_ad_rules (
         seller_id, ad_no,
-        min_30day_trades, min_30day_completion_rate,
-        max_avg_release_time, max_avg_pay_time,
-        required_trade_type, min_registered_days,
-        min_first_trade_days, min_trading_counterparty,
-        min_all_trades_count, min_buy_orders_count,
-        min_sell_orders_count,
         method1_liveness_enabled, method2_documents_enabled,
         method2_mobile_verification_enabled, method3_full_enabled,
         method3_mobile_verification_enabled, method3_payment_link_enabled,
         method3_payment_gateway, method3_delivery_method
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
+        method1_liveness_enabled = VALUES(method1_liveness_enabled),
+        method2_documents_enabled = VALUES(method2_documents_enabled),
+        method2_mobile_verification_enabled = VALUES(method2_mobile_verification_enabled),
+        method3_full_enabled = VALUES(method3_full_enabled),
+        method3_mobile_verification_enabled = VALUES(method3_mobile_verification_enabled),
+        method3_payment_link_enabled = VALUES(method3_payment_link_enabled),
+        method3_payment_gateway = VALUES(method3_payment_gateway),
+        method3_delivery_method = VALUES(method3_delivery_method),
+        updated_at = NOW()
+    `;
+
+    const [result] = await pool.query(query, [
+      sellerId,
+      adNo,
+      methods.method1_liveness_enabled ? 1 : 0,
+      methods.method2_documents_enabled ? 1 : 0,
+      methods.method2_mobile_verification_enabled ? 1 : 0,
+      methods.method3_full_enabled ? 1 : 0,
+      methods.method3_mobile_verification_enabled ? 1 : 0,
+      methods.method3_payment_link_enabled ? 1 : 0,
+      methods.method3_payment_gateway || 'razorpay',
+      methods.method3_delivery_method || 'payment_link',
+    ]);
+
+    // insert -> affectedRows 1; update with changes -> 1 or 2. updated_at=NOW()
+    // guarantees a row change even when method flags are unchanged, so a real
+    // save always reports >= 1. (0 would only happen if the query hit no row,
+    // which the upsert prevents.)
+    return result.affectedRows >= 1;
+  }
+
+  async upsertAdRules(sellerId, adNo, rulesData) {
+    const query = `
+      INSERT INTO seller_ad_rules (
+        seller_id, ad_no,
+        min_30day_trades_enabled, min_30day_trades,
+        min_30day_completion_rate_enabled, min_30day_completion_rate,
+        max_avg_release_time_enabled, max_avg_release_time,
+        max_avg_pay_time_enabled, max_avg_pay_time,
+        required_trade_type_enabled, required_trade_type,
+        min_registered_days_enabled, min_registered_days,
+        min_first_trade_days_enabled, min_first_trade_days,
+        min_trading_counterparty_enabled, min_trading_counterparty,
+        min_all_trades_count_enabled, min_all_trades_count,
+        min_buy_orders_count_enabled, min_buy_orders_count,
+        min_sell_orders_count_enabled, min_sell_orders_count,
+        method1_liveness_enabled, method2_documents_enabled,
+        method2_mobile_verification_enabled, method3_full_enabled,
+        method3_mobile_verification_enabled, method3_payment_link_enabled,
+        method3_payment_gateway, method3_delivery_method
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        min_30day_trades_enabled = VALUES(min_30day_trades_enabled),
         min_30day_trades = VALUES(min_30day_trades),
+        min_30day_completion_rate_enabled = VALUES(min_30day_completion_rate_enabled),
         min_30day_completion_rate = VALUES(min_30day_completion_rate),
+        max_avg_release_time_enabled = VALUES(max_avg_release_time_enabled),
         max_avg_release_time = VALUES(max_avg_release_time),
+        max_avg_pay_time_enabled = VALUES(max_avg_pay_time_enabled),
         max_avg_pay_time = VALUES(max_avg_pay_time),
+        required_trade_type_enabled = VALUES(required_trade_type_enabled),
         required_trade_type = VALUES(required_trade_type),
+        min_registered_days_enabled = VALUES(min_registered_days_enabled),
         min_registered_days = VALUES(min_registered_days),
+        min_first_trade_days_enabled = VALUES(min_first_trade_days_enabled),
         min_first_trade_days = VALUES(min_first_trade_days),
+        min_trading_counterparty_enabled = VALUES(min_trading_counterparty_enabled),
         min_trading_counterparty = VALUES(min_trading_counterparty),
+        min_all_trades_count_enabled = VALUES(min_all_trades_count_enabled),
         min_all_trades_count = VALUES(min_all_trades_count),
+        min_buy_orders_count_enabled = VALUES(min_buy_orders_count_enabled),
         min_buy_orders_count = VALUES(min_buy_orders_count),
+        min_sell_orders_count_enabled = VALUES(min_sell_orders_count_enabled),
         min_sell_orders_count = VALUES(min_sell_orders_count),
         method1_liveness_enabled = VALUES(method1_liveness_enabled),
         method2_documents_enabled = VALUES(method2_documents_enabled),
@@ -458,17 +636,17 @@ class SellerOrderDbService {
     return safe(
       pool.query(query, [
         sellerId, adNo,
-        rulesData.min_30day_trades,
-        rulesData.min_30day_completion_rate,
-        rulesData.max_avg_release_time,
-        rulesData.max_avg_pay_time,
-        rulesData.required_trade_type,
-        rulesData.min_registered_days,
-        rulesData.min_first_trade_days,
-        rulesData.min_trading_counterparty,
-        rulesData.min_all_trades_count,
-        rulesData.min_buy_orders_count,
-        rulesData.min_sell_orders_count,
+        rulesData.min_30day_trades_enabled ?? true, rulesData.min_30day_trades,
+        rulesData.min_30day_completion_rate_enabled ?? true, rulesData.min_30day_completion_rate,
+        rulesData.max_avg_release_time_enabled ?? true, rulesData.max_avg_release_time,
+        rulesData.max_avg_pay_time_enabled ?? true, rulesData.max_avg_pay_time,
+        rulesData.required_trade_type_enabled ?? true, rulesData.required_trade_type,
+        rulesData.min_registered_days_enabled ?? true, rulesData.min_registered_days,
+        rulesData.min_first_trade_days_enabled ?? true, rulesData.min_first_trade_days,
+        rulesData.min_trading_counterparty_enabled ?? true, rulesData.min_trading_counterparty,
+        rulesData.min_all_trades_count_enabled ?? true, rulesData.min_all_trades_count,
+        rulesData.min_buy_orders_count_enabled ?? true, rulesData.min_buy_orders_count,
+        rulesData.min_sell_orders_count_enabled ?? true, rulesData.min_sell_orders_count,
         rulesData.method1_liveness_enabled,
         rulesData.method2_documents_enabled,
         rulesData.method2_mobile_verification_enabled,
@@ -610,6 +788,34 @@ class SellerOrderDbService {
     return safe(
       pool.query(query, [sellerId, tradeTypeName]),
       `deleteTradeType:${tradeTypeName}`
+    );
+  }
+
+  /**
+   * Update ad rules in database
+   * @param {string} adNo - Ad number
+   * @param {object} updates - Fields to update (e.g., { min_30day_trades: 30, min_30day_trades_enabled: 1 })
+   * @returns {Promise}
+   */
+  async updateAdRules(adNo, updates) {
+    if (!adNo || !updates || Object.keys(updates).length === 0) {
+      throw new Error('Ad number and updates required');
+    }
+
+    // Build SET clause dynamically
+    const setClauses = Object.keys(updates).map(key => `${key} = ?`);
+    const values = Object.values(updates);
+    values.push(adNo);
+
+    const query = `
+      UPDATE seller_ad_rules
+      SET ${setClauses.join(', ')}, updated_at = NOW()
+      WHERE ad_no = ?
+    `;
+
+    return safe(
+      pool.query(query, values),
+      `updateAdRules:${adNo}`
     );
   }
 }

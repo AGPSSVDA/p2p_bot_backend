@@ -118,25 +118,25 @@ class SellerOrdersController {
       // Get state history
       const { pool } = require('../../config/mysql');
       const [stateHistory] = await pool.query(
-        'SELECT * FROM seller_order_state_log WHERE order_number = ? ORDER BY created_at ASC',
+        'SELECT * FROM seller_order_state_log WHERE order_number = ? ORDER BY transitioned_at ASC',
         [orderNo]
       );
 
-      // Get verification documents if available
+      // Get verification documents / chat images (oldest first = upload order)
       const [documents] = await pool.query(
-        'SELECT * FROM seller_verification_documents WHERE order_number = ?',
+        'SELECT * FROM seller_verification_documents WHERE order_number = ? ORDER BY uploaded_at ASC, id ASC',
         [orderNo]
       );
 
       // Get payment history if available
       const [paymentHistory] = await pool.query(
-        'SELECT * FROM seller_payment_history WHERE order_number = ? ORDER BY created_at DESC',
+        'SELECT * FROM seller_payment_history WHERE order_number = ? ORDER BY initiated_at DESC',
         [orderNo]
       );
 
       // Get order messages
       const [messages] = await pool.query(
-        'SELECT * FROM seller_order_messages WHERE order_number = ? ORDER BY created_at DESC',
+        'SELECT * FROM seller_order_messages WHERE order_number = ? ORDER BY sent_at DESC',
         [orderNo]
       );
 
@@ -171,11 +171,21 @@ class SellerOrdersController {
           requestedAt: order.pan_upload_requested_at || order.aadhaar_upload_requested_at,
           uploadedAt: order.pan_uploaded_at || order.aadhaar_uploaded_at,
           verifiedAt: order.pan_verified_at || order.aadhaar_verified_at,
+          // Images the buyer uploaded in the Binance order chat (Method 2).
+          // documentType is null until a later phase classifies Aadhaar vs PAN.
+          count: documents.length,
           documents: documents.map(d => ({
+            id: d.id,
             type: d.document_type,
+            imageUrl: d.image_url,
+            thumbnailUrl: d.thumbnail_url,
+            imageType: d.image_type,
+            width: d.image_width,
+            height: d.image_height,
+            uploadedAt: d.uploaded_at,
             verifiedAt: d.verified_at,
-            passed: d.verification_passed,
-            failedReason: d.verification_failed_reason
+            status: d.verification_status,
+            error: d.verification_error
           }))
         },
         mobileOtp: {
@@ -194,11 +204,14 @@ class SellerOrdersController {
           gateway: order.payment_gateway,
           deliveryMethod: order.payment_delivery_method,
           history: paymentHistory.map(p => ({
-            type: p.transaction_type,
-            amount: p.transaction_amount,
-            status: p.transaction_status,
-            reference: p.transaction_reference,
-            createdAt: p.created_at
+            method: p.payment_method,
+            amount: p.amount_inr,
+            status: p.status,
+            transactionId: p.transaction_id,
+            utr: p.utr,
+            error: p.error_message,
+            initiatedAt: p.initiated_at,
+            completedAt: p.completed_at
           }))
         },
         thankYou: {
@@ -213,9 +226,11 @@ class SellerOrdersController {
           from: s.from_state,
           to: s.to_state,
           reason: s.reason,
-          timestamp: s.created_at
+          timestamp: s.transitioned_at
         })),
         messages: messages.map(m => ({
+          direction: m.direction,
+          sender: m.sender,
           messageType: m.message_type,
           content: m.message_content,
           sentAt: m.sent_at

@@ -1,0 +1,479 @@
+/**
+ * Seller-specific Binance Service
+ * Uses separate API keys and config for seller operations
+ * Keeps buyer and seller accounts isolated
+ */
+
+const axios = require('axios');
+const https = require('https');
+const crypto = require('crypto');
+const sellerBinanceConfig = require('../../config/sellerBinanceConfig');
+const { withRetry } = require('../../utils/helpers');
+const logger = require('../../utils/logger');
+
+// Force IPv4 for all Binance calls. Binance API-key IP whitelists are IPv4, but
+// on dual-stack networks Node may connect over IPv6, which Binance then rejects
+// with -2015 "Invalid API-key, IP, or permissions". family:4 pins it to IPv4.
+const ipv4Agent = new https.Agent({ family: 4, keepAlive: true });
+
+// Seller-specific headers with seller API key
+function headers(extra = {}) {
+  return {
+    'X-MBX-APIKEY': sellerBinanceConfig.apiKey,
+    'Content-Type': 'application/json',
+    'clientType': 'PC',
+    ...extra,
+  };
+}
+
+function url(endpoint) {
+  return `${sellerBinanceConfig.baseUrl}${endpoint}`;
+}
+
+// Seller-specific signature using seller secret key
+function signQuery(queryString) {
+  return crypto
+    .createHmac('sha256', sellerBinanceConfig.secretKey)
+    .update(queryString)
+    .digest('hex');
+}
+
+// Seller-specific query builder with seller secret key
+function buildSignedQuery(params = {}) {
+  const timestamp = Date.now();
+  const allParams = { ...params, timestamp };
+  const queryStr = Object.entries(allParams)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${k}=${v}`)
+    .join('&');
+  const signature = signQuery(queryStr);
+  return `${queryStr}&signature=${signature}`;
+}
+
+// Order status codes
+const ORDER_STATUS = {
+  WAIT_PAYMENT: 1,
+  WAIT_RELEASE: 2,
+  APPEALING: 3,
+  COMPLETED: 4,
+  CANCELLED: 6,
+  SYS_CANCELLED: 7,
+};
+
+/**
+ * Get Pending Sell Orders (Orders on seller's ads)
+ * Fetch orders where seller is receiving payment from buyers
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/listOrders
+ */
+async function getPendingSellOrders() {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({});
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.listOrders)}?${qs}`,
+      {
+        orderStatusList: [ORDER_STATUS.WAIT_PAYMENT, ORDER_STATUS.WAIT_RELEASE],
+        tradeType: 'SELL',  // Seller receiving buy orders
+        page: 1,
+        rows: 20,
+      },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    const data = res.data?.data || res.data;
+    const list = Array.isArray(data) ? data : (data?.orderList || data?.data || []);
+    return list.filter(o => !o.tradeType || String(o.tradeType).toUpperCase() === 'SELL');
+  }, 3, 3000, 'getPendingSellOrders');
+}
+
+/**
+ * Get Counter Party Order Statistics (Buyer's metrics)
+ * Fetch buyer's trading history and statistics
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/queryCounterPartyOrderStatistic
+ */
+async function getCounterPartyOrderStats(orderNo) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNumber: orderNo });
+
+    console.log(`\n[BinanceService] 🔗 queryCounterPartyOrderStatistic API Call:`);
+    console.log(`   Order No: ${orderNo}`);
+    console.log(`   URL: ${url(sellerBinanceConfig.endpoints.queryCounterPartyOrderStatistic)}`);
+    console.log(`   Query String: ${qs}`);
+    console.log(`   API Key: ${sellerBinanceConfig.apiKey?.substring(0, 10)}...`);
+
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.queryCounterPartyOrderStatistic)}?${qs}`,
+      { orderNumber: orderNo },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    console.log(`   Status: ${res.status}`);
+    console.log(`   Full Response:`, JSON.stringify(res.data, null, 2));
+
+    const data = res.data?.data || res.data;
+
+    // Map Binance response fields to our format
+    // Binance returns different field names, map them correctly
+    const result = {
+      // 30-day metrics
+      trades_30day: data?.completedOrderNumOfLatest30day || data?.completedOrderNum || 0,
+      completion_rate_30day: (parseFloat(data?.finishRateLatest30Day) || parseFloat(data?.finishRate) || 0) * 100,  // Convert to percentage
+      registered_days: data?.registerDays || 0,
+
+      // Overall metrics
+      all_trades_count: data?.completedOrderNum || 0,
+      buy_orders_count: 0,  // Not directly provided by Binance
+      sell_orders_count: 0,  // Not directly provided by Binance
+      trading_counterparty_count: data?.numberOfTradesWithCounterpartyCompleted30day || 0,
+
+      // Time metrics (Binance returns in milliseconds, convert to minutes)
+      avg_release_time_minutes: Math.round((data?.avgReleaseTimeOfLatest30day || 0) / 60000),
+      avg_pay_time_minutes: Math.round((data?.avgPayTimeOfLatest30day || 0) / 60000),
+
+      // Store raw for reference
+      raw_binance_response: data
+    };
+
+    console.log(`   Parsed Result:`, JSON.stringify(result, null, 2));
+    console.log();
+
+    return result;
+  }, 3, 3000, `getCounterPartyOrderStats:${orderNo}`);
+}
+
+/**
+ * Get User Details (Buyer info)
+ * Fetch buyer's profile information
+ * Endpoint: GET /sapi/v1/c2c/user/queryUser
+ */
+async function getUserDetails(userId) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ userId });
+    const res = await axios.get(
+      `${url(sellerBinanceConfig.endpoints.queryUser)}?${qs}`,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    const data = res.data?.data || res.data;
+    return {
+      id: data?.id,
+      name: data?.name,
+      email: data?.email,
+      mobile: data?.mobile
+    };
+  }, 3, 3000, `getUserDetails:${userId}`);
+}
+
+/**
+ * Verify Additional KYC — confirms the order on Binance's side.
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/verifiedAdditionalKyc
+ *
+ * IMPORTANT: This is an ACTION (it verifies/confirms the order), NOT a status poll.
+ * Only call it AFTER liveness completion has been confirmed via the chat signal
+ * (see checkLivenessViaChat). Calling it earlier would verify the order before the
+ * buyer actually completed liveness.
+ */
+async function verifyAdditionalKyc(orderNo) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNumber: orderNo });
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.verifiedAdditionalKyc)}?${qs}`,
+      { orderNumber: orderNo },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    const responseData = res.data?.data || res.data || {};
+    const kycVerified = responseData.kycVerified === true;
+    const success = res.data?.code === '000000' || res.data?.code === 0 || res.status === 200;
+
+    return {
+      success,
+      kycVerified,
+      code: res.data?.code,
+      message: res.data?.message || 'Verification requested',
+      orderNumber: responseData.orderNumber || orderNo,
+      raw: responseData
+    };
+  }, 3, 3000, `verifyAdditionalKyc:${orderNo}`);
+}
+
+/**
+ * Get Order Detail (Full order information including buyer details)
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/getUserOrderDetail
+ *
+ * NOTE: This endpoint takes the ORDER NUMBER, not the ad/adv number.
+ * Passing the ad number returns 400 "illegal parameter" (verified empirically).
+ */
+async function getOrderDetail(orderNumber) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNumber });
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.orderDetail)}?${qs}`,
+      { orderNumber },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    const data = res.data?.data || res.data;
+    return {
+      orderNumber: data?.orderNumber,
+      advOrderNumber: data?.advOrderNumber,
+      buyerNickname: data?.buyerNickname,
+      buyerName: data?.buyerName,
+      takerUserNo: data?.takerUserNo,
+      totalPrice: data?.totalPrice,
+      fiatUnit: data?.fiatUnit,
+      asset: data?.asset,
+      amount: data?.amount,
+      tradeType: data?.tradeType,
+      orderStatus: data?.orderStatus,
+      // Additional-KYC ("liveness") status: 0=not required, 1=pending, 2=verified
+      additionalKycVerify: data?.additionalKycVerify,
+      // Store full response for debugging
+      raw: data
+    };
+  }, 3, 3000, `getOrderDetail:${orderNumber}`);
+}
+
+/**
+ * Get Order Status by Order Number (Latest from getUserOrderDetail)
+ * Check order verification status (including liveness)
+ *
+ * This uses getUserOrderDetail which returns the LATEST order data
+ * (listOrders may return cached data)
+ *
+ * additionalKycVerify values:
+ * 0 = not required
+ * 1 = not verified (pending)
+ * 2 = verified (✅ liveness completed)
+ */
+async function getOrderStatusByOrderNumber(orderNumber) {
+  return withRetry(async () => {
+    // Read additionalKycVerify directly from listOrders.
+    //
+    // We do NOT use getUserOrderDetail here: it returns -31002 "illegal parameter"
+    // intermittently for all orders regardless of parameter, so it's unreliable.
+    // Empirically, listOrders returns an accurate additionalKycVerify for every order
+    // (1 for pending-liveness orders, 2 for verified ones), which is exactly what we
+    // need. Values: 0=not required, 1=pending, 2=verified.
+    const listRes = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.listOrders)}?${buildSignedQuery({})}`,
+      {
+        orderStatusList: [ORDER_STATUS.WAIT_PAYMENT, ORDER_STATUS.WAIT_RELEASE],
+        tradeType: 'SELL',
+        page: 1,
+        rows: 100,
+      },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    const listData = listRes.data?.data || listRes.data;
+    const list = Array.isArray(listData) ? listData : (listData?.orderList || listData?.data || []);
+    const order = list.find(o => o.orderNumber === orderNumber);
+
+    if (!order) {
+      return {
+        success: false,
+        message: 'Order not found in pending orders',
+      };
+    }
+
+    return {
+      success: true,
+      orderNumber: order.orderNumber,
+      advNo: order.advNo,
+      orderStatus: order.orderStatus,
+      additionalKycVerify: order.additionalKycVerify,
+      raw: order,
+      source: 'listOrders',
+    };
+  }, 3, 3000, `getOrderStatusByOrderNumber:${orderNumber}`);
+}
+
+/**
+ * Send Chat Message
+ * Send message to buyer via Binance chat
+ * Endpoint: POST /sapi/v1/c2c/chat/sendMessage
+ */
+async function sendMessage(orderNo, content, msgType = 'TEXT') {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNo });
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.sendMessage)}?${qs}`,
+      {
+        orderNo,
+        content,
+        msgType
+      },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    return {
+      success: res.data?.code === 0 || res.status === 200,
+      message: res.data?.message || 'Message sent'
+    };
+  }, 3, 3000, `sendMessage:${orderNo}`);
+}
+
+/**
+ * Get Chat Messages for an order
+ * Endpoint: GET /sapi/v1/c2c/chat/retrieveChatMessagesWithPagination
+ * Returns the raw message array (newest first).
+ */
+async function getChatMessages(orderNo, rows = 50) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNo, page: 1, rows, sort: 'desc' });
+    const res = await axios.get(
+      `${url(sellerBinanceConfig.endpoints.chatMessages)}?${qs}`,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const data = res.data?.data || res.data;
+    const list = Array.isArray(data) ? data : (data?.list || data?.data || []);
+    return { success: true, messages: list };
+  }, 3, 3000, `getChatMessages:${orderNo}`);
+}
+
+/**
+ * Get images the BUYER uploaded in the order chat (Method 2 - document upload).
+ *
+ * Chat messages with type='image' carry imageUrl/thumbnailUrl (see SAPI v7.4
+ * RetrieveChatMessagesWithPaginationResp). `self` is true for messages WE sent,
+ * so buyer uploads are the ones with self !== true.
+ *
+ * Returns { success, images: [{ id, uuid, imageUrl, thumbnailUrl, imageType,
+ * width, height, createTime, fromNickName }], count }, oldest-first.
+ */
+async function getBuyerUploadedImages(orderNo, rows = 50) {
+  try {
+    const { messages } = await getChatMessages(orderNo, rows);
+
+    const images = (messages || [])
+      .filter(m => m?.type === 'image' && m.self !== true && m.imageUrl)
+      .map(m => ({
+        id: m.id,
+        uuid: m.uuid,
+        imageUrl: m.imageUrl,
+        thumbnailUrl: m.thumbnailUrl,
+        imageType: m.imageType,
+        width: m.width,
+        height: m.height,
+        createTime: m.createTime,
+        fromNickName: m.fromNickName,
+      }))
+      // getChatMessages returns newest-first; upload order is what matters here.
+      .sort((a, b) => (a.createTime || 0) - (b.createTime || 0));
+
+    return { success: true, images, count: images.length };
+  } catch (error) {
+    return {
+      success: false,
+      images: [],
+      count: 0,
+      message: error.response?.data?.msg || error.message,
+    };
+  }
+}
+
+/**
+ * Detect liveness completion via Binance chat system message.
+ *
+ * When the buyer completes the liveness/additional-KYC check, Binance posts a
+ * system message to the order chat whose content JSON has:
+ *   type = "liveness_check_complete_maker"
+ * (verified empirically — this is the reliable signal; additionalKycVerify in
+ * listOrders does NOT flip to 2 in real time.)
+ *
+ * Returns { success, livenessComplete, message }.
+ */
+async function checkLivenessViaChat(orderNo) {
+  try {
+    const { messages } = await getChatMessages(orderNo, 50);
+
+    for (const msg of messages) {
+      if (msg?.type !== 'system' || typeof msg.content !== 'string') continue;
+      // content is a JSON string; check for the completion type without full parse first
+      if (msg.content.includes('liveness_check_complete')) {
+        let parsed = null;
+        try { parsed = JSON.parse(msg.content); } catch (_) { /* keep raw */ }
+        return {
+          success: true,
+          livenessComplete: true,
+          messageType: parsed?.type || 'liveness_check_complete',
+          raw: msg,
+        };
+      }
+    }
+
+    return { success: true, livenessComplete: false };
+  } catch (error) {
+    return {
+      success: false,
+      livenessComplete: false,
+      message: error.response?.data?.msg || error.message,
+    };
+  }
+}
+
+/**
+ * Update seller ad with new parameters (eligibility criteria, etc)
+ * Uses seller API key - for P2P ad updates only
+ * CRITICAL: advNo goes in BODY, signature includes only timestamp
+ */
+async function updateAd(advNo, updates = {}) {
+  return withRetry(async () => {
+    console.log(`\n📡 [SELLER BINANCE] Calling updateAd`);
+    console.log(`   Ad No: ${advNo}`);
+    console.log(`   Fields to update: ${Object.keys(updates).join(', ')}`);
+
+    // Build query string with ONLY timestamp (for signature)
+    // advNo goes in the body, NOT in query
+    const qs = buildSignedQuery({});
+
+    // Payload contains advNo + all update fields
+    const payload = {
+      advNo,
+      ...updates,
+    };
+
+    console.log(`\n   📋 EXACT PAYLOAD BEING SENT:`);
+    console.log(`   Query: [timestamp & signature only]`);
+    console.log(`   Body: ${JSON.stringify(payload, null, 2)}`);
+    console.log(`\n   Using Seller API Key: ${sellerBinanceConfig.apiKey.substring(0, 10)}...`);
+
+    logger.info('Updating Binance ad (seller)', {
+      advNo,
+      updateFields: Object.keys(updates),
+    });
+
+    console.log(`   Sending POST request to: /sapi/v1/c2c/ads/update`);
+    const res = await axios.post(
+      `${url('/sapi/v1/c2c/ads/update')}?${qs}`,
+      payload,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+
+    console.log(`   ✅ Binance API Response received`);
+    console.log(`   Status: ${res.status}`);
+    console.log(`   Data: ${JSON.stringify(res.data, null, 2)}`);
+
+    logger.info('Binance ad updated successfully (seller)', {
+      advNo,
+      response: res.data,
+    });
+
+    return res.data;
+  }, 3, 3000, 'updateAd');
+}
+
+module.exports = {
+  ORDER_STATUS,
+  getPendingSellOrders,
+  getOrderDetail,
+  getOrderStatusByOrderNumber,
+  getCounterPartyOrderStats,
+  getUserDetails,
+  verifyAdditionalKyc,
+  sendMessage,
+  getChatMessages,
+  checkLivenessViaChat,
+  getBuyerUploadedImages,
+  updateAd
+};

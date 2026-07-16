@@ -52,6 +52,17 @@ router.get('/ads/:adNo', (req, res) => sellerAdsController.getAdDetail(req, res)
 // PUT /api/seller/ads/:adNo/rules
 router.put('/ads/:adNo/rules', (req, res) => sellerAdsController.updateAdRules(req, res));
 
+// POST /api/seller/ads/:adNo/sync-eligibility
+// ELIGIBILITY ONLY -> syncs buyer-eligibility criteria to the Binance ad, then saves to DB.
+// Does NOT touch verification methods (see /methods below).
+router.post('/ads/:adNo/sync-eligibility', (req, res) => sellerAdsController.syncEligibilityToBinance(req, res));
+
+// PUT /api/seller/ads/:adNo/methods
+// METHODS ONLY -> saves verification method toggles (Method 1/2/3) to our DB.
+// These are bot-side behaviour applied AFTER an order arrives; Binance has no
+// concept of them, so this never calls the Binance API.
+router.put('/ads/:adNo/methods', (req, res) => sellerAdsController.updateAdMethods(req, res));
+
 // POST /api/seller/ads/:adNo/toggle
 router.post('/ads/:adNo/toggle', (req, res) => sellerAdsController.toggleAd(req, res));
 

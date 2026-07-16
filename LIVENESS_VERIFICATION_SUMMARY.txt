@@ -1,0 +1,74 @@
+═══════════════════════════════════════════════════════════════════════════════
+                 LIVENESS VERIFICATION BUG FIX - SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+PROBLEM FIXED:
+─────────────
+The system was calling verifyAdditionalKyc() WITHOUT checking if liveness was
+actually completed by the buyer. This resulted in orders showing as verified
+(additionalKycVerify = 2) even when the buyer's liveness check on Binance was
+still pending.
+
+USER FEEDBACK THAT TRIGGERED THIS FIX:
+"bina livness check ke kar he ordervierify ho raha hai, mere livness check
+abhi pending hai but yaha value Additional KYC: 2 change ho rahe hai"
+
+ROOT CAUSE:
+───────────
+1. sellerOrderPoller.js (lines 231-249) - Blindly called verifyAdditionalKyc()
+2. sellerOrderHandler.js (lines 217-250) - Same blind verify call in polling
+
+SOLUTION IMPLEMENTED:
+─────────────────────
+✅ REMOVED all automatic/blind verifyAdditionalKyc() calls
+✅ Changed to WAIT for actual Binance status update (additionalKycVerify = 1 → 2)
+✅ Only proceed to order verification AFTER confirming liveness is complete
+
+NEW BEHAVIOR:
+─────────────
+When additionalKycVerify = 1 (pending):
+  1. System sends message to buyer: "Complete liveness on Binance"
+  2. Starts polling every 5 seconds
+  3. Waits for Binance to update status to additionalKycVerify = 2
+  4. Upon detection: marks liveness as completed
+  5. Calls verifyOrderInBinance() and proceeds
+  6. If timeout (10 minutes): cancels order with message to buyer
+
+FILES CHANGED:
+──────────────
+1. src/seller/bot/sellerOrderPoller.js
+   - Removed lines 231-249 (automatic verifyAdditionalKyc call)
+   - Now just checks status without calling verify
+
+2. src/seller/bot/sellerOrderHandler.js
+   - Modified startLivenessPolling() method (lines 217-232)
+   - Removed blind verifyAdditionalKyc() call
+   - Now waits for actual status change from Binance
+
+TESTING:
+────────
+Run script to check order status:
+  node scripts/check-all-kyc-fields.js <orderNumber>
+
+Expected behavior:
+  1. Place order with liveness requirement
+  2. Check logs: "Liveness still pending (additionalKycVerify = 1), waiting..."
+  3. Complete liveness on Binance
+  4. Within 5-10 seconds logs should show: "✅ Binance confirmed: Liveness VERIFIED!"
+  5. Order proceeds to verification/payment
+
+═══════════════════════════════════════════════════════════════════════════════
+                            KEY INSIGHT
+═══════════════════════════════════════════════════════════════════════════════
+
+WRONG ASSUMPTION (FIXED):
+  "When additionalKycVerify = 1, call verifyAdditionalKyc() to mark it verified"
+
+CORRECT APPROACH (IMPLEMENTED):
+  "Wait for buyer to complete liveness on Binance, then Binance will update
+   additionalKycVerify = 2. Only then proceed to order verification."
+
+The fix ensures orders are ONLY verified after ACTUAL liveness completion,
+not assumed completion.
+
+═══════════════════════════════════════════════════════════════════════════════

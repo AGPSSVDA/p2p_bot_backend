@@ -6,7 +6,8 @@ const sellerEligibilityService = require('../services/sellerEligibilityService')
 const sellerBuyerMetricsService = require('../services/sellerBuyerMetricsService');
 const { SellerStateManager, SELLER_ORDER_STATES } = require('./sellerStateManager');
 const sellerVerificationService = require('../services/sellerVerificationService');
-const { binanceService } = require('../../services/binanceService');
+// Seller flows use the SELLER API key only (sellerBinanceService).
+const sellerBinanceService = require('../services/sellerBinanceService');
 
 class SellerOrderHandler {
   constructor() {
@@ -15,6 +16,8 @@ class SellerOrderHandler {
     this.documentTimers = {};
     this.otpTimers = {};
     this.paymentTimers = {};
+    this.livenessPollers = {}; // Polling intervals for liveness check
+    this.documentPollers = {}; // Polling intervals for Method 2 chat image collection
   }
 
   /**
@@ -35,16 +38,30 @@ class SellerOrderHandler {
       logger.info(`📦 Starting seller order handler`, {
         orderNo,
         buyer: rawOrder.counterPartNickName,
-        ad: ad.ad_no
+        ad: ad.ad_no,
+        additionalKycVerify: rawOrder.additionalKycVerify
       });
+
+      // Resolve buyer id across the various field names Binance returns.
+      // Order detail uses takerUserNo; listOrders/other paths may use
+      // counterPartUserId or buyerUserNo. buyer_id is NOT NULL in the DB, so
+      // fall back to the order number to guarantee the insert never fails.
+      const buyerId =
+        rawOrder.counterPartUserId ||
+        rawOrder.takerUserNo ||
+        rawOrder.buyerUserNo ||
+        `unknown-${orderNo}`;
+      const buyerNickname =
+        rawOrder.counterPartNickName || rawOrder.buyerNickname || 'Unknown';
+      const buyerKycName = rawOrder.userFullName || rawOrder.buyerName || '(Unknown)';
 
       // Add to state manager
       this.stateManager.add({
         orderNumber: orderNo,
         sellerId: ad.seller_id,
-        buyerId: rawOrder.counterPartUserId,
-        buyerNickname: rawOrder.counterPartNickName,
-        buyerKycName: rawOrder.userFullName || '(Unknown)',
+        buyerId,
+        buyerNickname,
+        buyerKycName,
         adNo: ad.ad_no,
         cryptoAmount: rawOrder.amount,
         fiatAmount: rawOrder.totalPrice
@@ -54,9 +71,9 @@ class SellerOrderHandler {
       await sellerOrderDbService.upsertOrder({
         orderNumber: orderNo,
         sellerId: ad.seller_id,
-        buyerId: rawOrder.counterPartUserId,
-        buyerNickname: rawOrder.counterPartNickName,
-        buyerKycName: rawOrder.userFullName,
+        buyerId,
+        buyerNickname,
+        buyerKycName,
         adNo: ad.ad_no,
         cryptoAmount: rawOrder.amount,
         fiatAmount: rawOrder.totalPrice,
@@ -72,9 +89,43 @@ class SellerOrderHandler {
         );
       }
 
-      // ===== STEP 2: ELIGIBILITY CHECK =====
-      // Pass both adRules and ad.ad_no to eligibility check
-      await this.performEligibilityCheck(orderNo, rawOrder.counterPartUserId, ad.ad_no, adRules);
+      // ===== METHOD 1: LIVENESS CHECK ONLY =====
+      // Check liveness status and decide next step
+
+      logger.info(`[${orderNo}] Method 1: Checking liveness status`, {
+        additionalKycVerify: rawOrder.additionalKycVerify
+      });
+
+      if (rawOrder.additionalKycVerify === 2) {
+        // ✅ Liveness already verified - proceed to order verification
+        logger.info(`[${orderNo}] ✅ Liveness verified (additionalKycVerify = 2) - verifying order now`);
+
+        await sellerOrderDbService.recordLivenessCompleted(orderNo, true);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_COMPLETED);
+
+        // Verify order and proceed to payment
+        await this.verifyOrderInBinance(orderNo);
+        return;
+      }
+
+      if (rawOrder.additionalKycVerify === 1) {
+        // ⏳ Liveness still pending - START POLLING
+        logger.info(`[${orderNo}] ⏳ Liveness pending (additionalKycVerify = 1) - starting liveness polling`);
+
+        // Start liveness polling - this will wait for buyer to complete
+        await this.startLivenessPolling(orderNo, orderNo);
+        return; // ← IMPORTANT: Don't continue to startVerification!
+      }
+
+      if (rawOrder.additionalKycVerify === 0) {
+        // Liveness not required - proceed directly
+        logger.info(`[${orderNo}] ✅ Liveness not required (additionalKycVerify = 0) - proceeding directly`);
+        await this.verifyOrderInBinance(orderNo);
+        return;
+      }
+
+      // Shouldn't reach here
+      logger.warn(`[${orderNo}] Unknown additionalKycVerify status: ${rawOrder.additionalKycVerify}`);
 
     } catch (error) {
       logger.error(`Order handler error: ${error.message}`, { orderNo, error });
@@ -84,63 +135,8 @@ class SellerOrderHandler {
   }
 
   /**
-   * ===== STEP 2: ELIGIBILITY CHECK =====
-   */
-  async performEligibilityCheck(orderNo, buyerId, adNo, adRules) {
-    try {
-      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.CHECKING_ELIGIBILITY);
-      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.CHECKING_ELIGIBILITY);
-
-      logger.info(`[${orderNo}] Checking buyer eligibility...`);
-
-      // Check buyer against ad rules
-      const eligibility = await sellerEligibilityService.checkBuyerEligibility(
-        buyerId,
-        adNo
-      );
-
-      // Record result
-      await sellerOrderDbService.recordEligibilityCheck(
-        orderNo,
-        eligibility.eligible,
-        eligibility.eligible ? null : eligibility.reason
-      );
-
-      if (!eligibility.eligible) {
-        logger.warn(`[${orderNo}] Buyer ineligible`, { reason: eligibility.reason });
-
-        // Send message to buyer
-        const message = sellerEligibilityService.formatEligibilityMessage(
-          eligibility.failedChecks
-        );
-        await chatService.sendMessage({
-          orderNo,
-          content: message,
-          msgType: 'TEXT'
-        });
-
-        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.ELIGIBILITY_FAILED);
-        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.ELIGIBILITY_FAILED);
-        return;
-      }
-
-      logger.info(`[${orderNo}] ✅ Buyer eligible, proceeding to verification`);
-
-      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.ELIGIBILITY_PASSED);
-      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.ELIGIBILITY_PASSED);
-
-      // ===== STEP 3: START VERIFICATION =====
-      await this.startVerification(orderNo, adRules);
-
-    } catch (error) {
-      logger.error(`Eligibility check error: ${error.message}`, { orderNo });
-      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.REJECTED);
-      await sellerOrderDbService.recordError(orderNo, error.message);
-    }
-  }
-
-  /**
-   * ===== STEP 3: START VERIFICATION (Methods 1, 2, or 3) =====
+   * ===== STEP 2: START VERIFICATION (Methods 1, 2, or 3) =====
+   * Eligibility check already happened on Binance before order reached us
    */
   async startVerification(orderNo, adRules) {
     try {
@@ -194,11 +190,148 @@ class SellerOrderHandler {
         msgType: 'TEXT'
       });
 
-      // Start liveness timeout (10 minutes)
-      this.startLivenessTimeout(orderNo);
+      // Start liveness polling to monitor chatUnreadCount and detect completion
+      await this.startLivenessPolling(orderNo, null);
 
     } catch (error) {
       logger.error(`Liveness verification error: ${error.message}`, { orderNo });
+      await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /**
+   * ===== METHOD 1: LIVENESS POLLING =====
+   * Poll Binance every 5 seconds to check if buyer completed liveness
+   *
+   * IMPORTANT: We WAIT for Binance to auto-update additionalKycVerify from 1→2
+   * We DO NOT call verifyAdditionalKyc() ourselves - that's wrong!
+   * Only call it AFTER we confirm liveness is actually complete.
+   */
+  async startLivenessPolling(orderNo, adOrderNo) {
+    try {
+      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_LIVENESS);
+      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_LIVENESS);
+      await sellerOrderDbService.recordLivenessRequested(orderNo);
+
+      logger.info(`[${orderNo}] 🔄 Starting liveness polling (Method 1)...`, {
+        adOrderNo
+      });
+
+      // Note: No message sent to buyer during liveness verification
+      // Message will only be sent AFTER payment is complete (thank you message)
+
+      let pollCount = 0;
+      const MAX_POLLS = 100; // ~5 minutes with 3-second interval
+
+      // Start polling - PRIMARY signal is the Binance chat system message
+      // "liveness_check_complete_maker". The additionalKycVerify field is NOT
+      // reliable (it does not flip to 2 in real time), so we detect via chat.
+      const pollInterval = setInterval(async () => {
+        try {
+          pollCount++;
+
+          // ===== PRIMARY DETECTION: chat system message =====
+          const livenessCheck = await sellerBinanceService.checkLivenessViaChat(orderNo);
+
+          if (livenessCheck.success && livenessCheck.livenessComplete) {
+            console.log(`[${orderNo}] ✅ LIVENESS COMPLETE! (chat signal "${livenessCheck.messageType}" after ${pollCount} polls)`);
+            logger.info(`[${orderNo}] ✅ Liveness detected via chat message after ${pollCount} polls`, {
+              messageType: livenessCheck.messageType
+            });
+
+            clearInterval(this.livenessPollers[orderNo]);
+            delete this.livenessPollers[orderNo];
+            if (this.livenessTimers[orderNo]) {
+              clearTimeout(this.livenessTimers[orderNo]);
+              delete this.livenessTimers[orderNo];
+            }
+
+            await this.onLivenessCompleted(orderNo);
+            return;
+          }
+
+          // ===== SECONDARY: honor additionalKycVerify if it happens to update =====
+          // (0 = not required -> proceed; 2 = verified -> proceed). Best-effort.
+          const orderStatus = await sellerBinanceService.getOrderStatusByOrderNumber(orderNo);
+          const kycStatus = orderStatus?.success ? orderStatus.additionalKycVerify : undefined;
+
+          if (kycStatus === 0 || kycStatus === 2) {
+            console.log(`[${orderNo}] ✅ Proceeding via additionalKycVerify=${kycStatus} (after ${pollCount} polls)`);
+            logger.info(`[${orderNo}] Proceeding via additionalKycVerify=${kycStatus}`);
+
+            clearInterval(this.livenessPollers[orderNo]);
+            delete this.livenessPollers[orderNo];
+            if (this.livenessTimers[orderNo]) {
+              clearTimeout(this.livenessTimers[orderNo]);
+              delete this.livenessTimers[orderNo];
+            }
+
+            await this.onLivenessCompleted(orderNo);
+            return;
+          }
+
+          // Still pending
+          if (pollCount % 10 === 0 || pollCount <= 3) {
+            console.log(`[${orderNo}] ⏳ Poll #${pollCount}: Liveness still pending (no chat signal, additionalKycVerify=${kycStatus})`);
+          }
+
+          // Timeout
+          if (pollCount >= MAX_POLLS) {
+            console.log(`[${orderNo}] ⏱️  Timeout: Max polls (${MAX_POLLS}) reached - liveness not completed`);
+            logger.warn(`[${orderNo}] Timeout: Liveness did not complete within ${MAX_POLLS} polls (~5 minutes)`);
+
+            clearInterval(this.livenessPollers[orderNo]);
+            delete this.livenessPollers[orderNo];
+
+            this.stateManager.setState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
+            await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
+
+            await chatService.sendMessage({
+              orderNo,
+              content: 'Liveness check timeout. Your order has been cancelled. Please try again.',
+              msgType: 'TEXT'
+            });
+
+            if (this.livenessTimers[orderNo]) {
+              clearTimeout(this.livenessTimers[orderNo]);
+              delete this.livenessTimers[orderNo];
+            }
+          }
+
+        } catch (error) {
+          logger.error(`[${orderNo}] Poll #${pollCount} - Error: ${error.message}`, { error });
+          console.log(`[${orderNo}] Poll #${pollCount}: Error - ${error.message}, will retry...`);
+        }
+      }, 3000); // Poll every 3 seconds (balanced approach)
+
+      this.livenessPollers[orderNo] = pollInterval;
+
+      // Timeout as safety net (in case polling stops for some reason)
+      const timeoutId = setTimeout(async () => {
+        logger.warn(`[${orderNo}] Liveness timeout safety net triggered!`);
+
+        if (this.livenessPollers[orderNo]) {
+          clearInterval(this.livenessPollers[orderNo]);
+          delete this.livenessPollers[orderNo];
+        }
+
+        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
+
+        await chatService.sendMessage({
+          orderNo,
+          content: 'Liveness check timeout. Your order has been cancelled. Please try again.',
+          msgType: 'TEXT'
+        });
+
+        delete this.livenessTimers[orderNo];
+
+      }, 600000); // 10 minutes safety net
+
+      this.livenessTimers[orderNo] = timeoutId;
+
+    } catch (error) {
+      logger.error(`Liveness polling start error: ${error.message}`, { orderNo });
       await sellerOrderDbService.recordError(orderNo, error.message);
     }
   }
@@ -210,6 +343,12 @@ class SellerOrderHandler {
     try {
       logger.info(`[${orderNo}] Liveness check completed!`);
 
+      // Clear polling interval
+      if (this.livenessPollers[orderNo]) {
+        clearInterval(this.livenessPollers[orderNo]);
+        delete this.livenessPollers[orderNo];
+      }
+
       // Clear timeout
       if (this.livenessTimers[orderNo]) {
         clearTimeout(this.livenessTimers[orderNo]);
@@ -220,12 +359,121 @@ class SellerOrderHandler {
       await sellerOrderDbService.recordLivenessCompleted(orderNo, true);
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_COMPLETED);
 
+      // ===== METHOD 2: DOCUMENT IMAGES FROM CHAT =====
+      // Method 2 = Method 1 (liveness) + document images. Only when admin enabled it.
+      const order = this.stateManager.get(orderNo);
+      const adRules = order?.adNo
+        ? await sellerOrderDbService.getAdRules(order.adNo)
+        : null;
+
+      if (adRules?.method2_documents_enabled) {
+        logger.info(`[${orderNo}] Method 2 enabled - collecting document images from chat`);
+        await this.startDocumentImageCollection(orderNo);
+        return; // Payment/verification continues after documents are collected
+      }
+
       // ===== STEP 4: ORDER VERIFICATION IN BINANCE =====
       await this.verifyOrderInBinance(orderNo);
 
     } catch (error) {
       logger.error(`Liveness completion error: ${error.message}`, { orderNo });
       await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /**
+   * ===== METHOD 2 / PHASE 1: COLLECT DOCUMENT IMAGES FROM BINANCE CHAT =====
+   *
+   * Silently watches the order chat for images the buyer uploads (Aadhaar/PAN)
+   * and stores each one's Binance URL + metadata. We do NOT message the buyer.
+   *
+   * Phase 1 scope: fetch + store the images only. Deciding whether enough
+   * documents arrived, which is Aadhaar vs PAN, downloading, and OCR/verification
+   * are later phases. So this collects continuously and does not gate the order.
+   */
+  async startDocumentImageCollection(orderNo) {
+    try {
+      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_DOCUMENTS);
+      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_DOCUMENTS);
+
+      logger.info(`[${orderNo}] 📄 Watching chat for document images (no message sent to buyer)`);
+
+      // Don't start a second poller for an order already being watched.
+      if (this.documentPollers[orderNo]) {
+        logger.debug(`[${orderNo}] Document collection already running`);
+        return;
+      }
+
+      // Read the buyer from the DB, not the in-memory state manager: on a resume
+      // after restart the state manager is empty and buyerId would be undefined.
+      const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+      const buyerId = dbOrder?.buyer_id || this.stateManager.get(orderNo)?.buyerId;
+      let pollCount = 0;
+      const MAX_POLLS = 200; // ~10 minutes at 3s
+
+      const pollInterval = setInterval(async () => {
+        try {
+          pollCount++;
+
+          const result = await sellerBinanceService.getBuyerUploadedImages(orderNo);
+
+          if (!result.success) {
+            if (pollCount % 20 === 0 || pollCount <= 3) {
+              logger.debug(`[${orderNo}] Doc poll #${pollCount}: chat read failed - ${result.message}`);
+            }
+            return;
+          }
+
+          // Store any new images (saveChatImage is idempotent per chat message id)
+          let newCount = 0;
+          for (const image of result.images) {
+            const inserted = await sellerOrderDbService.saveChatImage(orderNo, buyerId, image);
+            if (inserted) {
+              newCount++;
+              console.log(`[${orderNo}] 📄 New document image stored: ${image.imageUrl}`);
+              logger.info(`[${orderNo}] 📄 Stored buyer image from chat`, {
+                chatMessageId: image.id,
+                imageType: image.imageType,
+                imageUrl: image.imageUrl,
+              });
+            }
+          }
+
+          if (newCount > 0) {
+            const stored = await sellerOrderDbService.getChatImages(orderNo);
+            console.log(`[${orderNo}] 📄 Total images uploaded by buyer so far: ${stored.length}`);
+            // NOTE: we deliberately do NOT label images aadhaar/pan here.
+            // Classification is a later phase — Phase 1 only collects them.
+          } else if (pollCount % 20 === 0 || pollCount <= 3) {
+            console.log(`[${orderNo}] 📄 Doc poll #${pollCount}: no NEW images (${result.count} already collected from chat)`);
+          }
+
+          if (pollCount >= MAX_POLLS) {
+            logger.info(`[${orderNo}] Document image collection window ended after ${pollCount} polls`);
+            this.stopDocumentImageCollection(orderNo);
+          }
+
+        } catch (error) {
+          logger.error(`[${orderNo}] Doc poll #${pollCount} error: ${error.message}`, { error });
+        }
+      }, 3000);
+
+      this.documentPollers[orderNo] = pollInterval;
+
+    } catch (error) {
+      logger.error(`Document image collection error: ${error.message}`, { orderNo });
+      await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /**
+   * Stop watching the chat for document images.
+   */
+  stopDocumentImageCollection(orderNo) {
+    if (this.documentPollers[orderNo]) {
+      clearInterval(this.documentPollers[orderNo]);
+      delete this.documentPollers[orderNo];
+      logger.info(`[${orderNo}] Stopped document image collection`);
     }
   }
 
@@ -477,39 +725,50 @@ class SellerOrderHandler {
    */
   async verifyOrderInBinance(orderNo) {
     try {
-      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.VERIFYING_ORDER);
-      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.VERIFYING_ORDER);
-      await sellerOrderDbService.recordOrderVerifyAttempted(orderNo);
+      logger.info(`[${orderNo}] Liveness confirmed - verifying order on Binance...`);
 
-      logger.info(`[${orderNo}] Calling Binance verifyOrder API...`);
+      // ===== CONFIRM THE ORDER ON BINANCE =====
+      // Now that liveness is genuinely complete (detected via chat signal), call
+      // Binance to verify/confirm the additional-KYC for this order. This is the
+      // action that marks the order verified on Binance's side.
+      const verifyResult = await sellerBinanceService.verifyAdditionalKyc(orderNo);
 
-      // Call Binance API to verify order
-      const verifyResult = await binanceService.verifyOrder(orderNo);
+      console.log(`[${orderNo}] verifyAdditionalKyc ->`, {
+        success: verifyResult?.success,
+        kycVerified: verifyResult?.kycVerified,
+        code: verifyResult?.code,
+        message: verifyResult?.message,
+      });
 
-      if (!verifyResult.success) {
-        logger.error(`[${orderNo}] Binance verification failed`, {
-          error: verifyResult.error
+      if (!verifyResult?.success) {
+        // Binance rejected the verification - do NOT proceed to payment.
+        logger.error(`[${orderNo}] ❌ Binance order verification failed`, {
+          code: verifyResult?.code,
+          message: verifyResult?.message,
         });
-
-        await sellerOrderDbService.recordOrderVerified(orderNo, false, verifyResult.error);
-        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.ORDER_VERIFY_FAILED);
-        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.ORDER_VERIFY_FAILED);
+        await sellerOrderDbService.recordOrderVerified(orderNo, false, verifyResult?.message || 'verify failed');
+        await sellerOrderDbService.recordError(orderNo, `Binance verify failed: ${verifyResult?.message || 'unknown'}`);
+        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.REJECTED);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.REJECTED);
         return;
       }
 
-      logger.info(`[${orderNo}] ✅ Order verified in Binance!`);
+      logger.info(`[${orderNo}] ✅ Order VERIFIED on Binance (kycVerified=${verifyResult.kycVerified})`);
 
+      // Mark order as verified in our database
       await sellerOrderDbService.recordOrderVerified(orderNo, true);
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.ORDER_VERIFIED);
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.ORDER_VERIFIED);
 
       // ===== STEP 5: PAYMENT HANDLING =====
+      // For Method 1: Binance handles payment automatically
       await this.handlePayment(orderNo);
 
     } catch (error) {
       logger.error(`Order verify error: ${error.message}`, { orderNo });
       await sellerOrderDbService.recordError(orderNo, error.message);
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.REJECTED);
+      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.REJECTED);
     }
   }
 
@@ -548,6 +807,7 @@ class SellerOrderHandler {
 
   /**
    * METHOD 1/2: Wait for Binance payment
+   * Poll order status to detect when payment is completed
    */
   async waitForBinancePayment(orderNo) {
     try {
@@ -556,17 +816,75 @@ class SellerOrderHandler {
 
       logger.info(`[${orderNo}] Waiting for buyer to complete payment on Binance...`);
 
-      // Poll order status until payment complete
-      // When complete: GOTO Step 6 (Thank you message)
+      // Start polling order status to detect payment completion
+      let previousOrderStatus = null;
 
-      // For now, set timeout and wait
+      const paymentPollInterval = setInterval(async () => {
+        try {
+          const orderStatus = await sellerBinanceService.getOrderStatusByOrderNumber(orderNo);
+
+          if (!orderStatus?.success) return;
+
+          // First poll - record initial status
+          if (previousOrderStatus === null) {
+            previousOrderStatus = orderStatus.orderStatus;
+            logger.debug(`[${orderNo}] Initial orderStatus: ${previousOrderStatus}`);
+            return;
+          }
+
+          // Check order status:
+          // 1 = WAIT_PAYMENT (buyer hasn't paid)
+          // 2 = WAIT_RELEASE (buyer paid, seller needs to release)
+          // 4 = COMPLETED (both paid and released)
+
+          logger.debug(`[${orderNo}] Polling payment status: ${orderStatus.orderStatus}`);
+
+          if (orderStatus.orderStatus === 2) {
+            // ✅ BUYER PAID - Seller needs to release
+            logger.info(`[${orderNo}] 💰 Buyer paid! orderStatus = 2 (WAIT_RELEASE)`);
+            logger.info(`[${orderNo}] Waiting for seller to release crypto...`);
+
+            // Continue polling for release
+            previousOrderStatus = 2;
+          } else if (orderStatus.orderStatus === 4) {
+            // ✅ PAYMENT COMPLETE - Both paid and released
+            logger.info(`[${orderNo}] ✅ Payment completed! orderStatus = 4 (COMPLETED)`);
+
+            // Stop polling
+            clearInterval(paymentPollInterval);
+            if (this.paymentTimers[orderNo]) {
+              clearTimeout(this.paymentTimers[orderNo]);
+              delete this.paymentTimers[orderNo];
+            }
+
+            // Send thank you message
+            await this.onBinancePaymentCompleted(orderNo);
+          }
+
+        } catch (error) {
+          logger.error(`[${orderNo}] Payment polling error: ${error.message}`);
+        }
+      }, 5000); // Poll every 5 seconds
+
+      this.paymentTimers[orderNo] = paymentPollInterval;
+
+      // Set timeout (30 minutes) in case polling hangs
       const paymentTimeout = setTimeout(async () => {
-        logger.warn(`[${orderNo}] Payment timeout!`);
+        logger.warn(`[${orderNo}] Payment timeout! (30 minutes)`);
+
+        // Stop polling
+        if (this.paymentTimers[orderNo]) {
+          clearInterval(this.paymentTimers[orderNo]);
+          delete this.paymentTimers[orderNo];
+        }
+
         this.stateManager.setState(orderNo, SELLER_ORDER_STATES.PAYMENT_TIMEOUT);
-        delete this.paymentTimers[orderNo];
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.PAYMENT_TIMEOUT);
+
+        logger.info(`[${orderNo}] Order moved to timeout state. Manual intervention may be needed.`);
       }, 1800000); // 30 minutes
 
-      this.paymentTimers[orderNo] = paymentTimeout;
+      this.paymentTimers[orderNo + '_timeout'] = paymentTimeout;
 
     } catch (error) {
       logger.error(`Binance payment wait error: ${error.message}`, { orderNo });
@@ -758,5 +1076,5 @@ class SellerOrderHandler {
 }
 
 module.exports = {
-  SellerOrderHandler: new SellerOrderHandler()
+  SellerOrderHandler
 };

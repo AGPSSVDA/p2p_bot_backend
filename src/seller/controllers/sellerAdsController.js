@@ -106,17 +106,43 @@ class SellerAdsController {
         // Rules & Configuration
         rules: {
           eligibility: {
-            min30dayTrades: ad.rules?.min_30day_trades || 0,
-            min30dayCompletionRate: ad.rules?.min_30day_completion_rate || 0,
-            maxAvgReleaseTime: ad.rules?.max_avg_release_time || 0,
-            maxAvgPayTime: ad.rules?.max_avg_pay_time || 0,
-            requiredTradeType: ad.rules?.required_trade_type || 'ANY',
-            minRegisteredDays: ad.rules?.min_registered_days || 0,
-            minFirstTradeDays: ad.rules?.min_first_trade_days || 0,
-            minTradingCounterparty: ad.rules?.min_trading_counterparty || 0,
-            minAllTradesCount: ad.rules?.min_all_trades_count || 0,
-            minBuyOrdersCount: ad.rules?.min_buy_orders_count || 0,
-            minSellOrdersCount: ad.rules?.min_sell_orders_count || 0
+            // Each criterion has enabled flag + value (from database)
+            min30dayTrades: {
+              enabled: ad.rules?.min_30day_trades_enabled === 1 || ad.rules?.min_30day_trades_enabled === true,
+              value: ad.rules?.min_30day_trades || 0
+            },
+            min30dayCompletionRate: {
+              enabled: ad.rules?.min_30day_completion_rate_enabled === 1 || ad.rules?.min_30day_completion_rate_enabled === true,
+              value: ad.rules?.min_30day_completion_rate || 0
+            },
+            minRegisteredDays: {
+              enabled: ad.rules?.min_registered_days_enabled === 1 || ad.rules?.min_registered_days_enabled === true,
+              value: ad.rules?.min_registered_days || 0
+            },
+            minAllTradesCount: {
+              enabled: ad.rules?.min_all_trades_count_enabled === 1 || ad.rules?.min_all_trades_count_enabled === true,
+              value: ad.rules?.min_all_trades_count || 0
+            },
+            minBuyOrdersCount: {
+              enabled: ad.rules?.min_buy_orders_count_enabled === 1 || ad.rules?.min_buy_orders_count_enabled === true,
+              value: ad.rules?.min_buy_orders_count || 0
+            },
+            minSellOrdersCount: {
+              enabled: ad.rules?.min_sell_orders_count_enabled === 1 || ad.rules?.min_sell_orders_count_enabled === true,
+              value: ad.rules?.min_sell_orders_count || 0
+            },
+            minTradeVolume: {
+              enabled: ad.rules?.min_trade_volume_enabled === 1 || ad.rules?.min_trade_volume_enabled === true,
+              value: ad.rules?.min_trade_volume || 0
+            },
+            maxTradeVolume: {
+              enabled: ad.rules?.max_trade_volume_enabled === 1 || ad.rules?.max_trade_volume_enabled === true,
+              value: ad.rules?.max_trade_volume || 0
+            },
+            minBtcHolding: {
+              enabled: ad.rules?.min_btc_holding_enabled === 1 || ad.rules?.min_btc_holding_enabled === true,
+              value: ad.rules?.min_btc_holding || 0
+            }
           },
           methods: {
             method1: {
@@ -199,17 +225,42 @@ class SellerAdsController {
         updatedAt: ad.updated_at,
         rules: {
           eligibility: {
-            min30dayTrades: ad.rules.min_30day_trades,
-            min30dayCompletionRate: ad.rules.min_30day_completion_rate,
-            maxAvgReleaseTime: ad.rules.max_avg_release_time,
-            maxAvgPayTime: ad.rules.max_avg_pay_time,
-            requiredTradeType: ad.rules.required_trade_type,
-            minRegisteredDays: ad.rules.min_registered_days,
-            minFirstTradeDays: ad.rules.min_first_trade_days,
-            minTradingCounterparty: ad.rules.min_trading_counterparty,
-            minAllTradesCount: ad.rules.min_all_trades_count,
-            minBuyOrdersCount: ad.rules.min_buy_orders_count,
-            minSellOrdersCount: ad.rules.min_sell_orders_count
+            min30dayTrades: {
+              enabled: ad.rules.min_30day_trades_enabled === 1 || ad.rules.min_30day_trades_enabled === true,
+              value: ad.rules.min_30day_trades || 0
+            },
+            min30dayCompletionRate: {
+              enabled: ad.rules.min_30day_completion_rate_enabled === 1 || ad.rules.min_30day_completion_rate_enabled === true,
+              value: ad.rules.min_30day_completion_rate || 0
+            },
+            minRegisteredDays: {
+              enabled: ad.rules.min_registered_days_enabled === 1 || ad.rules.min_registered_days_enabled === true,
+              value: ad.rules.min_registered_days || 0
+            },
+            minAllTradesCount: {
+              enabled: ad.rules.min_all_trades_count_enabled === 1 || ad.rules.min_all_trades_count_enabled === true,
+              value: ad.rules.min_all_trades_count || 0
+            },
+            minBuyOrdersCount: {
+              enabled: ad.rules.min_buy_orders_count_enabled === 1 || ad.rules.min_buy_orders_count_enabled === true,
+              value: ad.rules.min_buy_orders_count || 0
+            },
+            minSellOrdersCount: {
+              enabled: ad.rules.min_sell_orders_count_enabled === 1 || ad.rules.min_sell_orders_count_enabled === true,
+              value: ad.rules.min_sell_orders_count || 0
+            },
+            minTradeVolume: {
+              enabled: ad.rules.min_trade_volume_enabled === 1 || ad.rules.min_trade_volume_enabled === true,
+              value: ad.rules.min_trade_volume || 0
+            },
+            maxTradeVolume: {
+              enabled: ad.rules.max_trade_volume_enabled === 1 || ad.rules.max_trade_volume_enabled === true,
+              value: ad.rules.max_trade_volume || 0
+            },
+            minBtcHolding: {
+              enabled: ad.rules.min_btc_holding_enabled === 1 || ad.rules.min_btc_holding_enabled === true,
+              value: ad.rules.min_btc_holding || 0
+            }
           },
           methods: {
             method1: {
@@ -257,7 +308,16 @@ class SellerAdsController {
       const sellerId = getSellerIdFromRequest(req);
       const rulesData = req.body;
 
-      logger.info('Updating ad rules', { sellerId, adNo });
+      logger.info('Updating ad rules', {
+        sellerId,
+        adNo,
+        receivedFields: Object.keys(rulesData),
+        methodsInPayload: {
+          method1_liveness_enabled: rulesData.method1_liveness_enabled,
+          method2_documents_enabled: rulesData.method2_documents_enabled,
+          method3_full_enabled: rulesData.method3_full_enabled
+        }
+      });
 
       // Verify seller owns this ad
       const ad = await sellerAdService.getAdWithRules(adNo);
@@ -299,12 +359,73 @@ class SellerAdsController {
 
       logger.info(`✅ Ad rules updated`, { sellerId, adNo });
 
+      // Format rules with enabled flags
+      const formattedRules = {
+        eligibility: {
+          min30dayTrades: {
+            enabled: updatedAd.rules?.min_30day_trades_enabled === 1 || updatedAd.rules?.min_30day_trades_enabled === true,
+            value: updatedAd.rules?.min_30day_trades || 0
+          },
+          min30dayCompletionRate: {
+            enabled: updatedAd.rules?.min_30day_completion_rate_enabled === 1 || updatedAd.rules?.min_30day_completion_rate_enabled === true,
+            value: updatedAd.rules?.min_30day_completion_rate || 0
+          },
+          minRegisteredDays: {
+            enabled: updatedAd.rules?.min_registered_days_enabled === 1 || updatedAd.rules?.min_registered_days_enabled === true,
+            value: updatedAd.rules?.min_registered_days || 0
+          },
+          minAllTradesCount: {
+            enabled: updatedAd.rules?.min_all_trades_count_enabled === 1 || updatedAd.rules?.min_all_trades_count_enabled === true,
+            value: updatedAd.rules?.min_all_trades_count || 0
+          },
+          minBuyOrdersCount: {
+            enabled: updatedAd.rules?.min_buy_orders_count_enabled === 1 || updatedAd.rules?.min_buy_orders_count_enabled === true,
+            value: updatedAd.rules?.min_buy_orders_count || 0
+          },
+          minSellOrdersCount: {
+            enabled: updatedAd.rules?.min_sell_orders_count_enabled === 1 || updatedAd.rules?.min_sell_orders_count_enabled === true,
+            value: updatedAd.rules?.min_sell_orders_count || 0
+          },
+          minTradeVolume: {
+            enabled: updatedAd.rules?.min_trade_volume_enabled === 1 || updatedAd.rules?.min_trade_volume_enabled === true,
+            value: updatedAd.rules?.min_trade_volume || 0
+          },
+          maxTradeVolume: {
+            enabled: updatedAd.rules?.max_trade_volume_enabled === 1 || updatedAd.rules?.max_trade_volume_enabled === true,
+            value: updatedAd.rules?.max_trade_volume || 0
+          },
+          minBtcHolding: {
+            enabled: updatedAd.rules?.min_btc_holding_enabled === 1 || updatedAd.rules?.min_btc_holding_enabled === true,
+            value: updatedAd.rules?.min_btc_holding || 0
+          }
+        },
+        methods: {
+          method1: {
+            name: 'Liveness Check',
+            enabled: updatedAd.rules?.method1_liveness_enabled === 1 || updatedAd.rules?.method1_liveness_enabled === true
+          },
+          method2: {
+            name: 'Documents + OTP',
+            enabled: updatedAd.rules?.method2_documents_enabled === 1 || updatedAd.rules?.method2_documents_enabled === true,
+            mobileVerification: updatedAd.rules?.method2_mobile_verification_enabled === 1 || updatedAd.rules?.method2_mobile_verification_enabled === true
+          },
+          method3: {
+            name: 'Full Verification',
+            enabled: updatedAd.rules?.method3_full_enabled === 1 || updatedAd.rules?.method3_full_enabled === true,
+            mobileVerification: updatedAd.rules?.method3_mobile_verification_enabled === 1 || updatedAd.rules?.method3_mobile_verification_enabled === true,
+            paymentLink: updatedAd.rules?.method3_payment_link_enabled === 1 || updatedAd.rules?.method3_payment_link_enabled === true,
+            paymentGateway: updatedAd.rules?.method3_payment_gateway || 'razorpay',
+            deliveryMethod: updatedAd.rules?.method3_delivery_method || 'payment_link'
+          }
+        }
+      };
+
       res.status(200).json({
         success: true,
         message: 'Ad rules updated successfully',
         data: {
           adNo: updatedAd.ad_no,
-          rules: updatedAd.rules,
+          rules: formattedRules,
           summary: sellerAdService.getRuleSummary(updatedAd.rules)
         }
       });
@@ -371,6 +492,496 @@ class SellerAdsController {
       res.status(500).json({
         success: false,
         error: error.message
+      });
+    }
+  }
+
+  /**
+   * POST /api/seller/ads/:adNo/sync-eligibility
+   * Sync eligibility criteria from database to Binance ad
+   */
+  /**
+   * PUT /api/seller/ads/:adNo/methods
+   *
+   * Save VERIFICATION METHODS only (Method 1/2/3 toggles).
+   *
+   * Methods are bot-side behaviour applied AFTER an order arrives:
+   *   Method 1 -> check liveness
+   *   Method 2 -> liveness + documents the buyer uploads in Binance chat
+   *   Method 3 -> full verification
+   * Binance has no concept of these, so this endpoint NEVER calls the Binance API.
+   * That keeps method changes working even when a Binance ad update is rejected
+   * (e.g. ads in advStatus=4 return error 187022).
+   *
+   * Body: { methods: { method1: {enabled}, method2: {enabled, mobileVerification},
+   *                    method3: {enabled, mobileVerification, paymentLink,
+   *                              paymentGateway, deliveryMethod} } }
+   * Also accepts flat snake_case columns for convenience.
+   */
+  async updateAdMethods(req, res) {
+    try {
+      const sellerId = getSellerIdFromRequest(req);
+      const { adNo } = req.params;
+      const { methods } = req.body || {};
+
+      console.log(`\n⚙️  [METHODS] Updating verification methods (DB only, no Binance call)`);
+      console.log(`   Ad No: ${adNo}`);
+
+      // Verify the seller owns this ad
+      const ad = await sellerAdService.getAdWithRules(adNo);
+      if (!ad) {
+        return res.status(404).json({ success: false, error: 'Ad not found' });
+      }
+      if (ad.seller_id !== sellerId) {
+        return res.status(403).json({ success: false, error: 'Unauthorized access to this ad' });
+      }
+
+      // Accept either the nested {methods:{...}} shape or flat snake_case fields.
+      const asBool = (v) => v === true || v === 1 || v === '1';
+      const payload = methods
+        ? {
+            method1_liveness_enabled: asBool(methods.method1?.enabled),
+            method2_documents_enabled: asBool(methods.method2?.enabled),
+            method2_mobile_verification_enabled: asBool(methods.method2?.mobileVerification),
+            method3_full_enabled: asBool(methods.method3?.enabled),
+            method3_mobile_verification_enabled: asBool(methods.method3?.mobileVerification),
+            method3_payment_link_enabled: asBool(methods.method3?.paymentLink),
+            method3_payment_gateway: methods.method3?.paymentGateway || 'razorpay',
+            method3_delivery_method: methods.method3?.deliveryMethod || 'payment_link',
+          }
+        : {
+            method1_liveness_enabled: asBool(req.body.method1_liveness_enabled),
+            method2_documents_enabled: asBool(req.body.method2_documents_enabled),
+            method2_mobile_verification_enabled: asBool(req.body.method2_mobile_verification_enabled),
+            method3_full_enabled: asBool(req.body.method3_full_enabled),
+            method3_mobile_verification_enabled: asBool(req.body.method3_mobile_verification_enabled),
+            method3_payment_link_enabled: asBool(req.body.method3_payment_link_enabled),
+            method3_payment_gateway: req.body.method3_payment_gateway || 'razorpay',
+            method3_delivery_method: req.body.method3_delivery_method || 'payment_link',
+          };
+
+      // At least one method must be enabled, otherwise no order would ever verify.
+      if (!payload.method1_liveness_enabled &&
+          !payload.method2_documents_enabled &&
+          !payload.method3_full_enabled) {
+        return res.status(400).json({
+          success: false,
+          error: 'At least one verification method must be enabled',
+        });
+      }
+
+      console.log(`   Methods:`, JSON.stringify(payload, null, 2));
+
+      const result = await sellerAdService.updateAdMethods(sellerId, adNo, payload);
+      if (!result.success) {
+        return res.status(500).json({
+          success: false,
+          error: result.error || 'Failed to update methods',
+        });
+      }
+
+      console.log(`   ✅ Methods saved to database`);
+      logger.info('✅ Ad verification methods updated', { sellerId, adNo, methods: payload });
+
+      return res.json({
+        success: true,
+        message: 'Verification methods updated',
+        adNo,
+        methods: {
+          method1: { enabled: payload.method1_liveness_enabled },
+          method2: {
+            enabled: payload.method2_documents_enabled,
+            mobileVerification: payload.method2_mobile_verification_enabled,
+          },
+          method3: {
+            enabled: payload.method3_full_enabled,
+            mobileVerification: payload.method3_mobile_verification_enabled,
+            paymentLink: payload.method3_payment_link_enabled,
+            paymentGateway: payload.method3_payment_gateway,
+            deliveryMethod: payload.method3_delivery_method,
+          },
+        },
+      });
+
+    } catch (error) {
+      logger.error(`Update ad methods error: ${error.message}`, { error });
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  /**
+   * POST /api/seller/ads/:adNo/sync-eligibility
+   *
+   * ELIGIBILITY ONLY. Syncs buyer-eligibility criteria to the Binance ad and,
+   * if Binance accepts, saves them to our DB.
+   *
+   * Verification methods are NOT handled here — they are bot-side behaviour with
+   * no Binance equivalent. Use PUT /api/seller/ads/:adNo/methods for those.
+   *
+   * Body: { rules: { eligibility: {...} } }   // a `methods` key is ignored
+   */
+  async syncEligibilityToBinance(req, res) {
+    try {
+      const sellerId = getSellerIdFromRequest(req);
+      const { adNo } = req.params;
+      const { rules: frontendRules } = req.body;
+
+      console.log(`\n🔄 [SYNC] Starting eligibility sync to Binance (eligibility only)`);
+      console.log(`   Seller ID: ${sellerId}`);
+      console.log(`   Ad No: ${adNo}`);
+      console.log(`   Rules from frontend:`, frontendRules ? 'YES' : 'NO (using DB)');
+      logger.info('Syncing eligibility to Binance', { sellerId, adNo });
+
+      // Step 1: Get current ad rules
+      // If frontend sends rules, use those (they're the latest)
+      // Otherwise fetch from database
+      console.log(`\n📊 [SYNC] Step 1: Getting ad rules...`);
+      let rules;
+
+      if (frontendRules && frontendRules.eligibility) {
+        console.log(`   ✅ Using rules from frontend (latest changes)`);
+        rules = frontendRules.eligibility;
+      } else {
+        console.log(`   Using rules from database`);
+        rules = await sellerOrderDbService.getAdRules(adNo);
+      }
+
+      if (!rules) {
+        console.log(`   ❌ Ad rules not found in database`);
+        logger.error(`❌ Ad rules not found for ad ${adNo}`);
+        return res.status(404).json({
+          success: false,
+          error: 'Ad rules not found'
+        });
+      }
+      console.log(`   ✅ Ad rules found`);
+      console.log(`   Rules:`, JSON.stringify(rules, null, 2));
+
+      // Import sellerBinanceService - uses seller API keys for P2P operations
+      const sellerBinanceService = require('../services/sellerBinanceService');
+
+      // Step 2: Build Binance update payload with only enabled criteria
+      console.log(`\n🔨 [SYNC] Step 2: Building Binance payload...`);
+      const binancePayload = {};
+
+      // Helper function to safely parse integers
+      const safeInt = (val) => {
+        const parsed = parseInt(val);
+        return isNaN(parsed) ? 0 : parsed;
+      };
+
+      // Helper function to safely parse floats
+      const safeFloat = (val) => {
+        const parsed = parseFloat(val);
+        return isNaN(parsed) ? 0 : parsed;
+      };
+
+      // Helper to extract value from criteria object
+      const getCriterionValue = (criterion) => {
+        if (!criterion) return null;
+        if (typeof criterion === 'object' && 'value' in criterion) {
+          return criterion.value;
+        }
+        return criterion;
+      };
+
+      // Helper to check if criterion is enabled
+      const isCriterionEnabled = (criterion) => {
+        if (!criterion) return false;
+        if (typeof criterion === 'object' && 'enabled' in criterion) {
+          return criterion.enabled === true;
+        }
+        return false;
+      };
+
+      // Add eligibility criteria - include enabled AND send reset values for disabled ones
+      console.log(`   Checking criteria...`);
+
+      // Min 30-day trades (userTradeCountMin)
+      if (isCriterionEnabled(rules.min30dayTrades)) {
+        const val = getCriterionValue(rules.min30dayTrades);
+        if (val) {
+          binancePayload.userTradeCountMin = safeInt(val);
+          binancePayload.userTradeCountFilterTime = 1;
+          console.log(`   ✅ Min 30-day trades: ${binancePayload.userTradeCountMin}`);
+        }
+      } else {
+        binancePayload.userTradeCountMin = 0;
+        console.log(`   🔄 Min 30-day trades: RESET TO 0 (disabled)`);
+      }
+
+      // Min completion rate (userTradeCompleteRateMin)
+      if (isCriterionEnabled(rules.min30dayCompletionRate)) {
+        const val = getCriterionValue(rules.min30dayCompletionRate);
+        if (val) {
+          const rateValue = safeFloat(val);
+          const decimalRate = rateValue > 1 ? rateValue / 100 : rateValue;
+          binancePayload.userTradeCompleteRateMin = decimalRate;
+          binancePayload.userTradeCompleteRateFilterTime = 1;
+          console.log(`   ✅ Min completion rate: ${rateValue}% → ${decimalRate}`);
+        }
+      } else {
+        binancePayload.userTradeCompleteRateMin = 0;
+        console.log(`   🔄 Min completion rate: RESET TO 0 (disabled)`);
+      }
+
+      // Min registered days (buyerRegisterLimit)
+      if (isCriterionEnabled(rules.minRegisteredDays)) {
+        const val = getCriterionValue(rules.minRegisteredDays);
+        if (val) {
+          binancePayload.buyerRegisterLimit = safeInt(val);
+          console.log(`   ✅ Min registered days: ${binancePayload.buyerRegisterLimit}`);
+        }
+      } else {
+        binancePayload.buyerRegisterLimit = 0;
+        console.log(`   🔄 Min registered days: RESET TO 0 (disabled)`);
+      }
+
+      // Min all trades count (userAllTradeCountMin)
+      if (isCriterionEnabled(rules.minAllTradesCount)) {
+        const val = getCriterionValue(rules.minAllTradesCount);
+        if (val) {
+          binancePayload.userAllTradeCountMin = safeInt(val);
+          console.log(`   ✅ Min all trades: ${binancePayload.userAllTradeCountMin}`);
+        }
+      } else {
+        binancePayload.userAllTradeCountMin = 0;
+        console.log(`   🔄 Min all trades: RESET TO 0 (disabled)`);
+      }
+
+      // Min buy orders count (userBuyTradeCountMin)
+      if (isCriterionEnabled(rules.minBuyOrdersCount)) {
+        const val = getCriterionValue(rules.minBuyOrdersCount);
+        if (val) {
+          binancePayload.userBuyTradeCountMin = safeInt(val);
+          console.log(`   ✅ Min buy orders: ${binancePayload.userBuyTradeCountMin}`);
+        }
+      } else {
+        binancePayload.userBuyTradeCountMin = 0;
+        console.log(`   🔄 Min buy orders: RESET TO 0 (disabled)`);
+      }
+
+      // Min sell orders count (userSellTradeCountMin)
+      if (isCriterionEnabled(rules.minSellOrdersCount)) {
+        const val = getCriterionValue(rules.minSellOrdersCount);
+        if (val) {
+          binancePayload.userSellTradeCountMin = safeInt(val);
+          console.log(`   ✅ Min sell orders: ${binancePayload.userSellTradeCountMin}`);
+        }
+      } else {
+        binancePayload.userSellTradeCountMin = 0;
+        console.log(`   🔄 Min sell orders: RESET TO 0 (disabled)`);
+      }
+
+      // ADVANCED OPTIONS - Premium eligibility criteria
+
+      // Option 1: Min trade volume (userTradeVolumeMin)
+      if (isCriterionEnabled(rules.minTradeVolume)) {
+        const val = getCriterionValue(rules.minTradeVolume);
+        if (val) {
+          binancePayload.userTradeVolumeMin = safeFloat(val);
+          binancePayload.userTradeVolumeAsset = 'USDT';
+          binancePayload.userTradeVolumeFilterTime = 2;
+          console.log(`   ✅ Min trade volume: ${binancePayload.userTradeVolumeMin} USDT (premium)`);
+        }
+      } else {
+        binancePayload.userTradeVolumeMin = 0;
+        console.log(`   🔄 Min trade volume: RESET TO 0 (disabled)`);
+      }
+
+      // Option 2: Max trade volume (userTradeVolumeMax)
+      if (isCriterionEnabled(rules.maxTradeVolume)) {
+        const val = getCriterionValue(rules.maxTradeVolume);
+        if (val) {
+          binancePayload.userTradeVolumeMax = safeFloat(val);
+          if (!binancePayload.userTradeVolumeAsset) {
+            binancePayload.userTradeVolumeAsset = 'USDT';
+          }
+          if (!binancePayload.userTradeVolumeFilterTime) {
+            binancePayload.userTradeVolumeFilterTime = 2;
+          }
+          console.log(`   ✅ Max trade volume: ${binancePayload.userTradeVolumeMax} USDT (premium)`);
+        }
+      } else {
+        binancePayload.userTradeVolumeMax = 0;
+        console.log(`   🔄 Max trade volume: RESET TO 0 (disabled)`);
+      }
+
+      // Option 3: Min BTC holding (buyerBtcPositionLimit)
+      if (isCriterionEnabled(rules.minBtcHolding)) {
+        const val = getCriterionValue(rules.minBtcHolding);
+        if (val) {
+          binancePayload.buyerBtcPositionLimit = safeFloat(val);
+          console.log(`   ✅ Min BTC holding: ${binancePayload.buyerBtcPositionLimit} BTC (premium)`);
+        }
+      } else {
+        binancePayload.buyerBtcPositionLimit = 0;
+        console.log(`   🔄 Min BTC holding: RESET TO 0 (disabled)`);
+      }
+
+      console.log(`\n📦 [SYNC] Final Binance Payload:`);
+      console.log(JSON.stringify(binancePayload, null, 2));
+
+      logger.info('Binance payload to update', {
+        adNo,
+        payload: binancePayload
+      });
+
+      // Step 3: Call Binance API to update ad
+      console.log(`\n🌐 [SYNC] Step 3: Calling Binance API /sapi/v1/c2c/ads/update...`);
+      console.log(`   Endpoint: POST /sapi/v1/c2c/ads/update`);
+      console.log(`   Ad No: ${adNo}`);
+
+      const result = await sellerBinanceService.updateAd(adNo, binancePayload);
+
+      console.log(`\n📡 [SYNC] Binance Response:`);
+      console.log(JSON.stringify(result, null, 2));
+
+      // Verify Binance response indicates success
+      console.log(`\n✔️  [SYNC] Step 4: Validating Binance response...`);
+
+      if (!result) {
+        console.log(`   ❌ No response from Binance API`);
+        logger.error(`❌ Binance returned no response for ad ${adNo}`);
+        return res.status(500).json({
+          success: false,
+          error: 'Binance API returned no response'
+        });
+      }
+
+      console.log(`   Response received. Checking status...`);
+      console.log(`   - result.code: ${result.code}`);
+      console.log(`   - result.success: ${result.success}`);
+      console.log(`   - result.message: ${result.message || result.msg}`);
+
+      // Binance returns success with code "000000" or "0"
+      const isSuccess = (result.code === '0' || result.code === '000000' || result.success === true);
+
+      if (!isSuccess) {
+        const errorMsg = result?.message || result?.msg || 'Binance API returned error';
+        console.log(`   ❌ Binance returned error: ${errorMsg}`);
+        logger.error(`❌ Binance ad update failed`, {
+          sellerId,
+          adNo,
+          binanceResponse: result,
+          errorMsg
+        });
+        return res.status(500).json({
+          success: false,
+          error: `Binance ad update failed: ${errorMsg}`,
+          binanceResponse: result
+        });
+      }
+
+      console.log(`   ✅ Binance response valid - Update successful!`);
+      logger.info('✅ Ad eligibility synced to Binance', {
+        sellerId,
+        adNo,
+        result
+      });
+
+      // Step 5: Update database with the rules that were synced
+      console.log(`\n💾 [SYNC] Step 5: Updating database with synced rules...`);
+
+      const dbUpdates = {};
+
+      // Core criteria - update enabled flags and values
+      // If unchecked, set value to 0; if checked, use the value
+      if (rules.min30dayTrades !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.min30dayTrades);
+        dbUpdates.min_30day_trades_enabled = isEnabled ? 1 : 0;
+        dbUpdates.min_30day_trades = isEnabled ? (getCriterionValue(rules.min30dayTrades) || 0) : 0;
+      }
+
+      if (rules.min30dayCompletionRate !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.min30dayCompletionRate);
+        dbUpdates.min_30day_completion_rate_enabled = isEnabled ? 1 : 0;
+        if (isEnabled) {
+          const rateVal = getCriterionValue(rules.min30dayCompletionRate) || 0;
+          dbUpdates.min_30day_completion_rate = rateVal > 1 ? rateVal / 100 : rateVal;
+        } else {
+          dbUpdates.min_30day_completion_rate = 0;
+        }
+      }
+
+      if (rules.minRegisteredDays !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.minRegisteredDays);
+        dbUpdates.min_registered_days_enabled = isEnabled ? 1 : 0;
+        dbUpdates.min_registered_days = isEnabled ? (getCriterionValue(rules.minRegisteredDays) || 0) : 0;
+      }
+
+      if (rules.minAllTradesCount !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.minAllTradesCount);
+        dbUpdates.min_all_trades_count_enabled = isEnabled ? 1 : 0;
+        dbUpdates.min_all_trades_count = isEnabled ? (getCriterionValue(rules.minAllTradesCount) || 0) : 0;
+      }
+
+      if (rules.minBuyOrdersCount !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.minBuyOrdersCount);
+        dbUpdates.min_buy_orders_count_enabled = isEnabled ? 1 : 0;
+        dbUpdates.min_buy_orders_count = isEnabled ? (getCriterionValue(rules.minBuyOrdersCount) || 0) : 0;
+      }
+
+      if (rules.minSellOrdersCount !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.minSellOrdersCount);
+        dbUpdates.min_sell_orders_count_enabled = isEnabled ? 1 : 0;
+        dbUpdates.min_sell_orders_count = isEnabled ? (getCriterionValue(rules.minSellOrdersCount) || 0) : 0;
+      }
+
+      // Advanced options - update enabled flags and values
+      if (rules.minTradeVolume !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.minTradeVolume);
+        dbUpdates.min_trade_volume_enabled = isEnabled ? 1 : 0;
+        dbUpdates.min_trade_volume = isEnabled ? (getCriterionValue(rules.minTradeVolume) || 0) : 0;
+      }
+
+      if (rules.maxTradeVolume !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.maxTradeVolume);
+        dbUpdates.max_trade_volume_enabled = isEnabled ? 1 : 0;
+        dbUpdates.max_trade_volume = isEnabled ? (getCriterionValue(rules.maxTradeVolume) || 0) : 0;
+      }
+
+      if (rules.minBtcHolding !== undefined) {
+        const isEnabled = isCriterionEnabled(rules.minBtcHolding);
+        dbUpdates.min_btc_holding_enabled = isEnabled ? 1 : 0;
+        dbUpdates.min_btc_holding = isEnabled ? (getCriterionValue(rules.minBtcHolding) || 0) : 0;
+      }
+
+      // Update database
+      try {
+        const updateResult = await sellerOrderDbService.updateAdRules(adNo, dbUpdates);
+        console.log(`   ✅ Database updated successfully`);
+        console.log(`   Updated fields:`, Object.keys(dbUpdates));
+        logger.info('✅ Database rules updated', {
+          adNo,
+          updates: dbUpdates
+        });
+      } catch (dbError) {
+        console.log(`   ⚠️  Database update failed: ${dbError.message}`);
+        logger.warn(`Database update failed for ad ${adNo}`, { dbError });
+        // Don't fail the entire request if DB update fails (Binance sync already succeeded)
+      }
+
+      console.log(`\n✅ [SYNC] SUCCESS - Ad eligibility synced to Binance and database updated!\n`);
+
+      res.status(200).json({
+        success: true,
+        message: 'Ad eligibility criteria synced to Binance and database updated',
+        data: {
+          adNo,
+          synced: binancePayload,
+          dbUpdates: dbUpdates,
+          binanceResponse: result
+        }
+      });
+
+    } catch (error) {
+      console.log(`\n❌ [SYNC] ERROR: ${error.message}`);
+      console.log(`   Stack: ${error.stack}`);
+      logger.error(`Sync eligibility to Binance error: ${error.message}`, { error });
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Failed to sync eligibility criteria to Binance'
       });
     }
   }

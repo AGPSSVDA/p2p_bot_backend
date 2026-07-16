@@ -90,16 +90,28 @@ CREATE TABLE IF NOT EXISTS seller_ad_rules (
   ad_no VARCHAR(50) NOT NULL,
 
   -- ===== BUYER ELIGIBILITY CRITERIA (11 fields - all configurable) =====
+  -- Each criterion has an enabled flag and a value
+  min_30day_trades_enabled BOOLEAN DEFAULT TRUE,
   min_30day_trades INT DEFAULT 0,
+  min_30day_completion_rate_enabled BOOLEAN DEFAULT TRUE,
   min_30day_completion_rate DECIMAL(5,2) DEFAULT 0.00,
+  max_avg_release_time_enabled BOOLEAN DEFAULT TRUE,
   max_avg_release_time INT DEFAULT 0,
+  max_avg_pay_time_enabled BOOLEAN DEFAULT TRUE,
   max_avg_pay_time INT DEFAULT 0,
+  required_trade_type_enabled BOOLEAN DEFAULT TRUE,
   required_trade_type VARCHAR(20) DEFAULT 'ANY',
+  min_registered_days_enabled BOOLEAN DEFAULT TRUE,
   min_registered_days INT DEFAULT 0,
+  min_first_trade_days_enabled BOOLEAN DEFAULT TRUE,
   min_first_trade_days INT DEFAULT 0,
+  min_trading_counterparty_enabled BOOLEAN DEFAULT TRUE,
   min_trading_counterparty INT DEFAULT 0,
+  min_all_trades_count_enabled BOOLEAN DEFAULT TRUE,
   min_all_trades_count INT DEFAULT 0,
+  min_buy_orders_count_enabled BOOLEAN DEFAULT TRUE,
   min_buy_orders_count INT DEFAULT 0,
+  min_sell_orders_count_enabled BOOLEAN DEFAULT TRUE,
   min_sell_orders_count INT DEFAULT 0,
 
   -- ===== VERIFICATION METHODS (Toggles) =====
