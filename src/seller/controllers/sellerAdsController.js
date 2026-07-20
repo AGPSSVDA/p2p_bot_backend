@@ -17,15 +17,28 @@ class SellerAdsController {
     try {
       const sellerId = getSellerIdFromRequest(req); // From auth middleware
 
-      logger.info('Fetching seller ads', { sellerId });
+      // ?status=live  -> only ads that are Online on Binance (ad_status = 1)
+      // ?status=all   -> every ad regardless of status (default)
+      const status = String(req.query.status || 'all').toLowerCase();
 
-      const ads = await sellerAdService.getSellerAds(sellerId, true);
+      logger.info('Fetching seller ads', { sellerId, status });
+
+      const allAds = await sellerAdService.getSellerAds(sellerId, true);
+
+      // ad_status: 1 = Online (live), 3 = Offline, others = closed/expired
+      const ads = status === 'live'
+        ? (allAds || []).filter(a => Number(a.ad_status) === 1)
+        : (allAds || []);
 
       if (!ads || ads.length === 0) {
         return res.status(200).json({
           success: true,
           data: [],
-          message: 'No active ads found'
+          counts: {
+            all: (allAds || []).length,
+            live: (allAds || []).filter(a => Number(a.ad_status) === 1).length,
+          },
+          message: status === 'live' ? 'No live ads found' : 'No active ads found'
         });
       }
 
@@ -167,12 +180,17 @@ class SellerAdsController {
         summary: ad.rules ? sellerAdService.getRuleSummary(ad.rules) : { methods: '', minTradesCount: 0, minCompletionRate: 0, minRegisteredDays: 0 }
       }));
 
-      logger.info(`✅ Fetched ${formattedAds.length} ads`, { sellerId });
+      logger.info(`✅ Fetched ${formattedAds.length} ads`, { sellerId, status });
 
       res.status(200).json({
         success: true,
         data: formattedAds,
-        count: formattedAds.length
+        count: formattedAds.length,
+        // Counts for BOTH filters so the UI can label the tabs without refetching
+        counts: {
+          all: (allAds || []).length,
+          live: (allAds || []).filter(a => Number(a.ad_status) === 1).length,
+        },
       });
 
     } catch (error) {
