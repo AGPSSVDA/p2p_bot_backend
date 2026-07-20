@@ -61,7 +61,36 @@ function headers(extra = {}) {
  * CRITICAL: Must include "clientType: PC" header!
  * CRITICAL: Signature must be built with only timestamp (body params go in request body)
  */
-async function getSellerAds(page = 1, rows = 50) {
+/**
+ * Fetch ALL seller ads across every page.
+ *
+ * Binance caps `rows` at 20 per request regardless of what we ask for, and the
+ * response carries a `total`. Fetching only page 1 therefore silently drops any
+ * ads beyond the first 20 — that's why a seller with 28 ads saw only 20 synced.
+ * This loops until every page has been collected.
+ */
+async function getAllSellerAds(rows = 20) {
+  const all = [];
+  let page = 1;
+  const MAX_PAGES = 50; // safety stop
+
+  while (page <= MAX_PAGES) {
+    const batch = await getSellerAds(page, rows);
+    if (!batch || batch.length === 0) break;
+
+    all.push(...batch);
+
+    // Last page reached when Binance returns fewer than a full page.
+    if (batch.length < rows) break;
+    page++;
+  }
+
+  console.log(`📦 [SELLER BINANCE] Collected ${all.length} ads across ${page} page(s)`);
+  logger.info('✅ [SELLER BINANCE] Fetched ALL seller ads', { count: all.length, pages: page });
+  return all;
+}
+
+async function getSellerAds(page = 1, rows = 20) {
   console.log(`\n📡 [SELLER BINANCE] Fetching seller ads (page=${page}, rows=${rows})`);
   console.log(`📍 [SELLER BINANCE] API Key: ${sellerBinanceConfig.apiKey ? sellerBinanceConfig.apiKey.substring(0, 15) + '...' : 'NOT SET'}`);
 
