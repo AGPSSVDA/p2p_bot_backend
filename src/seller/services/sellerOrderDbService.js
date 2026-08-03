@@ -749,6 +749,20 @@ class SellerOrderDbService {
     return rows[0] || null;
   }
 
+  async createDefaultAdRules(adNo, sellerId) {
+    const query = `
+      INSERT INTO seller_ad_rules (
+        seller_id, ad_no,
+        method1_liveness_enabled,
+        method2_documents_enabled,
+        method3_full_enabled,
+        created_at, updated_at
+      ) VALUES (?, ?, 0, 0, 0, NOW(), NOW())
+      ON DUPLICATE KEY UPDATE updated_at = NOW()
+    `;
+    return pool.query(query, [sellerId, adNo]);
+  }
+
   async upsertAdTradeMethod(sellerId, adNo, method) {
     const query = `
       INSERT INTO seller_ad_trade_methods (

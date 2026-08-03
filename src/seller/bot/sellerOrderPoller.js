@@ -161,28 +161,26 @@ class SellerOrderPoller {
       logger.debug(`📊 Polling orders for ad: ${ad.ad_no}`);
 
       // Step 1: Get ad configuration (11 rules + 3 methods with toggles)
-      const adRules = await sellerOrderDbService.getAdRules(ad.ad_no);
+      // If no rules exist, create default empty rules so orders aren't skipped
+      let adRules = await sellerOrderDbService.getAdRules(ad.ad_no);
 
       if (!adRules) {
-        // Make this LOUD: with no rules row we skip the ad entirely, so every
-        // order placed on it is silently ignored and nothing else is logged.
-        console.log(`[SellerPoller] ⚠️  SKIPPING ad ${ad.ad_no} — no rules configured.`);
-        console.log(`               Any order placed on this ad will NOT be detected.`);
-        console.log(`               Fix: open this ad in the dashboard and save its verification methods.`);
-        logger.warn(`No rules configured for ad ${ad.ad_no} - orders on this ad are ignored`, {
-          adNo: ad.ad_no,
-          message: 'Ad has no eligibility rules or verification methods set'
-        });
-        return; // Skip this ad if not configured
+        console.log(`[SellerPoller] 📝 No rules configured for ad ${ad.ad_no} — creating default entry...`);
+        // Insert default rule row with all methods disabled
+        await sellerOrderDbService.createDefaultAdRules(ad.ad_no, this.sellerId);
+        // Fetch it back
+        adRules = await sellerOrderDbService.getAdRules(ad.ad_no);
       }
 
-      // Log ad configuration
-      const ruleSummary = sellerAdService.getRuleSummary(adRules);
-      logger.debug(`📌 Ad Config: ${ad.ad_no}`, {
-        methods: ruleSummary.methods,
-        minTradesCount: ruleSummary.minTradesCount,
-        minCompletionRate: ruleSummary.minCompletionRate
-      });
+      // Log ad configuration (if any methods are enabled)
+      if (adRules) {
+        const ruleSummary = sellerAdService.getRuleSummary(adRules);
+        logger.debug(`📌 Ad Config: ${ad.ad_no}`, {
+          methods: ruleSummary.methods,
+          minTradesCount: ruleSummary.minTradesCount,
+          minCompletionRate: ruleSummary.minCompletionRate
+        });
+      }
 
       // Step 2: Poll Binance for orders on this specific ad
       // Binance returns orders for ALL ads, so we filter by ad_no
