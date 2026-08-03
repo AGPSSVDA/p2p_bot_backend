@@ -23,7 +23,7 @@ class SellerAdsController {
 
       logger.info('Fetching seller ads', { sellerId, status });
 
-      const allAds = await sellerAdService.getSellerAds(sellerId, true);
+      const allAds = await sellerAdService.getSellerAds(sellerId, false);
 
       // ad_status: 1 = Online (live), 3 = Offline, others = closed/expired
       const ads = status === 'live'
