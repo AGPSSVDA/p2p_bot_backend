@@ -8,6 +8,7 @@ const { SellerStateManager, SELLER_ORDER_STATES } = require('./sellerStateManage
 const sellerVerificationService = require('../services/sellerVerificationService');
 // Seller flows use the SELLER API key only (sellerBinanceService).
 const sellerBinanceService = require('../services/sellerBinanceService');
+const sellerMethod2Service = require('../services/sellerMethod2Service');
 
 class SellerOrderHandler {
   constructor() {
@@ -87,6 +88,51 @@ class SellerOrderHandler {
           rawOrder.counterPartUserId,
           buyerMetrics
         );
+      }
+
+      // ===== 24-HOUR COOLDOWN CHECK (before any verification) =====
+      // If this buyer COMPLETED an order in the last 24h, they cannot place a new
+      // one yet. Tell them in chat and stop — no liveness/method check runs.
+      const recent = await sellerOrderDbService.getRecentCompletedOrderByBuyer(
+        buyerId,
+        orderNo,
+        24
+      );
+      if (recent) {
+        const completedAt = new Date(recent.completed_at);
+        const nextAllowed = new Date(completedAt.getTime() + 24 * 60 * 60 * 1000);
+        const hoursLeft = Math.max(
+          1,
+          Math.ceil((nextAllowed.getTime() - Date.now()) / (60 * 60 * 1000))
+        );
+
+        logger.info(`[${orderNo}] ⛔ 24h cooldown: buyer completed order ${recent.order_number} recently`, {
+          buyerId,
+          previousOrder: recent.order_number,
+          completedAt: recent.completed_at,
+          hoursLeft,
+        });
+
+        await chatService.sendMessage({
+          orderNo,
+          content:
+            `You have already placed an order in the last 24 hours. ` +
+            `Only one order per 24 hours is allowed. ` +
+            `Please place a new order after ${hoursLeft} hour(s).`,
+          msgType: 'TEXT',
+        });
+
+        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.REJECTED);
+        await sellerOrderDbService.setOrderState(
+          orderNo,
+          SELLER_ORDER_STATES.REJECTED,
+          '24h cooldown: buyer completed a previous order within 24h'
+        );
+        await sellerOrderDbService.recordError(
+          orderNo,
+          `24h cooldown - previous order ${recent.order_number}`
+        );
+        return; // Do NOT proceed to liveness / any method
       }
 
       // ===== METHOD 1: LIVENESS CHECK ONLY =====
@@ -361,15 +407,18 @@ class SellerOrderHandler {
 
       // ===== METHOD 2: DOCUMENT IMAGES FROM CHAT =====
       // Method 2 = Method 1 (liveness) + document images. Only when admin enabled it.
-      const order = this.stateManager.get(orderNo);
-      const adRules = order?.adNo
-        ? await sellerOrderDbService.getAdRules(order.adNo)
-        : null;
+      // Read adNo from the DB, not the in-memory state manager — after a restart
+      // (or the resume path) the state manager is empty, which would leave adRules
+      // null and silently skip Method 2 (the bug that left orders stuck in
+      // WAITING_DOCUMENTS).
+      const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+      const adNo = dbOrder?.ad_no || this.stateManager.get(orderNo)?.adNo;
+      const adRules = adNo ? await sellerOrderDbService.getAdRules(adNo) : null;
 
       if (adRules?.method2_documents_enabled) {
-        logger.info(`[${orderNo}] Method 2 enabled - collecting document images from chat`);
-        await this.startDocumentImageCollection(orderNo);
-        return; // Payment/verification continues after documents are collected
+        logger.info(`[${orderNo}] Method 2 enabled - starting document verification`);
+        await this.startMethod2Verification(orderNo);
+        return; // Order is verified only after documents pass
       }
 
       // ===== STEP 4: ORDER VERIFICATION IN BINANCE =====
@@ -382,98 +431,170 @@ class SellerOrderHandler {
   }
 
   /**
-   * ===== METHOD 2 / PHASE 1: COLLECT DOCUMENT IMAGES FROM BINANCE CHAT =====
+   * ===== METHOD 2: DOCUMENT VERIFICATION =====
    *
-   * Silently watches the order chat for images the buyer uploads (Aadhaar/PAN)
-   * and stores each one's Binance URL + metadata. We do NOT message the buyer.
+   * Polls the order chat and, on each cycle, runs the full document-verification
+   * flow (sellerMethod2Service):
+   *   OpenAI classify+extract -> require Aadhaar front+back + PAN
+   *   -> Aadhaar name ⟷ KYC name -> Surepass PAN verify -> PAN name ⟷ KYC name
+   *   -> verify the order in Binance.
    *
-   * Phase 1 scope: fetch + store the images only. Deciding whether enough
-   * documents arrived, which is Aadhaar vs PAN, downloading, and OCR/verification
-   * are later phases. So this collects continuously and does not gate the order.
+   * Chat messages (missing docs, mismatch, PAN fail, limit exceeded) are sent to
+   * the buyer, de-duplicated so the same message isn't repeated every 3 seconds.
+   * The images are also stored for the record (idempotent).
    */
-  async startDocumentImageCollection(orderNo) {
+  async startMethod2Verification(orderNo) {
     try {
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_DOCUMENTS);
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_DOCUMENTS);
 
-      logger.info(`[${orderNo}] 📄 Watching chat for document images (no message sent to buyer)`);
-
-      // Don't start a second poller for an order already being watched.
+      // Don't start a second poller for an order already being verified.
       if (this.documentPollers[orderNo]) {
-        logger.debug(`[${orderNo}] Document collection already running`);
+        logger.debug(`[${orderNo}] Method 2 verification already running`);
         return;
       }
 
-      // Read the buyer from the DB, not the in-memory state manager: on a resume
-      // after restart the state manager is empty and buyerId would be undefined.
       const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
       const buyerId = dbOrder?.buyer_id || this.stateManager.get(orderNo)?.buyerId;
+
+      // Resolve the buyer's REAL KYC name from Binance order detail — name
+      // matching is the whole point of Method 2, and the name stored at intake
+      // is often "(Unknown)" because listOrders doesn't carry buyerName.
+      let kycName = dbOrder?.buyer_kyc_name;
+      if (!kycName || kycName === '(Unknown)') {
+        try {
+          const detail = await sellerBinanceService.getOrderDetail(orderNo);
+          if (detail?.buyerName) {
+            kycName = detail.buyerName;
+            await sellerOrderDbService.updateBuyerKycName(orderNo, kycName);
+          }
+        } catch (e) {
+          logger.warn(`[${orderNo}] Could not fetch KYC name for Method 2: ${e.message}`);
+        }
+      }
+
+      logger.info(`[${orderNo}] 📄 Method 2 verification started`, { kycName });
+
+      if (!kycName || kycName === '(Unknown)') {
+        logger.error(`[${orderNo}] Method 2: no KYC name available — cannot name-match`);
+      }
+
       let pollCount = 0;
-      const MAX_POLLS = 200; // ~10 minutes at 3s
+      let lastMessage = null;       // de-dupe chat messages
+      let busy = false;             // prevent overlapping AI calls
+      const MAX_POLLS = 300;        // ~15 min at 3s
+
+      // ---- Wait for 3 images before calling OpenAI ----
+      // Method 2 requires 3 documents: Aadhaar front, Aadhaar back, PAN.
+      // (PAN back is not required — it's blank/QR with nothing to verify.)
+      // We only run the (expensive) OpenAI classification once the buyer has
+      // uploaded 3+ images — and only re-run when the image count CHANGES
+      // afterwards (e.g. re-upload after a mismatch), so we never classify a
+      // half-set or waste tokens re-running the same set.
+      const REQUIRED_IMAGES = Number(process.env.METHOD2_REQUIRED_IMAGES) || 3;
+      let verifiedCount = -1;       // image count we last ran OpenAI on
+
+      const sendOnce = async (content) => {
+        if (!content || content === lastMessage) return;
+        lastMessage = content;
+        await chatService.sendMessage({ orderNo, content, msgType: 'TEXT' });
+      };
 
       const pollInterval = setInterval(async () => {
+        if (busy) return;
+        busy = true;
         try {
           pollCount++;
 
-          const result = await sellerBinanceService.getBuyerUploadedImages(orderNo);
+          // Fetch current images + store new ones for the record (idempotent).
+          const imgs = await sellerBinanceService.getBuyerUploadedImages(orderNo);
+          const images = imgs.success ? imgs.images : [];
+          for (const image of images) {
+            await sellerOrderDbService.saveChatImage(orderNo, buyerId, image);
+          }
 
-          if (!result.success) {
-            if (pollCount % 20 === 0 || pollCount <= 3) {
-              logger.debug(`[${orderNo}] Doc poll #${pollCount}: chat read failed - ${result.message}`);
+          const count = images.length;
+
+          // Wait until at least REQUIRED_IMAGES (3) are uploaded.
+          if (count < REQUIRED_IMAGES) {
+            if (pollCount % 10 === 0) {
+              logger.debug(`[${orderNo}] Method 2: waiting for images (${count}/${REQUIRED_IMAGES})`);
             }
             return;
           }
 
-          // Store any new images (saveChatImage is idempotent per chat message id)
-          let newCount = 0;
-          for (const image of result.images) {
-            const inserted = await sellerOrderDbService.saveChatImage(orderNo, buyerId, image);
-            if (inserted) {
-              newCount++;
-              console.log(`[${orderNo}] 📄 New document image stored: ${image.imageUrl}`);
-              logger.info(`[${orderNo}] 📄 Stored buyer image from chat`, {
-                chatMessageId: image.id,
-                imageType: image.imageType,
-                imageUrl: image.imageUrl,
-              });
-            }
+          // Only run OpenAI when this image set is new (count changed since the
+          // last classification). Otherwise keep waiting for the next upload.
+          if (count === verifiedCount) return;
+
+          verifiedCount = count; // mark this set as classified
+          logger.info(`[${orderNo}] 📄 ${count} images uploaded — running OpenAI classification`);
+
+          // Run one verification pass on the full image set.
+          const result = await sellerMethod2Service.runVerification(orderNo, kycName, images);
+
+          switch (result.status) {
+            case 'verified':
+              logger.info(`[${orderNo}] ✅ Method 2 verified — proceeding to order verification`);
+              this.stopMethod2Verification(orderNo);
+              await sellerOrderDbService.recordDocumentVerified(orderNo, 'aadhaar', true);
+              await sellerOrderDbService.recordDocumentVerified(orderNo, 'pan', true);
+              await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFIED);
+              await this.verifyOrderInBinance(orderNo);
+              break;
+
+            case 'limit_exceeded':
+              logger.warn(`[${orderNo}] Method 2 attempt limit exceeded`);
+              this.stopMethod2Verification(orderNo);
+              await sendOnce(result.message);
+              this.stateManager.setState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFICATION_FAILED);
+              await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFICATION_FAILED, 'attempt limit exceeded');
+              break;
+
+            case 'need_upload':
+            case 'name_mismatch':
+            case 'pan_failed':
+              // Ask the buyer (once) for what's needed; keep polling for re-uploads.
+              if (result.message) await sendOnce(result.message);
+              break;
+
+            case 'error':
+            default:
+              if (pollCount % 20 === 0 || pollCount <= 2) {
+                logger.debug(`[${orderNo}] Method 2 pass: ${result.status}`, { detail: result.detail });
+              }
+              break;
           }
 
-          if (newCount > 0) {
-            const stored = await sellerOrderDbService.getChatImages(orderNo);
-            console.log(`[${orderNo}] 📄 Total images uploaded by buyer so far: ${stored.length}`);
-            // NOTE: we deliberately do NOT label images aadhaar/pan here.
-            // Classification is a later phase — Phase 1 only collects them.
-          } else if (pollCount % 20 === 0 || pollCount <= 3) {
-            console.log(`[${orderNo}] 📄 Doc poll #${pollCount}: no NEW images (${result.count} already collected from chat)`);
+          if (pollCount >= MAX_POLLS && this.documentPollers[orderNo]) {
+            logger.info(`[${orderNo}] Method 2 verification window ended (timeout)`);
+            this.stopMethod2Verification(orderNo);
+            await sendOnce('Document verification timed out. You can cancel this order and try again.');
+            await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFICATION_FAILED, 'timeout');
           }
-
-          if (pollCount >= MAX_POLLS) {
-            logger.info(`[${orderNo}] Document image collection window ended after ${pollCount} polls`);
-            this.stopDocumentImageCollection(orderNo);
-          }
-
         } catch (error) {
-          logger.error(`[${orderNo}] Doc poll #${pollCount} error: ${error.message}`, { error });
+          logger.error(`[${orderNo}] Method 2 poll error: ${error.message}`, { error });
+        } finally {
+          busy = false;
         }
       }, 3000);
 
       this.documentPollers[orderNo] = pollInterval;
 
     } catch (error) {
-      logger.error(`Document image collection error: ${error.message}`, { orderNo });
+      logger.error(`Method 2 verification start error: ${error.message}`, { orderNo });
       await sellerOrderDbService.recordError(orderNo, error.message);
     }
   }
 
   /**
-   * Stop watching the chat for document images.
+   * Stop the Method 2 verification poller.
    */
-  stopDocumentImageCollection(orderNo) {
+  stopMethod2Verification(orderNo) {
     if (this.documentPollers[orderNo]) {
       clearInterval(this.documentPollers[orderNo]);
       delete this.documentPollers[orderNo];
-      logger.info(`[${orderNo}] Stopped document image collection`);
+      logger.info(`[${orderNo}] Stopped Method 2 verification`);
     }
   }
 

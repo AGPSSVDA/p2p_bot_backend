@@ -126,7 +126,8 @@ class SellerAdsController {
             },
             min30dayCompletionRate: {
               enabled: ad.rules?.min_30day_completion_rate_enabled === 1 || ad.rules?.min_30day_completion_rate_enabled === true,
-              value: ad.rules?.min_30day_completion_rate || 0
+              // Stored as a 0-1 decimal (Binance format); show as a 0-100 percentage.
+              value: Math.round((ad.rules?.min_30day_completion_rate || 0) * 100)
             },
             minRegisteredDays: {
               enabled: ad.rules?.min_registered_days_enabled === 1 || ad.rules?.min_registered_days_enabled === true,
@@ -249,7 +250,8 @@ class SellerAdsController {
             },
             min30dayCompletionRate: {
               enabled: ad.rules.min_30day_completion_rate_enabled === 1 || ad.rules.min_30day_completion_rate_enabled === true,
-              value: ad.rules.min_30day_completion_rate || 0
+              // Stored as a 0-1 decimal (Binance format); show as a 0-100 percentage.
+              value: Math.round((ad.rules.min_30day_completion_rate || 0) * 100)
             },
             minRegisteredDays: {
               enabled: ad.rules.min_registered_days_enabled === 1 || ad.rules.min_registered_days_enabled === true,
@@ -386,7 +388,8 @@ class SellerAdsController {
           },
           min30dayCompletionRate: {
             enabled: updatedAd.rules?.min_30day_completion_rate_enabled === 1 || updatedAd.rules?.min_30day_completion_rate_enabled === true,
-            value: updatedAd.rules?.min_30day_completion_rate || 0
+            // Stored as a 0-1 decimal (Binance format); show as a 0-100 percentage.
+            value: Math.round((updatedAd.rules?.min_30day_completion_rate || 0) * 100)
           },
           minRegisteredDays: {
             enabled: updatedAd.rules?.min_registered_days_enabled === 1 || updatedAd.rules?.min_registered_days_enabled === true,
@@ -578,15 +581,8 @@ class SellerAdsController {
             method3_delivery_method: req.body.method3_delivery_method || 'payment_link',
           };
 
-      // At least one method must be enabled, otherwise no order would ever verify.
-      if (!payload.method1_liveness_enabled &&
-          !payload.method2_documents_enabled &&
-          !payload.method3_full_enabled) {
-        return res.status(400).json({
-          success: false,
-          error: 'At least one verification method must be enabled',
-        });
-      }
+      // Methods are optional — admin may enable any, all, or none. With no
+      // method enabled, orders skip verification and proceed directly.
 
       console.log(`   Methods:`, JSON.stringify(payload, null, 2));
 
@@ -732,11 +728,12 @@ class SellerAdsController {
       if (isCriterionEnabled(rules.min30dayCompletionRate)) {
         const val = getCriterionValue(rules.min30dayCompletionRate);
         if (val) {
-          const rateValue = safeFloat(val);
-          const decimalRate = rateValue > 1 ? rateValue / 100 : rateValue;
+          // Frontend sends a 0-100 percentage; Binance wants a 0-1 decimal.
+          const pct = Math.min(100, Math.max(0, safeFloat(val)));
+          const decimalRate = pct / 100;
           binancePayload.userTradeCompleteRateMin = decimalRate;
           binancePayload.userTradeCompleteRateFilterTime = 1;
-          console.log(`   ✅ Min completion rate: ${rateValue}% → ${decimalRate}`);
+          console.log(`   ✅ Min completion rate: ${pct}% → ${decimalRate}`);
         }
       } else {
         binancePayload.userTradeCompleteRateMin = 0;
@@ -915,8 +912,10 @@ class SellerAdsController {
         const isEnabled = isCriterionEnabled(rules.min30dayCompletionRate);
         dbUpdates.min_30day_completion_rate_enabled = isEnabled ? 1 : 0;
         if (isEnabled) {
-          const rateVal = getCriterionValue(rules.min30dayCompletionRate) || 0;
-          dbUpdates.min_30day_completion_rate = rateVal > 1 ? rateVal / 100 : rateVal;
+          // Frontend always sends a 0-100 percentage; store as the 0-1 decimal
+          // Binance uses. Clamp to [0,100] to avoid bad input.
+          const pct = Math.min(100, Math.max(0, getCriterionValue(rules.min30dayCompletionRate) || 0));
+          dbUpdates.min_30day_completion_rate = pct / 100;
         } else {
           dbUpdates.min_30day_completion_rate = 0;
         }

@@ -71,20 +71,18 @@ class SellerOrderPoller {
       const pending = await sellerOrderDbService.getOrdersByState(
         SELLER_ORDER_STATES.WAITING_DOCUMENTS
       );
-
       if (!pending.length) return;
 
-      console.log(`[SellerPoller] 🔄 Resuming document collection for ${pending.length} order(s) in WAITING_DOCUMENTS`);
-      logger.info(`Resuming document image collection after restart`, {
-        count: pending.length,
-      });
-
       for (const order of pending) {
-        console.log(`[SellerPoller]    ↻ ${order.order_number} (ad ${order.ad_no})`);
-        await this.orderHandler.startDocumentImageCollection(order.order_number);
+        // Skip orders whose verification loop is already running — start only
+        // the ones that aren't being watched (log only those, to avoid spam).
+        if (this.orderHandler.documentPollers[order.order_number]) continue;
+
+        console.log(`[SellerPoller] 🔄 Starting Method 2 verification for ${order.order_number} (ad ${order.ad_no})`);
+        await this.orderHandler.startMethod2Verification(order.order_number);
       }
     } catch (error) {
-      logger.error(`Failed to resume document collection: ${error.message}`, { error });
+      logger.error(`Failed to resume document verification: ${error.message}`, { error });
     }
   }
 
@@ -104,6 +102,11 @@ class SellerOrderPoller {
 
     try {
       await this.pollAllAds();
+      // Also (re)start Method 2 verification for any order stuck in
+      // WAITING_DOCUMENTS that isn't already being watched. This recovers
+      // orders without needing a server restart — e.g. if the verification
+      // loop never started or was interrupted.
+      await this.resumeDocumentCollection();
     } catch (error) {
       logger.error(`Seller poller error: ${error.message}`, { error });
     }

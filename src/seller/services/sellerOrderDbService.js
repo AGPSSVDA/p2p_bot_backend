@@ -70,6 +70,34 @@ class SellerOrderDbService {
   }
 
   /**
+   * 24h cooldown check: has this buyer COMPLETED an order in the last `hours`?
+   *
+   * "Completed" = the trade actually finished (COMPLETED state or payment_received_at
+   * set). We ignore the current order (excludeOrderNumber) and any not-yet-finished
+   * orders, so a buyer is only blocked after a real completed trade.
+   *
+   * Returns the most recent qualifying order row, or null if none.
+   */
+  async getRecentCompletedOrderByBuyer(buyerId, excludeOrderNumber, hours = 24) {
+    if (!buyerId) return null;
+    const query = `
+      SELECT order_number, current_state, payment_received_at,
+             thank_you_message_sent_at, created_at, updated_at,
+             COALESCE(payment_received_at, thank_you_message_sent_at, updated_at) AS completed_at
+      FROM seller_orders
+      WHERE buyer_id = ?
+        AND order_number <> ?
+        AND (current_state = 'COMPLETED' OR payment_received_at IS NOT NULL)
+        AND COALESCE(payment_received_at, thank_you_message_sent_at, updated_at)
+              >= (NOW() - INTERVAL ? HOUR)
+      ORDER BY completed_at DESC
+      LIMIT 1
+    `;
+    const [rows] = await pool.query(query, [buyerId, excludeOrderNumber, hours]);
+    return rows[0] || null;
+  }
+
+  /**
    * Get all orders for an ad
    */
   async getOrdersByAdNo(adNo, limit = 50, offset = 0) {
@@ -305,6 +333,61 @@ class SellerOrderDbService {
     return safe(
       pool.query(query, [passed, orderNumber]),
       `recordDocumentVerified:${orderNumber}:${docType}`
+    );
+  }
+
+  // ===== METHOD 2: DOCUMENT VERIFICATION ATTEMPT COUNTERS =====
+
+  /** Increment and return the attempt count for a document (aadhaar|pan). */
+  async incrementDocAttempt(orderNumber, docType) {
+    const col = docType === 'pan' ? 'pan_attempts' : 'aadhaar_attempts';
+    await pool.query(
+      `UPDATE seller_orders SET \`${col}\` = \`${col}\` + 1 WHERE order_number = ?`,
+      [orderNumber]
+    );
+    const [[row]] = await pool.query(
+      `SELECT \`${col}\` AS n FROM seller_orders WHERE order_number = ?`,
+      [orderNumber]
+    );
+    return row ? row.n : null;
+  }
+
+  /** Read current attempt counts for both documents. */
+  async getDocAttempts(orderNumber) {
+    const [[row]] = await pool.query(
+      'SELECT aadhaar_attempts, pan_attempts FROM seller_orders WHERE order_number = ?',
+      [orderNumber]
+    );
+    return {
+      aadhaar: row?.aadhaar_attempts || 0,
+      pan: row?.pan_attempts || 0,
+    };
+  }
+
+  /** Update the buyer's real KYC name (often unknown at intake). */
+  async updateBuyerKycName(orderNumber, kycName) {
+    return safe(
+      pool.query('UPDATE seller_orders SET buyer_kyc_name = ? WHERE order_number = ?', [kycName, orderNumber]),
+      `updateBuyerKycName:${orderNumber}`
+    );
+  }
+
+  /** Store the name extracted from the Aadhaar front. */
+  async saveAadhaarName(orderNumber, name) {
+    return safe(
+      pool.query('UPDATE seller_orders SET aadhaar_name = ? WHERE order_number = ?', [name, orderNumber]),
+      `saveAadhaarName:${orderNumber}`
+    );
+  }
+
+  /** Store the PAN number + name extracted/verified. */
+  async savePanDetails(orderNumber, panNumber, panName) {
+    return safe(
+      pool.query(
+        'UPDATE seller_orders SET pan_number = ?, pan_name = ? WHERE order_number = ?',
+        [panNumber, panName, orderNumber]
+      ),
+      `savePanDetails:${orderNumber}`
     );
   }
 

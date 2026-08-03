@@ -81,7 +81,10 @@ class SellerAdService {
         min_30day_completion_rate_enabled: rulesData.min_30day_completion_rate_enabled !== undefined
           ? rulesData.min_30day_completion_rate_enabled === true
           : (existingRules?.min_30day_completion_rate_enabled === 1 || existingRules?.min_30day_completion_rate_enabled === true),
-        min_30day_completion_rate: rulesData.min_30day_completion_rate !== undefined ? rulesData.min_30day_completion_rate : (existingRules?.min_30day_completion_rate || 0),
+        // Frontend sends a 0-100 percentage; store as the 0-1 decimal Binance uses.
+        min_30day_completion_rate: rulesData.min_30day_completion_rate !== undefined
+          ? Math.min(100, Math.max(0, rulesData.min_30day_completion_rate)) / 100
+          : (existingRules?.min_30day_completion_rate || 0),
 
         max_avg_release_time_enabled: rulesData.max_avg_release_time_enabled !== undefined
           ? rulesData.max_avg_release_time_enabled === true
@@ -187,25 +190,11 @@ class SellerAdService {
   }
 
   /**
-   * Validate rules data
-   * Check if at least one method is enabled
+   * Validate rules data.
+   * Verification methods are optional — admin may enable any, all, or none.
    */
-  validateRules(rulesData) {
-    const errors = [];
-
-    const hasAnyMethod =
-      rulesData.method1_liveness_enabled ||
-      rulesData.method2_documents_enabled ||
-      rulesData.method3_full_enabled;
-
-    if (!hasAnyMethod) {
-      errors.push('At least one verification method must be enabled');
-    }
-
-    return {
-      valid: errors.length === 0,
-      errors
-    };
+  validateRules(_rulesData) {
+    return { valid: true, errors: [] };
   }
 
   /**

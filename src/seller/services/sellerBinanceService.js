@@ -197,20 +197,38 @@ async function verifyAdditionalKyc(orderNo) {
 }
 
 /**
- * Get Order Detail (Full order information including buyer details)
+ * Get Order Detail (Full order information including buyer's real KYC name).
  * Endpoint: POST /sapi/v1/c2c/orderMatch/getUserOrderDetail
  *
- * NOTE: This endpoint takes the ORDER NUMBER, not the ad/adv number.
- * Passing the ad number returns 400 "illegal parameter" (verified empirically).
+ * NOTE: Binance is INCONSISTENT about the param name for this endpoint — some
+ * orders accept `orderNumber`, others require `adOrderNo` (both equal the order
+ * number for our SELL orders). Passing the wrong one returns 400 -31002
+ * "illegal parameter". So we try `orderNumber` first, then fall back to
+ * `adOrderNo`. This is what makes buyerName (KYC name) reliably available.
  */
 async function getOrderDetail(orderNumber) {
   return withRetry(async () => {
-    const qs = buildSignedQuery({ orderNumber });
-    const res = await axios.post(
-      `${url(sellerBinanceConfig.endpoints.orderDetail)}?${qs}`,
-      { orderNumber },
-      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
-    );
+    let res;
+    try {
+      const qs = buildSignedQuery({ orderNumber });
+      res = await axios.post(
+        `${url(sellerBinanceConfig.endpoints.orderDetail)}?${qs}`,
+        { orderNumber },
+        { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+      );
+    } catch (err) {
+      if (err.response?.data?.code === -31002) {
+        // Fall back to the adOrderNo param (same value, different key).
+        const qs2 = buildSignedQuery({ adOrderNo: orderNumber });
+        res = await axios.post(
+          `${url(sellerBinanceConfig.endpoints.orderDetail)}?${qs2}`,
+          { adOrderNo: orderNumber },
+          { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+        );
+      } else {
+        throw err;
+      }
+    }
 
     const data = res.data?.data || res.data;
     return {

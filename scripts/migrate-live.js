@@ -140,6 +140,17 @@ async function main() {
     }
   }
 
+  // ---- 3b) Method 2 attempt/extraction columns on seller_orders ----
+  console.log('\n3b) seller_orders — Method 2 document verification columns');
+  const method2Cols = [
+    ['aadhaar_attempts', 'aadhaar_attempts INT DEFAULT 0'],
+    ['pan_attempts', 'pan_attempts INT DEFAULT 0'],
+    ['aadhaar_name', 'aadhaar_name VARCHAR(200) NULL'],
+    ['pan_number', 'pan_number VARCHAR(20) NULL'],
+    ['pan_name', 'pan_name VARCHAR(200) NULL'],
+  ];
+  for (const [col, ddl] of method2Cols) await addColumn(c, 'seller_orders', col, ddl);
+
   // Helper: run the CREATE TABLE statements from a migration .sql file verbatim,
   // so table definitions always match the committed migration exactly.
   async function createFromFile(fileName) {
