@@ -162,11 +162,31 @@ class SellerOrderHandler {
         return; // Do NOT proceed to liveness / any method
       }
 
-      // ===== METHOD 1: LIVENESS CHECK ONLY =====
+      // ===== VERIFICATION METHOD GATE =====
+      // The bot only acts if the admin enabled a verification method on THIS ad.
+      // If no method is enabled, the bot does NOTHING — it must never auto-verify
+      // an order. (Binance's own liveness prompt is independent of our toggles;
+      // we must not treat additionalKycVerify as permission to verify.)
+      const method1On = adRules?.method1_liveness_enabled === 1 || adRules?.method1_liveness_enabled === true;
+      const method2On = adRules?.method2_documents_enabled === 1 || adRules?.method2_documents_enabled === true;
+      const method3On = adRules?.method3_full_enabled === 1 || adRules?.method3_full_enabled === true;
+
+      if (!method1On && !method2On && !method3On) {
+        logger.info(`[${orderNo}] ⏭️  No verification method enabled on ad ${ad.ad_no} — bot will NOT touch this order (no auto-verify)`);
+        await sellerOrderDbService.setOrderState(
+          orderNo,
+          SELLER_ORDER_STATES.NEW_ORDER,
+          'No verification method enabled — bot inactive for this ad'
+        );
+        return; // Do NOT verify, do NOT run liveness/documents.
+      }
+
+      // ===== METHOD 1: LIVENESS CHECK (only when a method is enabled) =====
       // Check liveness status and decide next step
 
-      logger.info(`[${orderNo}] Method 1: Checking liveness status`, {
-        additionalKycVerify: rawOrder.additionalKycVerify
+      logger.info(`[${orderNo}] Checking liveness status`, {
+        additionalKycVerify: rawOrder.additionalKycVerify,
+        method1On, method2On, method3On,
       });
 
       if (rawOrder.additionalKycVerify === 2) {
