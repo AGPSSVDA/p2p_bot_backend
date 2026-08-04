@@ -142,10 +142,18 @@ async function main() {
   // Start order poller (detects new orders + fallback chat polling)
   orderPoller.start();
 
-  // Start seller order poller (if SELLER_MODE is enabled)
+  // Start seller order poller (if SELLER_MODE is enabled AND the persisted
+  // bot flag says it should run — a stop via the API survives restarts).
   if (process.env.SELLER_MODE === 'true' || process.env.SELLER_MODE === '1') {
-    sellerOrderPoller.start();
-    logger.info('🏪 Seller order poller started');
+    const sellerOrderDbService = require('./seller/services/sellerOrderDbService');
+    const enabled = await sellerOrderDbService.isSellerBotEnabled();
+    if (enabled) {
+      sellerOrderPoller.start();
+      logger.info('🏪 Seller order poller started');
+    } else {
+      logger.info('🏪 Seller order poller NOT started — bot is stopped in seller_bot_config');
+      console.log('🏪 [Seller] Bot is OFF (seller_bot_config.bot_status=0). Use POST /api/seller/bot/start to enable.');
+    }
   }
 
   // Stats every 2 minutes

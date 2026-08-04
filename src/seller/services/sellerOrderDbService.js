@@ -749,6 +749,32 @@ class SellerOrderDbService {
     return rows[0] || null;
   }
 
+  // ===== SELLER BOT ON/OFF (persisted in DB) =====
+
+  /** Returns true if the seller bot is set to running (default true). */
+  async isSellerBotEnabled() {
+    try {
+      const [rows] = await pool.query('SELECT bot_status FROM seller_bot_config WHERE id = 1');
+      if (!rows.length) return true; // no row yet = default running
+      return Number(rows[0].bot_status) === 1;
+    } catch (err) {
+      // If the table doesn't exist yet, default to running so the bot still works.
+      logger.warn(`isSellerBotEnabled read failed: ${err.message}`);
+      return true;
+    }
+  }
+
+  /** Persist the seller bot on/off state (1 = running, 0 = stopped). */
+  async setSellerBotEnabled(enabled) {
+    const status = enabled ? 1 : 0;
+    await pool.query(
+      `INSERT INTO seller_bot_config (id, bot_status) VALUES (1, ?)
+       ON DUPLICATE KEY UPDATE bot_status = VALUES(bot_status), updated_at = NOW()`,
+      [status]
+    );
+    return status === 1;
+  }
+
   async createDefaultAdRules(adNo, sellerId) {
     const query = `
       INSERT INTO seller_ad_rules (

@@ -22,6 +22,33 @@ class SellerOrderHandler {
   }
 
   /**
+   * Immediately stop ALL in-flight work — every liveness/document/payment poll
+   * loop and timer across every order. Used when the seller bot is stopped.
+   */
+  stopAll() {
+    const stores = [
+      this.livenessPollers,
+      this.documentPollers,
+      this.livenessTimers,
+      this.documentTimers,
+      this.otpTimers,
+      this.paymentTimers,
+    ];
+    let cleared = 0;
+    for (const store of stores) {
+      for (const key of Object.keys(store)) {
+        // clearInterval and clearTimeout are interchangeable for either handle.
+        clearInterval(store[key]);
+        clearTimeout(store[key]);
+        delete store[key];
+        cleared++;
+      }
+    }
+    logger.info(`[SellerHandler] stopAll — cleared ${cleared} active poller(s)/timer(s)`);
+    return cleared;
+  }
+
+  /**
    * START: Called when new order is detected by sellerOrderPoller
    *
    * Parameters:

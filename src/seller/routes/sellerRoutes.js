@@ -8,6 +8,7 @@ const sellerOrdersController = require('../controllers/sellerOrdersController');
 const sellerDashboardController = require('../controllers/sellerDashboardController');
 const sellerSyncController = require('../controllers/sellerSyncController');
 const sellerTradeTypesController = require('../controllers/sellerTradeTypesController');
+const sellerBotController = require('../controllers/sellerBotController');
 
 // Middleware
 const { authMiddleware } = require('../../middleware/authMiddleware'); // Assuming you have auth middleware
@@ -94,6 +95,19 @@ router.post('/sync/ads', (req, res) => sellerSyncController.syncAdsFromBinance(r
 
 // GET /api/seller/sync/status
 router.get('/sync/status', (req, res) => sellerSyncController.getSyncStatus(req, res));
+
+/**
+ * ===== SELLER BOT ON/OFF CONTROL =====
+ */
+
+// GET /api/seller/bot/status  — is the seller bot running?
+router.get('/bot/status', (req, res) => sellerBotController.status(req, res));
+
+// POST /api/seller/bot/stop   — stop polling + halt all in-flight order loops
+router.post('/bot/stop', (req, res) => sellerBotController.stop(req, res));
+
+// POST /api/seller/bot/start  — resume polling (and recover stuck orders)
+router.post('/bot/start', (req, res) => sellerBotController.start(req, res));
 
 /**
  * ===== TRADE TYPES ENDPOINTS =====

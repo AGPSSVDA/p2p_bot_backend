@@ -87,11 +87,21 @@ class SellerOrderPoller {
   }
 
   /**
-   * Stop the poller
+   * Stop the poller AND all in-flight work.
+   * Immediately halts new-order polling and clears every active liveness/
+   * document/payment loop and timer across all orders.
    */
   stop() {
     this.running = false;
-    logger.info('⏹️ Seller Order Poller stopped');
+    const cleared = this.orderHandler.stopAll();
+    // Let processed orders be re-picked-up if the bot is started again.
+    this.processedOrders.clear();
+    console.log(`\n⏹️ [SellerPoller] STOPPED — halted polling + cleared ${cleared} active loop(s)\n`);
+    logger.info('⏹️ Seller Order Poller stopped', { clearedLoops: cleared });
+  }
+
+  isRunning() {
+    return this.running;
   }
 
   /**
