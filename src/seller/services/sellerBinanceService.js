@@ -307,8 +307,37 @@ async function getOrderStatusByOrderNumber(orderNumber) {
 }
 
 /**
- * Send Chat Message
- * Send message to buyer via Binance chat
+ * Retrieve the seller's chat WSS credential (SELLER key).
+ * Returns { chatWssUrl, listenKey, listenToken } used to open the chat WebSocket.
+ * The REST sendMessage endpoint returns 404 on Binance — sending must go over WSS
+ * (same as the buyer side), so sellerChatService uses this to connect.
+ */
+async function getChatCredential(orderNo) {
+  return withRetry(async () => {
+    // Match the buyer side EXACTLY (verified working): empty params (listenKey is
+    // per-USER, not per-order) and the clientType=WEB header. Using orderNo params
+    // or the PC header makes Binance reject the chat WSS with ILLEGAL_PARAM.
+    const qs = buildSignedQuery({});
+    const res = await axios.get(
+      `${url(sellerBinanceConfig.endpoints.chatCredential)}?${qs}`,
+      { headers: headers({ clientType: 'WEB' }), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const data = res.data?.data || res.data;
+    if (!data?.listenKey || !data?.listenToken) {
+      throw new Error(`chatCredential missing listenKey: ${JSON.stringify(res.data).slice(0, 150)}`);
+    }
+    return {
+      chatWssUrl: data.chatWssUrl,
+      listenKey: data.listenKey,
+      listenToken: data.listenToken,
+    };
+  }, 3, 3000, `getChatCredential:${orderNo}`);
+}
+
+/**
+ * Send Chat Message (REST) — NOTE: Binance returns 404 for this endpoint, so it
+ * is NOT used. Kept for reference. Seller messages are sent over WSS via
+ * sellerChatService (see getChatCredential).
  * Endpoint: POST /sapi/v1/c2c/chat/sendMessage
  */
 async function sendMessage(orderNo, content, msgType = 'TEXT') {
@@ -387,6 +416,30 @@ async function getBuyerUploadedImages(orderNo, rows = 50) {
       count: 0,
       message: error.response?.data?.msg || error.message,
     };
+  }
+}
+
+/**
+ * Get TEXT messages the BUYER sent in the order chat (Method 2 OTP flow — the
+ * buyer replies with their mobile number, then the OTP). Oldest-first, with a
+ * stable `id` so the caller can process only new messages.
+ */
+async function getBuyerTextMessages(orderNo, rows = 50) {
+  try {
+    const { messages } = await getChatMessages(orderNo, rows);
+    const texts = (messages || [])
+      .filter((m) => m?.type === 'text' && m.self !== true && (m.content || m.message))
+      .map((m) => ({
+        id: m.id,
+        uuid: m.uuid,
+        content: m.content || m.message,
+        createTime: m.createTime,
+        fromNickName: m.fromNickName,
+      }))
+      .sort((a, b) => (a.createTime || 0) - (b.createTime || 0));
+    return { success: true, messages: texts, count: texts.length };
+  } catch (error) {
+    return { success: false, messages: [], count: 0, message: error.response?.data?.msg || error.message };
   }
 }
 
@@ -490,8 +543,10 @@ module.exports = {
   getUserDetails,
   verifyAdditionalKyc,
   sendMessage,
+  getChatCredential,
   getChatMessages,
   checkLivenessViaChat,
   getBuyerUploadedImages,
+  getBuyerTextMessages,
   updateAd
 };

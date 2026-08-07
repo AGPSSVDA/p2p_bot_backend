@@ -391,6 +391,118 @@ class SellerOrderDbService {
     );
   }
 
+  /** Mark that the Aadhaar BACK side has been seen (nothing to name-match on it). */
+  async setAadhaarBackSeen(orderNumber) {
+    return safe(
+      pool.query('UPDATE seller_orders SET aadhaar_back_seen = 1 WHERE order_number = ?', [orderNumber]),
+      `setAadhaarBackSeen:${orderNumber}`
+    );
+  }
+
+  /**
+   * Current Method 2 verification state for an order (incremental flow):
+   *   aadhaarFront: Aadhaar name matched KYC (aadhaar_verification_passed)
+   *   aadhaarBack : back side seen
+   *   pan         : PAN verified (pan_verification_passed)
+   *   attempts    : { aadhaar, pan }
+   */
+  async getMethod2State(orderNumber) {
+    const [[row]] = await pool.query(
+      `SELECT aadhaar_verification_passed, aadhaar_back_seen, pan_verification_passed,
+              aadhaar_attempts, pan_attempts
+       FROM seller_orders WHERE order_number = ?`,
+      [orderNumber]
+    );
+    return {
+      aadhaarFront: row?.aadhaar_verification_passed === 1 || row?.aadhaar_verification_passed === true,
+      aadhaarBack: row?.aadhaar_back_seen === 1 || row?.aadhaar_back_seen === true,
+      pan: row?.pan_verification_passed === 1 || row?.pan_verification_passed === true,
+      attempts: { aadhaar: row?.aadhaar_attempts || 0, pan: row?.pan_attempts || 0 },
+    };
+  }
+
+  /**
+   * Mark a stored chat image as processed and record the classified type, so we
+   * never re-run OpenAI on the same image (idempotent across restarts).
+   */
+  async markImageProcessed(imageId, classifiedType) {
+    return safe(
+      pool.query(
+        `UPDATE seller_verification_documents
+           SET verification_status = 'PROCESSED', document_type = ?
+         WHERE id = ?`,
+        [classifiedType || 'unknown', imageId]
+      ),
+      `markImageProcessed:${imageId}`
+    );
+  }
+
+  /**
+   * Return chat images for an order that have NOT yet been processed by OpenAI
+   * (verification_status still 'UPLOADED'), oldest first.
+   */
+  async getUnprocessedChatImages(orderNumber) {
+    const [rows] = await pool.query(
+      `SELECT id, image_url, chat_message_id
+         FROM seller_verification_documents
+        WHERE order_number = ? AND image_url IS NOT NULL
+          AND (verification_status IS NULL OR verification_status = 'UPLOADED')
+        ORDER BY uploaded_at ASC, id ASC`,
+      [orderNumber]
+    );
+    return rows;
+  }
+
+  // ===== METHOD 2: OTP (MOBILE) VERIFICATION =====
+
+  /** Save the buyer's mobile number. */
+  async saveMobileNumber(orderNumber, mobileNumber) {
+    return safe(
+      pool.query('UPDATE seller_orders SET mobile_number = ? WHERE order_number = ?', [mobileNumber, orderNumber]),
+      `saveMobileNumber:${orderNumber}`
+    );
+  }
+
+  /** Store the generated OTP + sent timestamp. */
+  async saveOtp(orderNumber, otp) {
+    return safe(
+      pool.query('UPDATE seller_orders SET otp_code = ?, otp_sent_at = NOW() WHERE order_number = ?', [otp, orderNumber]),
+      `saveOtp:${orderNumber}`
+    );
+  }
+
+  /** Current OTP state for an order. */
+  async getOtpState(orderNumber) {
+    const [[row]] = await pool.query(
+      `SELECT mobile_number, otp_code, otp_sent_at, otp_attempts, mobile_number_attempts,
+              mobile_verification_passed
+         FROM seller_orders WHERE order_number = ?`,
+      [orderNumber]
+    );
+    return {
+      mobileNumber: row?.mobile_number || null,
+      otpCode: row?.otp_code || null,
+      otpSentAt: row?.otp_sent_at || null,
+      otpAttempts: row?.otp_attempts || 0,
+      mobileAttempts: row?.mobile_number_attempts || 0,
+      passed: row?.mobile_verification_passed === 1 || row?.mobile_verification_passed === true,
+    };
+  }
+
+  /** Increment and return an OTP-flow attempt counter ('otp' | 'mobile'). */
+  async incrementOtpAttempt(orderNumber, kind) {
+    const col = kind === 'mobile' ? 'mobile_number_attempts' : 'otp_attempts';
+    await pool.query(
+      `UPDATE seller_orders SET \`${col}\` = \`${col}\` + 1 WHERE order_number = ?`,
+      [orderNumber]
+    );
+    const [[row]] = await pool.query(
+      `SELECT \`${col}\` AS n FROM seller_orders WHERE order_number = ?`,
+      [orderNumber]
+    );
+    return row ? row.n : null;
+  }
+
   // ===== STEP 4: ORDER VERIFICATION =====
 
   async recordOrderVerifyAttempted(orderNumber) {

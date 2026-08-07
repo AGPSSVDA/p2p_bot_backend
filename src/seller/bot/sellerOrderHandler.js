@@ -1,5 +1,4 @@
 const logger = require('../../utils/logger');
-const { chatService } = require('../../services/chatService');
 const sellerOrderDbService = require('../services/sellerOrderDbService');
 const sellerAdService = require('../services/sellerAdService');
 const sellerEligibilityService = require('../services/sellerEligibilityService');
@@ -8,7 +7,11 @@ const { SellerStateManager, SELLER_ORDER_STATES } = require('./sellerStateManage
 const sellerVerificationService = require('../services/sellerVerificationService');
 // Seller flows use the SELLER API key only (sellerBinanceService).
 const sellerBinanceService = require('../services/sellerBinanceService');
+// Chat SENDS go over the SELLER chat WSS with the SELLER key (sellerChatService).
+const { sellerChatService } = require('../services/sellerChatService');
 const sellerMethod2Service = require('../services/sellerMethod2Service');
+const sellerMessageService = require('../services/sellerMessageService');
+const sellerOtpService = require('../services/sellerOtpService');
 
 class SellerOrderHandler {
   constructor() {
@@ -19,6 +22,7 @@ class SellerOrderHandler {
     this.paymentTimers = {};
     this.livenessPollers = {}; // Polling intervals for liveness check
     this.documentPollers = {}; // Polling intervals for Method 2 chat image collection
+    this.otpPollers = {};      // Polling intervals for Method 2 OTP chat replies
   }
 
   /**
@@ -29,6 +33,7 @@ class SellerOrderHandler {
     const stores = [
       this.livenessPollers,
       this.documentPollers,
+      this.otpPollers,
       this.livenessTimers,
       this.documentTimers,
       this.otpTimers,
@@ -46,6 +51,24 @@ class SellerOrderHandler {
     }
     logger.info(`[SellerHandler] stopAll — cleared ${cleared} active poller(s)/timer(s)`);
     return cleared;
+  }
+
+  /**
+   * Send a chat message to the buyer on an order — over the SELLER chat WSS with
+   * the SELLER key (sellerChatService). Accepts the object form { orderNo, content }.
+   */
+  async _sendChat({ orderNo, content }) {
+    if (!content) return { success: false, message: 'empty content' };
+    try {
+      const res = await sellerChatService.send(orderNo, content);
+      if (!res?.success) {
+        logger.warn(`[${orderNo}] Chat send returned non-success`, { message: res?.message });
+      }
+      return res;
+    } catch (err) {
+      logger.error(`[${orderNo}] Chat send failed: ${err.message}`);
+      return { success: false, message: err.message };
+    }
   }
 
   /**
@@ -140,12 +163,15 @@ class SellerOrderHandler {
           hoursLeft,
         });
 
-        await chatService.sendMessage({
+        await this._sendChat({
           orderNo,
-          content:
+          content: await sellerMessageService.get(
+            'seller_cooldown_24h',
+            { hours: hoursLeft },
             `You have already placed an order in the last 24 hours. ` +
-            `Only one order per 24 hours is allowed. ` +
-            `Please place a new order after ${hoursLeft} hour(s).`,
+              `Only one order per 24 hours is allowed. ` +
+              `Please place a new order after ${hoursLeft} hour(s).`
+          ),
           msgType: 'TEXT',
         });
 
@@ -277,9 +303,13 @@ class SellerOrderHandler {
       logger.info(`[${orderNo}] Waiting for liveness check completion...`);
 
       // Send message to buyer
-      await chatService.sendMessage({
+      await this._sendChat({
         orderNo,
-        content: 'Please complete the liveness check on Binance to proceed with your order.',
+        content: await sellerMessageService.get(
+          'seller_liveness_request',
+          {},
+          'Please complete the liveness check on Binance to proceed with your order.'
+        ),
         msgType: 'TEXT'
       });
 
@@ -379,9 +409,9 @@ class SellerOrderHandler {
             this.stateManager.setState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
             await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
 
-            await chatService.sendMessage({
+            await this._sendChat({
               orderNo,
-              content: 'Liveness check timeout. Your order has been cancelled. Please try again.',
+              content: await sellerMessageService.get('seller_liveness_timeout', {}, 'Liveness check timeout. Your order has been cancelled. Please try again.'),
               msgType: 'TEXT'
             });
 
@@ -411,9 +441,9 @@ class SellerOrderHandler {
         this.stateManager.setState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
         await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
 
-        await chatService.sendMessage({
+        await this._sendChat({
           orderNo,
-          content: 'Liveness check timeout. Your order has been cancelled. Please try again.',
+          content: await sellerMessageService.get('seller_liveness_timeout', {}, 'Liveness check timeout. Your order has been cancelled. Please try again.'),
           msgType: 'TEXT'
         });
 
@@ -478,17 +508,25 @@ class SellerOrderHandler {
   }
 
   /**
-   * ===== METHOD 2: DOCUMENT VERIFICATION =====
+   * ===== METHOD 2: DOCUMENT VERIFICATION (incremental, per-image) =====
    *
-   * Polls the order chat and, on each cycle, runs the full document-verification
-   * flow (sellerMethod2Service):
-   *   OpenAI classify+extract -> require Aadhaar front+back + PAN
-   *   -> Aadhaar name ⟷ KYC name -> Surepass PAN verify -> PAN name ⟷ KYC name
-   *   -> verify the order in Binance.
+   * On entry: asks the buyer (in chat) to upload Aadhaar front, Aadhaar back and
+   * PAN. Then polls the order chat and processes EACH new image individually
+   * (sellerMethod2Service.processImage) — no image count is assumed; the buyer
+   * may send documents in any order, any count, any layout.
    *
-   * Chat messages (missing docs, mismatch, PAN fail, limit exceeded) are sent to
-   * the buyer, de-duplicated so the same message isn't repeated every 3 seconds.
-   * The images are also stored for the record (idempotent).
+   * For every image:
+   *   - classify + extract (OpenAI, one image),
+   *   - Aadhaar front → name ⟷ KYC name → mark Aadhaar verified,
+   *   - Aadhaar back  → mark seen,
+   *   - PAN           → Surepass verify + name match → mark PAN verified,
+   *   - anything else / unreadable → tell the buyer what's still needed.
+   * A doc already verified is skipped (its later images are ignored). Each failed
+   * read/match consumes an attempt; 3 attempts → limit exceeded → ask to cancel.
+   * Once Aadhaar front + back + PAN are all done, the order is verified in Binance.
+   *
+   * Processed images are marked in the DB so we never re-classify (re-bill) the
+   * same image, even across a restart.
    */
   async startMethod2Verification(orderNo) {
     try {
@@ -531,21 +569,24 @@ class SellerOrderHandler {
       let busy = false;             // prevent overlapping AI calls
       const MAX_POLLS = 300;        // ~15 min at 3s
 
-      // ---- Wait for 3 images before calling OpenAI ----
-      // Method 2 requires 3 documents: Aadhaar front, Aadhaar back, PAN.
-      // (PAN back is not required — it's blank/QR with nothing to verify.)
-      // We only run the (expensive) OpenAI classification once the buyer has
-      // uploaded 3+ images — and only re-run when the image count CHANGES
-      // afterwards (e.g. re-upload after a mismatch), so we never classify a
-      // half-set or waste tokens re-running the same set.
-      const REQUIRED_IMAGES = Number(process.env.METHOD2_REQUIRED_IMAGES) || 3;
-      let verifiedCount = -1;       // image count we last ran OpenAI on
-
       const sendOnce = async (content) => {
         if (!content || content === lastMessage) return;
         lastMessage = content;
-        await chatService.sendMessage({ orderNo, content, msgType: 'TEXT' });
+        await this._sendChat({ orderNo, content, msgType: 'TEXT' });
       };
+
+      // ---- Ask the buyer to upload the documents (once, on entry) ----
+      await this._sendChat({
+        orderNo,
+        content: await sellerMessageService.get(
+          'seller_doc_upload_request',
+          {},
+          'Liveness verified ✓\n\nPlease upload the following for document verification:\n' +
+            '1) Aadhaar card — front\n2) Aadhaar card — back\n3) PAN card\n\n' +
+            'You can send them in any order.'
+        ),
+        msgType: 'TEXT',
+      });
 
       const pollInterval = setInterval(async () => {
         if (busy) return;
@@ -553,70 +594,96 @@ class SellerOrderHandler {
         try {
           pollCount++;
 
-          // Fetch current images + store new ones for the record (idempotent).
+          // Fetch current chat images + store new ones (idempotent). Newly stored
+          // images have verification_status = 'UPLOADED' until we process them.
           const imgs = await sellerBinanceService.getBuyerUploadedImages(orderNo);
           const images = imgs.success ? imgs.images : [];
           for (const image of images) {
             await sellerOrderDbService.saveChatImage(orderNo, buyerId, image);
           }
 
-          const count = images.length;
-
-          // Wait until at least REQUIRED_IMAGES (3) are uploaded.
-          if (count < REQUIRED_IMAGES) {
-            if (pollCount % 10 === 0) {
-              logger.debug(`[${orderNo}] Method 2: waiting for images (${count}/${REQUIRED_IMAGES})`);
+          // Process only images we haven't classified yet — one at a time.
+          const pending = await sellerOrderDbService.getUnprocessedChatImages(orderNo);
+          if (pending.length === 0) {
+            // Nothing new to process. Occasionally remind what's still missing.
+            if (pollCount % 20 === 0) {
+              const state = await sellerOrderDbService.getMethod2State(orderNo);
+              const msg = await sellerMethod2Service.missingDocsMessage(state);
+              if (msg) await sendOnce(msg);
             }
             return;
           }
 
-          // Only run OpenAI when this image set is new (count changed since the
-          // last classification). Otherwise keep waiting for the next upload.
-          if (count === verifiedCount) return;
+          for (const img of pending) {
+            // Stop early if the order got verified / failed mid-loop.
+            if (!this.documentPollers[orderNo]) break;
 
-          verifiedCount = count; // mark this set as classified
-          logger.info(`[${orderNo}] 📄 ${count} images uploaded — running OpenAI classification`);
+            const result = await sellerMethod2Service.processImage(orderNo, kycName, img.image_url);
 
-          // Run one verification pass on the full image set.
-          const result = await sellerMethod2Service.runVerification(orderNo, kycName, images);
+            // On a transient failure (couldn't download/classify), DON'T mark it
+            // processed — leave it so the next poll retries this image.
+            if (result.status === 'error') {
+              if (pollCount % 20 === 0) {
+                logger.debug(`[${orderNo}] Method 2: image ${img.id} classify error, will retry`, { detail: result.detail });
+              }
+              continue;
+            }
 
-          switch (result.status) {
-            case 'verified':
-              logger.info(`[${orderNo}] ✅ Method 2 verified — proceeding to order verification`);
-              this.stopMethod2Verification(orderNo);
-              await sellerOrderDbService.recordDocumentVerified(orderNo, 'aadhaar', true);
-              await sellerOrderDbService.recordDocumentVerified(orderNo, 'pan', true);
-              await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFIED);
-              await this.verifyOrderInBinance(orderNo);
-              break;
-
-            case 'limit_exceeded':
-              logger.warn(`[${orderNo}] Method 2 attempt limit exceeded`);
-              this.stopMethod2Verification(orderNo);
+            // Artificial OpenAI credit exhausted — send the generic message once
+            // and stop the poller. Do NOT mark the image processed, so it is
+            // re-processed once credit is topped up and the order resumes.
+            if (result.status === 'unavailable') {
+              logger.warn(`[${orderNo}] Method 2: OpenAI token limit exceeded — verification unavailable`);
               await sendOnce(result.message);
+              this.stopMethod2Verification(orderNo);
+              await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_DOCUMENTS, 'OpenAI credit exhausted');
+              return;
+            }
+
+            // Remember we processed this image (so we never re-bill it).
+            await sellerOrderDbService.markImageProcessed(img.id, result.classifiedType || 'unknown');
+
+            if (result.status === 'limit_exceeded') {
+              logger.warn(`[${orderNo}] Method 2 attempt limit exceeded`);
+              await sendOnce(result.message);
+              this.stopMethod2Verification(orderNo);
               this.stateManager.setState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFICATION_FAILED);
               await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFICATION_FAILED, 'attempt limit exceeded');
-              break;
+              return;
+            }
 
-            case 'need_upload':
-            case 'name_mismatch':
-            case 'pan_failed':
-              // Ask the buyer (once) for what's needed; keep polling for re-uploads.
-              if (result.message) await sendOnce(result.message);
-              break;
+            // Send any per-image message (mismatch / unreadable / not-a-document).
+            if (result.message) await sendOnce(result.message);
 
-            case 'error':
-            default:
-              if (pollCount % 20 === 0 || pollCount <= 2) {
-                logger.debug(`[${orderNo}] Method 2 pass: ${result.status}`, { detail: result.detail });
+            // After a successful doc step, check whether we're all done.
+            if (['aadhaar_verified', 'aadhaar_back_seen', 'pan_verified'].includes(result.status)) {
+              const state = await sellerOrderDbService.getMethod2State(orderNo);
+              if (sellerMethod2Service.isComplete(state)) {
+                logger.info(`[${orderNo}] ✅ Method 2 documents complete (Aadhaar front+back + PAN)`);
+                this.stopMethod2Verification(orderNo);
+                await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFIED);
+
+                // If the ad also requires mobile OTP, run that BEFORE verifying.
+                const adRules = await sellerOrderDbService.getAdRules(dbOrder?.ad_no);
+                if (adRules?.method2_mobile_verification_enabled) {
+                  logger.info(`[${orderNo}] Method 2 OTP enabled — starting mobile OTP verification`);
+                  await this.startOtpVerification(orderNo, kycName);
+                  return;
+                }
+
+                await this.verifyOrderInBinance(orderNo);
+                return;
               }
-              break;
+              // Not done yet — nudge the buyer for what's left.
+              const msg = await sellerMethod2Service.missingDocsMessage(state);
+              if (msg) await sendOnce(msg);
+            }
           }
 
           if (pollCount >= MAX_POLLS && this.documentPollers[orderNo]) {
             logger.info(`[${orderNo}] Method 2 verification window ended (timeout)`);
             this.stopMethod2Verification(orderNo);
-            await sendOnce('Document verification timed out. You can cancel this order and try again.');
+            await sendOnce(await sellerMessageService.get('seller_doc_timeout', {}, 'Document verification timed out. You can cancel this order and try again.'));
             await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFICATION_FAILED, 'timeout');
           }
         } catch (error) {
@@ -646,6 +713,123 @@ class SellerOrderHandler {
   }
 
   /**
+   * ===== METHOD 2: OTP (MOBILE) VERIFICATION =====
+   *
+   * Runs after documents are verified, ONLY when the ad has
+   * method2_mobile_verification_enabled. Asks the buyer for a 10-digit mobile
+   * number, sends an OTP via SMS (NettyFish), then verifies the OTP the buyer
+   * replies with in chat. All decision logic lives in sellerOtpService; this
+   * poller just feeds it new buyer text messages and reacts to the result.
+   */
+  async startOtpVerification(orderNo, kycName) {
+    try {
+      if (this.otpPollers[orderNo]) {
+        logger.debug(`[${orderNo}] OTP verification already running`);
+        return;
+      }
+
+      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_MOBILE_OTP);
+      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_MOBILE_OTP);
+      await sellerOrderDbService.recordDocumentUploadRequested?.(orderNo, 'mobile');
+
+      // Ask for the mobile number (once, on entry).
+      await this._sendChat({
+        orderNo,
+        content: await sellerOtpService.mobileRequestMessage(),
+        msgType: 'TEXT',
+      });
+
+      let pollCount = 0;
+      let busy = false;
+      let lastMessage = null;
+      // Only process buyer messages that arrive AFTER we asked, so an old chat
+      // line isn't mistaken for a mobile number / OTP.
+      const startedAt = Date.now();
+      const processed = new Set();
+      const MAX_POLLS = 300; // ~15 min at 3s
+
+      const sendOnce = async (content) => {
+        if (!content || content === lastMessage) return;
+        lastMessage = content;
+        await this._sendChat({ orderNo, content, msgType: 'TEXT' });
+      };
+
+      const pollInterval = setInterval(async () => {
+        if (busy) return;
+        busy = true;
+        try {
+          pollCount++;
+
+          const resTexts = await sellerBinanceService.getBuyerTextMessages(orderNo);
+          const texts = resTexts.success ? resTexts.messages : [];
+
+          for (const t of texts) {
+            if (!this.otpPollers[orderNo]) break;
+            if (processed.has(String(t.id))) continue;
+            // Skip messages sent before we prompted (avoids stale replies).
+            if (t.createTime && t.createTime < startedAt - 5000) {
+              processed.add(String(t.id));
+              continue;
+            }
+            processed.add(String(t.id));
+
+            const result = await sellerOtpService.handleMessage(orderNo, t.content);
+
+            if (result.status === 'ignored') continue;
+
+            if (result.status === 'verified') {
+              logger.info(`[${orderNo}] ✅ OTP verified — verifying order`);
+              this.stopOtpVerification(orderNo);
+              await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.MOBILE_OTP_VERIFIED);
+              await this.verifyOrderInBinance(orderNo);
+              return;
+            }
+
+            if (result.status === 'limit_exceeded') {
+              logger.warn(`[${orderNo}] OTP verification limit exceeded`);
+              await sendOnce(result.message);
+              this.stopOtpVerification(orderNo);
+              this.stateManager.setState(orderNo, SELLER_ORDER_STATES.MOBILE_OTP_FAILED);
+              await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.MOBILE_OTP_FAILED, 'OTP attempt limit exceeded');
+              return;
+            }
+
+            // otp_sent / invalid_mobile / invalid_otp / send_failed → tell the buyer.
+            if (result.message) await sendOnce(result.message);
+            // A fresh OTP was just sent → allow its confirm text to repeat later.
+            if (result.status === 'otp_sent') lastMessage = null;
+          }
+
+          if (pollCount >= MAX_POLLS && this.otpPollers[orderNo]) {
+            logger.info(`[${orderNo}] OTP verification window ended (timeout)`);
+            this.stopOtpVerification(orderNo);
+            this.stateManager.setState(orderNo, SELLER_ORDER_STATES.MOBILE_OTP_FAILED);
+            await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.MOBILE_OTP_FAILED, 'OTP timeout');
+          }
+        } catch (error) {
+          logger.error(`[${orderNo}] OTP poll error: ${error.message}`, { error });
+        } finally {
+          busy = false;
+        }
+      }, 3000);
+
+      this.otpPollers[orderNo] = pollInterval;
+    } catch (error) {
+      logger.error(`OTP verification start error: ${error.message}`, { orderNo });
+      await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /** Stop the Method 2 OTP poller. */
+  stopOtpVerification(orderNo) {
+    if (this.otpPollers[orderNo]) {
+      clearInterval(this.otpPollers[orderNo]);
+      delete this.otpPollers[orderNo];
+      logger.info(`[${orderNo}] Stopped OTP verification`);
+    }
+  }
+
+  /**
    * Liveness timeout handler
    */
   startLivenessTimeout(orderNo) {
@@ -656,9 +840,9 @@ class SellerOrderHandler {
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
 
       // Send message
-      await chatService.sendMessage({
+      await this._sendChat({
         orderNo,
-        content: 'Liveness check timeout. Your order has been cancelled. Please try again.',
+        content: await sellerMessageService.get('seller_liveness_timeout', {}, 'Liveness check timeout. Your order has been cancelled. Please try again.'),
         msgType: 'TEXT'
       });
 
@@ -680,7 +864,7 @@ class SellerOrderHandler {
       logger.info(`[${orderNo}] Requesting document upload...`);
 
       // Send message to buyer
-      await chatService.sendMessage({
+      await this._sendChat({
         orderNo,
         content: 'Please upload your Aadhaar card and PAN card for verification.',
         msgType: 'TEXT'
@@ -726,7 +910,7 @@ class SellerOrderHandler {
         });
 
         // Send message
-        await chatService.sendMessage({
+        await this._sendChat({
           orderNo,
           content: `Document verification failed: ${verificationResult.reason}. Please try again.`,
           msgType: 'TEXT'
@@ -768,7 +952,7 @@ class SellerOrderHandler {
       logger.info(`[${orderNo}] Requesting mobile number...`);
 
       // Send message
-      await chatService.sendMessage({
+      await this._sendChat({
         orderNo,
         content: 'Please provide your mobile number for OTP verification.',
         msgType: 'TEXT'
@@ -798,7 +982,7 @@ class SellerOrderHandler {
 
       if (!otpResult.success) {
         logger.warn(`[${orderNo}] OTP send failed`, { reason: otpResult.reason });
-        await chatService.sendMessage({
+        await this._sendChat({
           orderNo,
           content: 'Failed to send OTP. Please try again.',
           msgType: 'TEXT'
@@ -807,7 +991,7 @@ class SellerOrderHandler {
       }
 
       // Send message
-      await chatService.sendMessage({
+      await this._sendChat({
         orderNo,
         content: 'OTP sent to your mobile. Please reply with the OTP.',
         msgType: 'TEXT'
@@ -837,7 +1021,7 @@ class SellerOrderHandler {
 
       if (!verification.success) {
         logger.warn(`[${orderNo}] OTP verification failed`);
-        await chatService.sendMessage({
+        await this._sendChat({
           orderNo,
           content: 'Invalid OTP. Please try again.',
           msgType: 'TEXT'
@@ -1107,7 +1291,7 @@ class SellerOrderHandler {
         ? 'Please scan the QR code below to complete payment:'
         : 'Please click the link below to complete payment:';
 
-      await chatService.sendMessage({
+      await this._sendChat({
         orderNo,
         content: `${message}\n\n${linkResult.link || linkResult.qrCode}`,
         msgType: adRules.method3_delivery_method === 'qr_code' ? 'IMAGE' : 'TEXT'
@@ -1195,9 +1379,13 @@ class SellerOrderHandler {
       logger.info(`[${orderNo}] Sending thank you message...`);
 
       // Send thank you
-      await chatService.sendMessage({
+      await this._sendChat({
         orderNo,
-        content: 'Payment completed! ✓\n\nThank you for trading with us! Your crypto will be released shortly.',
+        content: await sellerMessageService.get(
+          'seller_thank_you',
+          {},
+          'Payment completed! ✓\n\nThank you for trading with us! Your crypto will be released shortly.'
+        ),
         msgType: 'TEXT'
       });
 

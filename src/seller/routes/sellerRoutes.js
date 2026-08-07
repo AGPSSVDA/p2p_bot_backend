@@ -9,6 +9,8 @@ const sellerDashboardController = require('../controllers/sellerDashboardControl
 const sellerSyncController = require('../controllers/sellerSyncController');
 const sellerTradeTypesController = require('../controllers/sellerTradeTypesController');
 const sellerBotController = require('../controllers/sellerBotController');
+const openaiUsageController = require('../controllers/openaiUsageController');
+const sellerMessageController = require('../controllers/sellerMessageController');
 
 // Middleware
 const { authMiddleware } = require('../../middleware/authMiddleware'); // Assuming you have auth middleware
@@ -108,6 +110,35 @@ router.post('/bot/stop', (req, res) => sellerBotController.stop(req, res));
 
 // POST /api/seller/bot/start  — resume polling (and recover stuck orders)
 router.post('/bot/start', (req, res) => sellerBotController.start(req, res));
+
+/**
+ * ===== OPENAI USAGE / CREDIT =====
+ */
+
+// GET /api/seller/openai/usage  — spend, remaining, request log
+router.get('/openai/usage', (req, res) => openaiUsageController.summary(req, res));
+
+// POST /api/seller/openai/credit  — set the purchased credit amount (USD)
+router.post('/openai/credit', (req, res) => openaiUsageController.setCredit(req, res));
+
+/**
+ * ===== SELLER CHAT MESSAGES (editable templates for Method 1 & 2) =====
+ */
+
+// GET /api/seller/messages            — all seller message templates
+router.get('/messages', (req, res) => sellerMessageController.getMessages(req, res));
+
+// GET /api/seller/messages/variables  — {token} palette
+router.get('/messages/variables', (req, res) => sellerMessageController.getVariables(req, res));
+
+// POST /api/seller/messages           — add new message variations
+router.post('/messages', (req, res) => sellerMessageController.createMessages(req, res));
+
+// PUT /api/seller/messages            — edit/reorder existing messages
+router.put('/messages', (req, res) => sellerMessageController.updateMessages(req, res));
+
+// DELETE /api/seller/messages/:id     — delete a message variation
+router.delete('/messages/:id', (req, res) => sellerMessageController.deleteMessage(req, res));
 
 /**
  * ===== TRADE TYPES ENDPOINTS =====

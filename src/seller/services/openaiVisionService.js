@@ -16,6 +16,7 @@
 const axios = require('axios');
 const https = require('https');
 const logger = require('../../utils/logger');
+const openaiUsage = require('./openaiUsageService');
 
 const ipv4Agent = new https.Agent({ family: 4, keepAlive: true });
 
@@ -75,13 +76,19 @@ async function toDataUrl(url) {
   return `data:${mime};base64,${b64}`;
 }
 
-async function classifyAndExtract(imageUrls) {
+async function classifyAndExtract(imageUrls, orderNumber = null) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return { success: false, message: 'OPENAI_API_KEY not set' };
   }
   if (!imageUrls || imageUrls.length === 0) {
     return { success: true, images: [] };
+  }
+
+  // Artificial credit gate (see classifyImage).
+  if (await openaiUsage.isCreditExhausted()) {
+    logger.warn('OpenAI token limit exceeded — refusing request (artificial credit gate)', { orderNumber });
+    return { success: false, creditExhausted: true, message: 'OpenAI token limit exceeded' };
   }
 
   // Fetch each image and inline as base64 (Binance URLs aren't OpenAI-fetchable).
@@ -146,6 +153,14 @@ async function classifyAndExtract(imageUrls) {
       }
     }
 
+    // Record token usage + estimated cost for this request (never throws).
+    await openaiUsage.logUsage({
+      orderNumber,
+      model: res.data?.model || MODEL,
+      usage: res.data?.usage,
+      purpose: 'document_verification',
+    });
+
     const raw = res.data?.choices?.[0]?.message?.content;
     if (!raw) {
       return { success: false, message: 'Empty response from OpenAI' };
@@ -183,4 +198,141 @@ async function classifyAndExtract(imageUrls) {
   }
 }
 
-module.exports = { classifyAndExtract };
+// Single-image prompt for the incremental flow. A buyer may put MORE THAN ONE
+// document in one image (e.g. an e-Aadhaar PDF screenshot that shows the front
+// card AND the back/address block, or a photo of Aadhaar front+back side by
+// side). So we ask for a "documents" ARRAY of everything present in this one
+// image — not a single type.
+const SINGLE_PROMPT = `You are an ID document classifier and data extractor for an Indian KYC flow.
+You receive ONE image. It may contain ONE OR MORE Indian ID documents (a single
+image can show, for example, an Aadhaar front card AND the Aadhaar back/address
+block together, as in an e-Aadhaar PDF screenshot).
+
+Detect EVERY distinct document present in this image. For each, decide its type:
+- "aadhaar_front": the Aadhaar side/section showing the person's NAME + photo + DOB/gender (and the 12-digit Aadhaar number).
+- "aadhaar_back": the Aadhaar side/section showing the ADDRESS (Aadhaar number may repeat, but NO name/photo).
+- "pan": a PAN card (10-char PAN like ABCDE1234F, holder's NAME, father's name, DOB, photo).
+
+Extraction rules:
+- aadhaar_front: "name" = full printed name (English). Do NOT extract the Aadhaar number.
+- aadhaar_back: "name" = null.
+- pan: "pan_number" = the 10-character PAN, "name" = holder's full name.
+- Names: exact printed English text, uppercase, no titles. If unreadable, null. Never guess.
+- If the image is NOT an Indian ID at all (selfie, payment screenshot, blurry/unreadable),
+  return an empty "documents" array.
+
+Respond with STRICT JSON only, no markdown:
+{
+  "documents": [
+    { "type": "aadhaar_front", "name": "VIKRAM KUMAR", "pan_number": null },
+    { "type": "aadhaar_back",  "name": null,           "pan_number": null }
+  ]
+}`;
+
+/**
+ * Classify + extract from a SINGLE image (the incremental Method 2 flow).
+ *
+ * Because one image can carry more than one document, this returns ALL documents
+ * detected in the image. The caller advances verification for each.
+ *
+ * @param {string} imageUrl
+ * @param {string|null} orderNumber
+ * @returns {Promise<{success:boolean, documents?:Array<{type,name,pan_number}>, message?:string}>}
+ */
+async function classifyImage(imageUrl, orderNumber = null) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return { success: false, message: 'OPENAI_API_KEY not set' };
+  if (!imageUrl) return { success: true, documents: [] };
+
+  // Artificial credit gate: if our tracked credit is exhausted, refuse the call
+  // ("token limit exceeded") even if the real OpenAI account still has credit.
+  if (await openaiUsage.isCreditExhausted()) {
+    logger.warn('OpenAI token limit exceeded — refusing request (artificial credit gate)', { orderNumber });
+    return { success: false, creditExhausted: true, message: 'OpenAI token limit exceeded' };
+  }
+
+  let dataUrl;
+  try {
+    dataUrl = await toDataUrl(imageUrl);
+  } catch (e) {
+    logger.error('OpenAI vision (single): failed to download image', { detail: e.message });
+    return { success: false, message: `Could not download image: ${e.message}` };
+  }
+
+  const payload = {
+    model: MODEL,
+    temperature: 0,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: SINGLE_PROMPT },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Detect and extract all Indian ID documents in this image.' },
+          { type: 'image_url', image_url: { url: dataUrl, detail: IMAGE_DETAIL } },
+        ],
+      },
+    ],
+  };
+
+  try {
+    let res;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        res = await axios.post(OPENAI_URL, payload, {
+          headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          timeout: 60000,
+          httpsAgent: ipv4Agent,
+        });
+        break;
+      } catch (err) {
+        const status = err.response?.status;
+        if (status === 429 && attempt < 3) {
+          const retryAfter = Number(err.response?.headers?.['retry-after']) * 1000;
+          const msg = err.response?.data?.error?.message || '';
+          const m = msg.match(/try again in ([\d.]+)s/i);
+          const waitMs = retryAfter || (m ? Math.ceil(parseFloat(m[1]) * 1000) : 20000);
+          logger.warn(`OpenAI vision (single) 429 — retrying in ${waitMs}ms (attempt ${attempt}/3)`);
+          await new Promise((r) => setTimeout(r, waitMs + 500));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    await openaiUsage.logUsage({
+      orderNumber,
+      model: res.data?.model || MODEL,
+      usage: res.data?.usage,
+      purpose: 'document_verification',
+    });
+
+    const raw = res.data?.choices?.[0]?.message?.content;
+    if (!raw) return { success: false, message: 'Empty response from OpenAI' };
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      logger.warn('OpenAI vision (single): could not parse JSON', { raw: String(raw).slice(0, 300) });
+      return { success: false, message: 'Could not parse OpenAI response' };
+    }
+
+    const docs = Array.isArray(parsed.documents) ? parsed.documents : [];
+    const normalised = docs.map((d) => ({
+      type: d.type || 'unknown',
+      name: d.name ? String(d.name).toUpperCase().trim() : null,
+      pan_number: d.pan_number ? String(d.pan_number).toUpperCase().replace(/\s+/g, '') : null,
+    }));
+
+    logger.info('OpenAI vision (single) classified', { types: normalised.map((n) => n.type) });
+    return { success: true, documents: normalised };
+  } catch (error) {
+    const status = error.response?.status;
+    const detail = error.response?.data?.error?.message || error.message;
+    logger.error('OpenAI vision (single) call failed', { status, detail });
+    return { success: false, message: detail };
+  }
+}
+
+module.exports = { classifyAndExtract, classifyImage };
