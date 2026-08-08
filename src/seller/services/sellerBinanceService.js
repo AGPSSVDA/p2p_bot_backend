@@ -197,6 +197,56 @@ async function verifyAdditionalKyc(orderNo) {
 }
 
 /**
+ * Method 3: Check whether the seller can release the crypto for an order yet.
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/checkIfCanReleaseCoin  → boolean
+ */
+async function checkIfCanReleaseCoin(orderNo) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNumber: orderNo });
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.checkCanRelease)}?${qs}`,
+      { orderNumber: orderNo },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const data = res.data?.data;
+    const canRelease = data === true || data === 'true' ||
+      res.data?.code === '000000' || res.data?.code === 0;
+    return { success: true, canRelease, code: res.data?.code, message: res.data?.message, raw: res.data };
+  }, 3, 3000, `checkIfCanReleaseCoin:${orderNo}`);
+}
+
+/**
+ * Method 3: Release the crypto to the buyer.
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/releaseCoin
+ *
+ * The body may carry 2FA codes (googleVerifyCode / mobileVerifyCode / emailVerifyCode)
+ * depending on the account's security settings. We pass whatever is configured via
+ * env (SELLER_RELEASE_AUTH_TYPE / SELLER_RELEASE_* codes); if the account doesn't
+ * require them (like verifyAdditionalKyc, which "does not require authentication"),
+ * the empty body works. On failure the caller marks the order READY_TO_RELEASE and
+ * alerts the admin instead of forcing a release.
+ */
+async function releaseCoin(orderNo) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNumber: orderNo });
+    const body = { orderNumber: orderNo };
+    // Optional 2FA — only include when configured.
+    if (process.env.SELLER_RELEASE_AUTH_TYPE) body.authType = process.env.SELLER_RELEASE_AUTH_TYPE;
+    if (process.env.SELLER_RELEASE_GOOGLE_CODE) body.googleVerifyCode = process.env.SELLER_RELEASE_GOOGLE_CODE;
+    if (process.env.SELLER_RELEASE_MOBILE_CODE) body.mobileVerifyCode = process.env.SELLER_RELEASE_MOBILE_CODE;
+    if (process.env.SELLER_RELEASE_EMAIL_CODE) body.emailVerifyCode = process.env.SELLER_RELEASE_EMAIL_CODE;
+
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.releaseCoin)}?${qs}`,
+      body,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const success = res.data?.code === '000000' || res.data?.code === 0 || res.status === 200;
+    return { success, code: res.data?.code, message: res.data?.message || 'release requested', raw: res.data };
+  }, 3, 3000, `releaseCoin:${orderNo}`);
+}
+
+/**
  * Get Order Detail (Full order information including buyer's real KYC name).
  * Endpoint: POST /sapi/v1/c2c/orderMatch/getUserOrderDetail
  *
@@ -542,6 +592,8 @@ module.exports = {
   getCounterPartyOrderStats,
   getUserDetails,
   verifyAdditionalKyc,
+  checkIfCanReleaseCoin,
+  releaseCoin,
   sendMessage,
   getChatCredential,
   getChatMessages,

@@ -12,6 +12,8 @@ const { sellerChatService } = require('../services/sellerChatService');
 const sellerMethod2Service = require('../services/sellerMethod2Service');
 const sellerMessageService = require('../services/sellerMessageService');
 const sellerOtpService = require('../services/sellerOtpService');
+const paymentGatewayService = require('../services/paymentGatewayService');
+const { matchNames } = require('../../utils/helpers');
 
 class SellerOrderHandler {
   constructor() {
@@ -23,6 +25,7 @@ class SellerOrderHandler {
     this.livenessPollers = {}; // Polling intervals for liveness check
     this.documentPollers = {}; // Polling intervals for Method 2 chat image collection
     this.otpPollers = {};      // Polling intervals for Method 2 OTP chat replies
+    this.gatewayPollers = {};  // Polling intervals for Method 3 payment status
   }
 
   /**
@@ -34,6 +37,7 @@ class SellerOrderHandler {
       this.livenessPollers,
       this.documentPollers,
       this.otpPollers,
+      this.gatewayPollers,
       this.livenessTimers,
       this.documentTimers,
       this.otpTimers,
@@ -140,52 +144,59 @@ class SellerOrderHandler {
         );
       }
 
-      // ===== 24-HOUR COOLDOWN CHECK (before any verification) =====
-      // If this buyer COMPLETED an order in the last 24h, they cannot place a new
-      // one yet. Tell them in chat and stop — no liveness/method check runs.
-      const recent = await sellerOrderDbService.getRecentCompletedOrderByBuyer(
-        buyerId,
-        orderNo,
-        24
-      );
-      if (recent) {
-        const completedAt = new Date(recent.completed_at);
-        const nextAllowed = new Date(completedAt.getTime() + 24 * 60 * 60 * 1000);
-        const hoursLeft = Math.max(
-          1,
-          Math.ceil((nextAllowed.getTime() - Date.now()) / (60 * 60 * 1000))
-        );
+      // ===== RE-ORDER COOLDOWN CHECK (per-ad, before any verification) =====
+      // If the ad has the cooldown enabled and this buyer COMPLETED an order on
+      // it within the configured window, block the new order. The window is
+      // per-ad (reorder_cooldown_hours); default OFF unless the admin turns it on.
+      const cooldownOn = adRules?.reorder_cooldown_enabled === 1 || adRules?.reorder_cooldown_enabled === true;
+      const cooldownHours = Number(adRules?.reorder_cooldown_hours) > 0 ? Number(adRules.reorder_cooldown_hours) : 24;
 
-        logger.info(`[${orderNo}] ⛔ 24h cooldown: buyer completed order ${recent.order_number} recently`, {
+      if (cooldownOn) {
+        const recent = await sellerOrderDbService.getRecentCompletedOrderByBuyer(
           buyerId,
-          previousOrder: recent.order_number,
-          completedAt: recent.completed_at,
-          hoursLeft,
-        });
-
-        await this._sendChat({
           orderNo,
-          content: await sellerMessageService.get(
-            'seller_cooldown_24h',
-            { hours: hoursLeft },
-            `You have already placed an order in the last 24 hours. ` +
-              `Only one order per 24 hours is allowed. ` +
-              `Please place a new order after ${hoursLeft} hour(s).`
-          ),
-          msgType: 'TEXT',
-        });
-
-        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.REJECTED);
-        await sellerOrderDbService.setOrderState(
-          orderNo,
-          SELLER_ORDER_STATES.REJECTED,
-          '24h cooldown: buyer completed a previous order within 24h'
+          cooldownHours
         );
-        await sellerOrderDbService.recordError(
-          orderNo,
-          `24h cooldown - previous order ${recent.order_number}`
-        );
-        return; // Do NOT proceed to liveness / any method
+        if (recent) {
+          const completedAt = new Date(recent.completed_at);
+          const nextAllowed = new Date(completedAt.getTime() + cooldownHours * 60 * 60 * 1000);
+          const hoursLeft = Math.max(
+            1,
+            Math.ceil((nextAllowed.getTime() - Date.now()) / (60 * 60 * 1000))
+          );
+
+          logger.info(`[${orderNo}] ⛔ Re-order cooldown (${cooldownHours}h): buyer completed order ${recent.order_number} recently`, {
+            buyerId,
+            previousOrder: recent.order_number,
+            completedAt: recent.completed_at,
+            cooldownHours,
+            hoursLeft,
+          });
+
+          await this._sendChat({
+            orderNo,
+            content: await sellerMessageService.get(
+              'seller_cooldown_24h',
+              { hours: hoursLeft, cooldownHours },
+              `You have already completed an order recently. ` +
+                `Only one order per ${cooldownHours} hours is allowed. ` +
+                `Please place a new order after ${hoursLeft} hour(s).`
+            ),
+            msgType: 'TEXT',
+          });
+
+          this.stateManager.setState(orderNo, SELLER_ORDER_STATES.REJECTED);
+          await sellerOrderDbService.setOrderState(
+            orderNo,
+            SELLER_ORDER_STATES.REJECTED,
+            `Re-order cooldown: buyer completed a previous order within ${cooldownHours}h`
+          );
+          await sellerOrderDbService.recordError(
+            orderNo,
+            `Re-order cooldown (${cooldownHours}h) - previous order ${recent.order_number}`
+          );
+          return; // Do NOT proceed to liveness / any method
+        }
       }
 
       // ===== VERIFICATION METHOD GATE =====
@@ -492,10 +503,12 @@ class SellerOrderHandler {
       const adNo = dbOrder?.ad_no || this.stateManager.get(orderNo)?.adNo;
       const adRules = adNo ? await sellerOrderDbService.getAdRules(adNo) : null;
 
-      if (adRules?.method2_documents_enabled) {
-        logger.info(`[${orderNo}] Method 2 enabled - starting document verification`);
+      // Method 2 OR Method 3 both require document verification after liveness.
+      // (Method 3 = liveness + documents [+ OTP] + payment gateway.)
+      if (adRules?.method2_documents_enabled || adRules?.method3_full_enabled) {
+        logger.info(`[${orderNo}] Documents required (m2=${!!adRules?.method2_documents_enabled}, m3=${!!adRules?.method3_full_enabled}) - starting document verification`);
         await this.startMethod2Verification(orderNo);
-        return; // Order is verified only after documents pass
+        return; // Order is verified only after documents (and OTP/payment) pass
       }
 
       // ===== STEP 4: ORDER VERIFICATION IN BINANCE =====
@@ -663,10 +676,11 @@ class SellerOrderHandler {
                 this.stopMethod2Verification(orderNo);
                 await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.DOCUMENTS_VERIFIED);
 
-                // If the ad also requires mobile OTP, run that BEFORE verifying.
+                // If the ad requires mobile OTP (Method 2 OR Method 3), run it
+                // BEFORE verifying. OTP is optional in both methods.
                 const adRules = await sellerOrderDbService.getAdRules(dbOrder?.ad_no);
-                if (adRules?.method2_mobile_verification_enabled) {
-                  logger.info(`[${orderNo}] Method 2 OTP enabled — starting mobile OTP verification`);
+                if (adRules?.method2_mobile_verification_enabled || adRules?.method3_mobile_verification_enabled) {
+                  logger.info(`[${orderNo}] OTP enabled — starting mobile OTP verification`);
                   await this.startOtpVerification(orderNo, kycName);
                   return;
                 }
@@ -742,9 +756,9 @@ class SellerOrderHandler {
       let pollCount = 0;
       let busy = false;
       let lastMessage = null;
-      // Only process buyer messages that arrive AFTER we asked, so an old chat
-      // line isn't mistaken for a mobile number / OTP.
-      const startedAt = Date.now();
+      // Track which chat messages we've already handled so we never process one
+      // twice. We do NOT filter by timestamp — the buyer may have sent their
+      // mobile/OTP before this poller (re)started.
       const processed = new Set();
       const MAX_POLLS = 300; // ~15 min at 3s
 
@@ -766,11 +780,11 @@ class SellerOrderHandler {
           for (const t of texts) {
             if (!this.otpPollers[orderNo]) break;
             if (processed.has(String(t.id))) continue;
-            // Skip messages sent before we prompted (avoids stale replies).
-            if (t.createTime && t.createTime < startedAt - 5000) {
-              processed.add(String(t.id));
-              continue;
-            }
+            // NOTE: we deliberately do NOT skip "old" messages by timestamp — if
+            // the buyer sent their mobile/OTP before the poller (re)started (e.g.
+            // after a server restart), a timestamp filter would wrongly ignore it.
+            // The `processed` set + DB state (mobileNumber/otpCode) prevent any
+            // double-processing, so it's safe to handle every unprocessed message.
             processed.add(String(t.id));
 
             const result = await sellerOtpService.handleMessage(orderNo, t.content);
@@ -1131,25 +1145,22 @@ class SellerOrderHandler {
    */
   async handlePayment(orderNo) {
     try {
-      const order = this.stateManager.get(orderNo);
-      const adRules = await sellerOrderDbService.getAdRules(order.adNo);
+      // Read adNo/adRules from the DB — the in-memory state manager is empty after
+      // a restart, which would break the Method 3 branch.
+      const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+      const adNo = dbOrder?.ad_no || this.stateManager.get(orderNo)?.adNo;
+      const adRules = adNo ? await sellerOrderDbService.getAdRules(adNo) : null;
 
-      // ===== METHOD 1/2: BINANCE AUTOMATIC =====
-      if (!adRules.method3_full_enabled) {
-        logger.info(`[${orderNo}] Waiting for Binance payment (auto)...`);
-
-        // Wait for payment webhook from Binance
-        // Or poll order status
-        // Then send thank you message
-
-        await this.waitForBinancePayment(orderNo);
+      // ===== METHOD 3: PAYMENT GATEWAY =====
+      if (adRules?.method3_full_enabled) {
+        logger.info(`[${orderNo}] Method 3 — starting payment gateway flow`);
+        await this.startMethod3Payment(orderNo, adRules);
         return;
       }
 
-      // ===== METHOD 3: PAYMENT GATEWAY =====
-      logger.info(`[${orderNo}] Sending payment link (Method 3)...`);
-
-      await this.sendPaymentLink(orderNo, adRules);
+      // ===== METHOD 1/2: BINANCE AUTOMATIC =====
+      logger.info(`[${orderNo}] Waiting for Binance payment (auto)...`);
+      await this.waitForBinancePayment(orderNo);
 
     } catch (error) {
       logger.error(`Payment handling error: ${error.message}`, { orderNo });
@@ -1266,69 +1277,226 @@ class SellerOrderHandler {
   }
 
   /**
-   * METHOD 3: Send payment link
+   * ===== METHOD 3: PAYMENT GATEWAY FLOW (Easebuzz) =====
+   *
+   * Runs after the order is verified (liveness + docs [+ OTP]). Steps:
+   *   1. Tell the buyer the order is verified.
+   *   2. Create a payment link/QR for the EXACT order fiat amount (Easebuzz).
+   *   3. Send the link to the buyer in chat.
+   *   4. Poll the gateway for payment success.
+   *   5. On success: verify the payer name vs Binance KYC name where the gateway
+   *      provides it (card payments). If it MISMATCHES → send the refund message,
+   *      do NOT release. If it matches, or no payer name is available (UPI) → the
+   *      buyer already passed liveness+docs[+OTP], so proceed to release.
+   *   6. Release the crypto (checkIfCanReleaseCoin → releaseCoin). If Binance
+   *      needs 2FA / fails → mark READY_TO_RELEASE and alert for manual release.
    */
-  async sendPaymentLink(orderNo, adRules) {
+  async startMethod3Payment(orderNo, adRules) {
     try {
+      const gateway = (adRules.method3_payment_gateway || 'easebuzz').toLowerCase();
+      if (!paymentGatewayService.isSupported(gateway)) {
+        logger.error(`[${orderNo}] Method 3: unsupported gateway '${gateway}'`);
+        await sellerOrderDbService.recordError(orderNo, `Unsupported payment gateway: ${gateway}`);
+        return;
+      }
+
+      const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+      const amount = Number(dbOrder?.fiat_amount || dbOrder?.total_price || 0);
+      const fiat = dbOrder?.fiat_unit || 'INR';
+      const kycName = dbOrder?.buyer_kyc_name && dbOrder.buyer_kyc_name !== '(Unknown)'
+        ? dbOrder.buyer_kyc_name : 'Customer';
+      const phone = dbOrder?.mobile_number || null; // from OTP step if present
+
+      if (!amount || amount <= 0) {
+        logger.error(`[${orderNo}] Method 3: order amount unavailable — cannot create payment`);
+        await sellerOrderDbService.recordError(orderNo, 'Method 3: order amount unavailable');
+        return;
+      }
+
+      // 1) Order verified message
+      await this._sendChat({
+        orderNo,
+        content: await sellerMessageService.get(
+          'seller_m3_order_verified_pay',
+          { amount, fiat },
+          `Your order is verified. Please complete the payment of ${amount} ${fiat} using the link below.`
+        ),
+      });
+
+      // 2) Create the payment link
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.PAYMENT_LINK_SENT);
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.PAYMENT_LINK_SENT);
 
-      logger.info(`[${orderNo}] Generating payment link...`);
-
-      // Generate payment link
-      const linkResult = await sellerVerificationService.generatePaymentLink(
-        orderNo,
-        adRules.method3_payment_gateway,
-        adRules.method3_delivery_method
-      );
-
-      if (!linkResult.success) {
-        throw new Error(`Failed to generate payment link: ${linkResult.reason}`);
-      }
-
-      // Send to buyer
-      const message = adRules.method3_delivery_method === 'qr_code'
-        ? 'Please scan the QR code below to complete payment:'
-        : 'Please click the link below to complete payment:';
-
-      await this._sendChat({
-        orderNo,
-        content: `${message}\n\n${linkResult.link || linkResult.qrCode}`,
-        msgType: adRules.method3_delivery_method === 'qr_code' ? 'IMAGE' : 'TEXT'
+      const linkRes = await paymentGatewayService.createLink(gateway, {
+        orderNo, amount, name: kycName, phone,
       });
 
-      await sellerOrderDbService.recordPaymentLinkSent(orderNo);
+      if (!linkRes.success || !linkRes.link) {
+        logger.error(`[${orderNo}] Method 3: link creation failed`, { detail: linkRes.message });
+        await this._sendChat({
+          orderNo,
+          content: await sellerMessageService.get('seller_m3_link_failed', {},
+            'We could not generate the payment link right now. Please wait a moment or contact support.'),
+        });
+        await sellerOrderDbService.recordError(orderNo, `Payment link failed: ${linkRes.message || 'unknown'}`);
+        return;
+      }
 
-      // Start listening for payment webhook
-      await this.waitForPaymentWebhook(orderNo);
+      await sellerOrderDbService.savePaymentLink(orderNo, {
+        gateway, link: linkRes.link, merchantTxn: linkRes.merchantTxn, amount,
+      });
+
+      // 3) Send the link to the buyer
+      await this._sendChat({
+        orderNo,
+        content: await sellerMessageService.get(
+          'seller_m3_payment_link',
+          { link: linkRes.link, amount, fiat },
+          `Pay ${amount} ${fiat} here: ${linkRes.link}`
+        ),
+      });
+
+      // 4) Poll the gateway for payment
+      await this.pollGatewayPayment(orderNo, gateway, linkRes.merchantTxn, kycName);
 
     } catch (error) {
-      logger.error(`Payment link error: ${error.message}`, { orderNo });
+      logger.error(`Method 3 payment start error: ${error.message}`, { orderNo });
+      await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /** Poll the payment gateway until the buyer pays (or the window ends). */
+  async pollGatewayPayment(orderNo, gateway, merchantTxn, kycName) {
+    if (this.gatewayPollers[orderNo]) return;
+
+    this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
+    await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
+
+    let pollCount = 0;
+    let busy = false;
+    const INTERVAL = Number(process.env.SELLER_GATEWAY_POLL_INTERVAL) || 10000; // 10s
+    const MAX_POLLS = Number(process.env.SELLER_GATEWAY_MAX_POLLS) || 360;       // ~1h at 10s
+
+    const poll = setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        pollCount++;
+        const st = await paymentGatewayService.getStatus(gateway, merchantTxn);
+        if (!st.success) { if (pollCount % 12 === 0) logger.debug(`[${orderNo}] gateway status err: ${st.message}`); return; }
+
+        if (st.paid) {
+          logger.info(`[${orderNo}] 💰 Payment received (${gateway})`, { easepayid: st.easepayid, mode: st.mode, payer: st.payerName });
+          this.stopGatewayPolling(orderNo);
+          await sellerOrderDbService.recordPaymentConfirmed(orderNo, {
+            status: st.status, easepayid: st.easepayid, payerName: st.payerName, mode: st.mode,
+          });
+          await this._sendChat({
+            orderNo,
+            content: await sellerMessageService.get('seller_m3_payment_received', {},
+              'Payment received. Verifying your payment, please wait...'),
+          });
+          await this.verifyPaymentAndRelease(orderNo, kycName, st.payerName);
+          return;
+        }
+
+        if (pollCount >= MAX_POLLS) {
+          logger.info(`[${orderNo}] Method 3 payment window ended (timeout)`);
+          this.stopGatewayPolling(orderNo);
+          this.stateManager.setState(orderNo, SELLER_ORDER_STATES.PAYMENT_TIMEOUT);
+          await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.PAYMENT_TIMEOUT, 'gateway payment timeout');
+        }
+      } catch (err) {
+        logger.error(`[${orderNo}] gateway poll error: ${err.message}`);
+      } finally {
+        busy = false;
+      }
+    }, INTERVAL);
+
+    this.gatewayPollers[orderNo] = poll;
+  }
+
+  stopGatewayPolling(orderNo) {
+    if (this.gatewayPollers[orderNo]) {
+      clearInterval(this.gatewayPollers[orderNo]);
+      delete this.gatewayPollers[orderNo];
+    }
+  }
+
+  /**
+   * Payment confirmed → decide whether to release the crypto.
+   * - payerName present + MISMATCH → refund message, no release.
+   * - payerName present + match, OR payerName absent (UPI) → release
+   *   (buyer already passed liveness + documents [+ OTP]).
+   */
+  async verifyPaymentAndRelease(orderNo, kycName, payerName) {
+    try {
+      console.log(`\n💳 [${orderNo}] Method 3 payment verify:`);
+      console.log(`    Binance KYC name : ${kycName}`);
+      console.log(`    Gateway payer    : ${payerName || '(none — likely UPI)'}`);
+
+      if (payerName && kycName && kycName !== 'Customer') {
+        const m = matchNames(kycName, payerName);
+        console.log(`    name match       : ${m.matched ? '✅ MATCH' : '❌ MISMATCH'}`);
+        if (!m.matched) {
+          logger.warn(`[${orderNo}] Method 3: payer name mismatch — NOT releasing`, { kycName, payerName });
+          await this._sendChat({
+            orderNo,
+            content: await sellerMessageService.get('seller_m3_name_mismatch_refund', { kycName, payerName },
+              'Your Binance KYC name and the bank account holder name did not match. Your amount will be refunded within 48 hours. Kindly cancel the order.'),
+          });
+          this.stateManager.setState(orderNo, SELLER_ORDER_STATES.REJECTED);
+          await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.REJECTED, 'Method 3: payer name mismatch');
+          return;
+        }
+        logger.info(`[${orderNo}] Method 3: payer name matched KYC`, { kycName, payerName });
+      } else {
+        console.log(`    decision         : no gateway payer name → release on prior verification (liveness+docs${''})`);
+        logger.info(`[${orderNo}] Method 3: no payer name from gateway (likely UPI) — proceeding on prior verification`);
+      }
+
+      console.log(`    → releasing crypto...`);
+      await this.releaseCryptoForOrder(orderNo);
+    } catch (error) {
+      logger.error(`[${orderNo}] verifyPaymentAndRelease error: ${error.message}`);
       await sellerOrderDbService.recordError(orderNo, error.message);
     }
   }
 
   /**
-   * METHOD 3: Wait for payment webhook
+   * Release the crypto on Binance (checkIfCanReleaseCoin → releaseCoin). On any
+   * failure (e.g. Binance requires a 2FA code) mark READY_TO_RELEASE for manual
+   * release rather than forcing it.
    */
-  async waitForPaymentWebhook(orderNo) {
+  async releaseCryptoForOrder(orderNo) {
     try {
-      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
-      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
+      const check = await sellerBinanceService.checkIfCanReleaseCoin(orderNo);
+      if (!check.success || !check.canRelease) {
+        logger.warn(`[${orderNo}] Cannot release yet (canRelease=${check.canRelease}) — marking READY_TO_RELEASE`);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (checkIfCanReleaseCoin=false)');
+        return;
+      }
 
-      logger.info(`[${orderNo}] Waiting for payment webhook...`);
+      const rel = await sellerBinanceService.releaseCoin(orderNo);
+      if (!rel.success) {
+        logger.error(`[${orderNo}] releaseCoin failed — manual release needed`, { code: rel.code, message: rel.message });
+        await sellerOrderDbService.recordError(orderNo, `releaseCoin failed: ${rel.message || rel.code}`);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (releaseCoin failed)');
+        return;
+      }
 
-      // Set timeout
-      const timeout = setTimeout(async () => {
-        logger.warn(`[${orderNo}] Payment webhook timeout!`);
-        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.PAYMENT_TIMEOUT);
-        delete this.paymentTimers[orderNo];
-      }, 86400000); // 24 hours
-
-      this.paymentTimers[orderNo] = timeout;
-
+      logger.info(`[${orderNo}] ✅ Crypto released`);
+      await sellerOrderDbService.recordCryptoReleased(orderNo);
+      await this._sendChat({
+        orderNo,
+        content: await sellerMessageService.get('seller_m3_released', {},
+          'Payment verified successfully. Your crypto has been released. Thank you for trading with us!'),
+      });
+      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.COMPLETED);
+      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.COMPLETED);
     } catch (error) {
-      logger.error(`Payment webhook wait error: ${error.message}`, { orderNo });
+      logger.error(`[${orderNo}] releaseCryptoForOrder error: ${error.message}`);
+      await sellerOrderDbService.recordError(orderNo, error.message);
     }
   }
 

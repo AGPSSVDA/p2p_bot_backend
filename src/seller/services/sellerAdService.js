@@ -150,8 +150,15 @@ class SellerAdService {
         method3_payment_link_enabled: rulesData.method3_payment_link_enabled !== undefined
           ? rulesData.method3_payment_link_enabled === true
           : (existingRules?.method3_payment_link_enabled === 1 || existingRules?.method3_payment_link_enabled === true),
-        method3_payment_gateway: rulesData.method3_payment_gateway || existingRules?.method3_payment_gateway || 'razorpay',
-        method3_delivery_method: rulesData.method3_delivery_method || existingRules?.method3_delivery_method || 'payment_link'
+        method3_payment_gateway: rulesData.method3_payment_gateway || existingRules?.method3_payment_gateway || 'easebuzz',
+        method3_delivery_method: rulesData.method3_delivery_method || existingRules?.method3_delivery_method || 'payment_link',
+        // Per-ad re-order cooldown (default OFF; hours default 24 when enabled).
+        reorder_cooldown_enabled: rulesData.reorder_cooldown_enabled !== undefined
+          ? rulesData.reorder_cooldown_enabled === true
+          : (existingRules?.reorder_cooldown_enabled === 1 || existingRules?.reorder_cooldown_enabled === true),
+        reorder_cooldown_hours: rulesData.reorder_cooldown_hours !== undefined && Number(rulesData.reorder_cooldown_hours) > 0
+          ? Math.round(Number(rulesData.reorder_cooldown_hours))
+          : (existingRules?.reorder_cooldown_hours || 24)
       };
 
       await sellerOrderDbService.upsertAdRules(sellerId, adNo, updateData);

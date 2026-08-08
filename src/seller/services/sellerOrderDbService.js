@@ -503,6 +503,59 @@ class SellerOrderDbService {
     return row ? row.n : null;
   }
 
+  // ===== METHOD 3: PAYMENT GATEWAY =====
+
+  /** Save the created payment link + gateway + merchant txn id. */
+  async savePaymentLink(orderNumber, { gateway, link, merchantTxn, amount }) {
+    return safe(
+      pool.query(
+        `UPDATE seller_orders
+           SET payment_gateway = ?, payment_link = ?, payment_txn_id = ?,
+               payment_amount = ?, payment_link_sent_at = NOW()
+         WHERE order_number = ?`,
+        [gateway, link || null, merchantTxn || null, amount != null ? amount : null, orderNumber]
+      ),
+      `savePaymentLink:${orderNumber}`
+    );
+  }
+
+  /** Record a confirmed payment (status/easepayid/payer name/mode). */
+  async recordPaymentConfirmed(orderNumber, { status, easepayid, payerName, mode }) {
+    return safe(
+      pool.query(
+        `UPDATE seller_orders
+           SET payment_status = ?, payment_easepayid = ?, payment_payer_name = ?,
+               payment_mode = ?, payment_received_at = NOW()
+         WHERE order_number = ?`,
+        [status || null, easepayid || null, payerName || null, mode || null, orderNumber]
+      ),
+      `recordPaymentConfirmed:${orderNumber}`
+    );
+  }
+
+  /** Mark that the crypto was released. */
+  async recordCryptoReleased(orderNumber) {
+    return safe(
+      pool.query('UPDATE seller_orders SET crypto_released_at = NOW() WHERE order_number = ?', [orderNumber]),
+      `recordCryptoReleased:${orderNumber}`
+    );
+  }
+
+  /** Read the stored payment gateway + merchant txn for an order. */
+  async getPaymentInfo(orderNumber) {
+    const [[row]] = await pool.query(
+      `SELECT payment_gateway, payment_txn_id, payment_amount, payment_status
+         FROM seller_orders WHERE order_number = ?`,
+      [orderNumber]
+    );
+    return {
+      gateway: row?.payment_gateway || null,
+      merchantTxn: row?.payment_txn_id || null,
+      amount: row?.payment_amount != null ? Number(row.payment_amount) : null,
+      status: row?.payment_status || null,
+    };
+  }
+
   // ===== STEP 4: ORDER VERIFICATION =====
 
   async recordOrderVerifyAttempted(orderNumber) {
@@ -792,8 +845,9 @@ class SellerOrderDbService {
         method1_liveness_enabled, method2_documents_enabled,
         method2_mobile_verification_enabled, method3_full_enabled,
         method3_mobile_verification_enabled, method3_payment_link_enabled,
-        method3_payment_gateway, method3_delivery_method
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        method3_payment_gateway, method3_delivery_method,
+        reorder_cooldown_enabled, reorder_cooldown_hours
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         min_30day_trades_enabled = VALUES(min_30day_trades_enabled),
         min_30day_trades = VALUES(min_30day_trades),
@@ -825,6 +879,8 @@ class SellerOrderDbService {
         method3_payment_link_enabled = VALUES(method3_payment_link_enabled),
         method3_payment_gateway = VALUES(method3_payment_gateway),
         method3_delivery_method = VALUES(method3_delivery_method),
+        reorder_cooldown_enabled = VALUES(reorder_cooldown_enabled),
+        reorder_cooldown_hours = VALUES(reorder_cooldown_hours),
         updated_at = NOW()
     `;
 
@@ -849,7 +905,9 @@ class SellerOrderDbService {
         rulesData.method3_mobile_verification_enabled,
         rulesData.method3_payment_link_enabled,
         rulesData.method3_payment_gateway,
-        rulesData.method3_delivery_method
+        rulesData.method3_delivery_method,
+        rulesData.reorder_cooldown_enabled ? 1 : 0,
+        Number(rulesData.reorder_cooldown_hours) > 0 ? Math.round(Number(rulesData.reorder_cooldown_hours)) : 24
       ]),
       `upsertAdRules:${adNo}`
     );

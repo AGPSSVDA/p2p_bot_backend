@@ -148,9 +148,16 @@ class SellerOrderPoller {
         ads: ads.map(a => a.ad_no)
       });
 
-      // Step 2: Poll each ad separately
+      // Fetch Binance orders ONCE per cycle — getPendingSellOrders returns orders
+      // for ALL of the seller's ads, so calling it per-ad multiplied the request
+      // count by the ad count and tripped Binance's -1003 rate limit. We fetch
+      // once and filter per ad below.
+      const allOrders = await this.fetchOrdersFromBinance();
+      console.log(`[SellerPoller] 📦 Got ${allOrders.length} total order(s) from Binance for ${ads.length} ad(s)`);
+
+      // Step 2: Process each ad against the already-fetched order list.
       for (const ad of ads) {
-        await this.pollOrdersForAd(ad);
+        await this.pollOrdersForAd(ad, allOrders);
       }
 
     } catch (error) {
@@ -166,7 +173,7 @@ class SellerOrderPoller {
    * 2. Poll Binance for orders on this ad
    * 3. For each order: apply ad-specific rules
    */
-  async pollOrdersForAd(ad) {
+  async pollOrdersForAd(ad, allOrders) {
     try {
       logger.debug(`📊 Polling orders for ad: ${ad.ad_no}`);
 
@@ -192,16 +199,14 @@ class SellerOrderPoller {
         });
       }
 
-      // Step 2: Poll Binance for orders on this specific ad
-      // Binance returns orders for ALL ads, so we filter by ad_no
-      const allOrders = await this.fetchOrdersFromBinance();
+      // Step 2: Filter the already-fetched order list for THIS ad.
+      // (Orders are fetched ONCE per cycle in pollAllAds — Binance returns orders
+      // for all ads in a single call, so we must not call the API per ad.)
+      allOrders = allOrders || [];
 
       if (allOrders.length === 0) {
-        console.log(`[SellerPoller] 📭 No orders found in Binance for ad ${ad.ad_no}`);
         return;
       }
-
-      console.log(`[SellerPoller] 📦 Got ${allOrders.length} total orders from Binance`);
 
       // Filter: only orders for THIS ad
       // Try multiple field names since Binance response might vary

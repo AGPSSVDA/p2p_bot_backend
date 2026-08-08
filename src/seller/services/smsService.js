@@ -41,7 +41,7 @@ const DEFAULT_URL = 'http://retailsms.nettyfish.com/api/mt/SendSMS';
 // Override via SMS_OTP_TEMPLATE. The gateway rejects text that doesn't match the
 // registered DLT template.
 const DEFAULT_OTP_TEMPLATE =
-  'Your OTP for mobile number verification is {otp}. This code is valid for 10 minutes. Do not share this OTP with anyone.';
+  'AGPSS_GLOBAL_PVT: Your OTP for mobile number verification is {otp}. This code is valid for 10 minutes. Do not share this OTP with anyone.';
 
 /** Build the OTP message text (env template with {otp} filled). */
 function otpMessage(otp) {

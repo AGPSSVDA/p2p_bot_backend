@@ -176,6 +176,10 @@ class SellerAdsController {
               paymentGateway: ad.rules?.method3_payment_gateway || 'razorpay',
               deliveryMethod: ad.rules?.method3_delivery_method || 'payment_link'
             }
+          },
+          cooldown: {
+            enabled: ad.rules?.reorder_cooldown_enabled === 1 || ad.rules?.reorder_cooldown_enabled === true,
+            hours: ad.rules?.reorder_cooldown_hours || 24
           }
         },
         summary: ad.rules ? sellerAdService.getRuleSummary(ad.rules) : { methods: '', minTradesCount: 0, minCompletionRate: 0, minRegisteredDays: 0 }
@@ -300,6 +304,10 @@ class SellerAdsController {
               paymentGateway: ad.rules.method3_payment_gateway,
               deliveryMethod: ad.rules.method3_delivery_method
             }
+          },
+          cooldown: {
+            enabled: ad.rules.reorder_cooldown_enabled === 1 || ad.rules.reorder_cooldown_enabled === true,
+            hours: ad.rules.reorder_cooldown_hours || 24
           }
         }
       };

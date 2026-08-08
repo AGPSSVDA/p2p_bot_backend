@@ -88,7 +88,8 @@ function invalidate() {
 //  These are the {tokens} the bot fills at send time.
 // ─────────────────────────────────────────────────────────────────────────────
 const TEMPLATE_VARIABLES = [
-  { name: 'hours',       example: '12',           description: '24h-cooldown: hours left before the buyer can order again' },
+  { name: 'hours',       example: '12',           description: 'Re-order cooldown: hours LEFT before the buyer can order again' },
+  { name: 'cooldownHours', example: '24',         description: 'Re-order cooldown: the configured cooldown window (hours)' },
   { name: 'docType',     example: 'Aadhaar',      description: 'Document being verified (Aadhaar / PAN)' },
   { name: 'kycName',     example: 'RAHUL SHARMA',  description: "Buyer's Binance KYC name" },
   { name: 'docName',     example: 'RAHUL SHARMA',  description: 'Name extracted from the uploaded document' },
@@ -97,6 +98,10 @@ const TEMPLATE_VARIABLES = [
   { name: 'reason',      example: 'PAN inactive', description: 'PAN verification failure reason (Surepass)' },
   { name: 'missing',     example: 'Aadhaar back, PAN card', description: 'List of documents still pending' },
   { name: 'mobile',      example: '7210',         description: 'Last 4 digits of the buyer\'s mobile (OTP-sent message)' },
+  { name: 'amount',      example: '210',          description: 'Method 3: order fiat amount to pay' },
+  { name: 'fiat',        example: 'INR',          description: 'Method 3: fiat currency' },
+  { name: 'link',        example: 'https://…',    description: 'Method 3: payment link/QR URL' },
+  { name: 'payerName',   example: 'RAHUL SHARMA', description: 'Method 3: payer bank/card name (mismatch message)' },
   { name: 'orderNo',     example: '22899…416',    description: 'Binance order number' },
 ];
 

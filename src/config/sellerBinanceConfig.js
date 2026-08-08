@@ -28,6 +28,9 @@ const sellerBinanceConfig = {
     markPaid:        '/sapi/v1/c2c/orderMatch/markOrderAsPaid',
     cancelOrder:     '/sapi/v1/c2c/orderMatch/cancelOrder',
     canCancel:       '/sapi/v1/c2c/orderMatch/checkIfAllowedCancelOrder',
+    // Method 3: release crypto to the buyer after payment is verified.
+    checkCanRelease: '/sapi/v1/c2c/orderMatch/checkIfCanReleaseCoin',
+    releaseCoin:     '/sapi/v1/c2c/orderMatch/releaseCoin',
 
     // Chat
     chatCredential:  '/sapi/v1/c2c/chat/retrieveChatCredential',

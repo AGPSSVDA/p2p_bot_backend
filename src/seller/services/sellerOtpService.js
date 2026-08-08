@@ -81,7 +81,7 @@ async function handleMessage(orderNo, text) {
         const message = await sellerMessageService.get(
           'seller_otp_mobile_invalid',
           { attempt: n, maxAttempts: MAX_ATTEMPTS },
-          `That does not look like a valid 10-digit mobile number. Please send a valid 10-digit mobile number. (Attempt ${n}/${MAX_ATTEMPTS})`
+          `That does not look like a valid 10-digit mobile. Please send a valid 10-digit mobile. (Attempt ${n}/${MAX_ATTEMPTS})`
         );
         return res('invalid_mobile', message);
       }
@@ -145,7 +145,7 @@ async function sendOtpFor(orderNo, mobile) {
     const message = await sellerMessageService.get(
       'seller_otp_send_failed',
       {},
-      'We could not send the OTP right now. Please re-send your mobile number to try again.'
+      'We could not send the OTP right now. Please re-send your mobile to try again.'
     );
     return res('send_failed', message);
   }
@@ -154,7 +154,7 @@ async function sendOtpFor(orderNo, mobile) {
   const message = await sellerMessageService.get(
     'seller_otp_sent',
     { mobile: mobile.slice(-4) },
-    `An OTP has been sent to your mobile number ending ${mobile.slice(-4)}. Please enter the OTP here to verify.`
+    `An OTP has been sent to your mobile ending ${mobile.slice(-4)}. Please enter the OTP here to verify.`
   );
   return res('otp_sent', message);
 }
@@ -164,7 +164,7 @@ async function mobileRequestMessage() {
   return sellerMessageService.get(
     'seller_otp_mobile_request',
     {},
-    'Document verification done. Please send your 10-digit mobile number to receive an OTP for verification.'
+    'Document verification done. Please send your 10-digit mobile to receive an OTP for verification.'
   );
 }
 
