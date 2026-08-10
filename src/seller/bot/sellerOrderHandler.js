@@ -541,7 +541,11 @@ class SellerOrderHandler {
    * Processed images are marked in the DB so we never re-classify (re-bill) the
    * same image, even across a restart.
    */
-  async startMethod2Verification(orderNo) {
+  async startMethod2Verification(orderNo, options = {}) {
+    // `resuming` = true when the poller re-attaches after a restart. In that case
+    // the buyer was already asked to upload documents, so we must NOT re-send the
+    // entry prompt (that was the bug where the same message went out repeatedly).
+    const resuming = options.resuming === true;
     try {
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_DOCUMENTS);
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_DOCUMENTS);
@@ -589,17 +593,21 @@ class SellerOrderHandler {
       };
 
       // ---- Ask the buyer to upload the documents (once, on entry) ----
-      await this._sendChat({
-        orderNo,
-        content: await sellerMessageService.get(
-          'seller_doc_upload_request',
-          {},
-          'Liveness verified ✓\n\nPlease upload the following for document verification:\n' +
-            '1) Aadhaar card — front\n2) Aadhaar card — back\n3) PAN card\n\n' +
-            'You can send them in any order.'
-        ),
-        msgType: 'TEXT',
-      });
+      // Skip on resume (restart) — the buyer was already prompted; re-sending
+      // would spam them the same message again.
+      if (!resuming) {
+        await this._sendChat({
+          orderNo,
+          content: await sellerMessageService.get(
+            'seller_doc_upload_request',
+            {},
+            'Liveness verified ✓\n\nPlease upload the following for document verification:\n' +
+              '1) Aadhaar card — front\n2) Aadhaar card — back\n3) PAN card\n\n' +
+              'You can send them in any order.'
+          ),
+          msgType: 'TEXT',
+        });
+      }
 
       const pollInterval = setInterval(async () => {
         if (busy) return;
@@ -618,8 +626,9 @@ class SellerOrderHandler {
           // Process only images we haven't classified yet — one at a time.
           const pending = await sellerOrderDbService.getUnprocessedChatImages(orderNo);
           if (pending.length === 0) {
-            // Nothing new to process. Occasionally remind what's still missing.
-            if (pollCount % 20 === 0) {
+            // Nothing new to process. Remind what's still missing only occasionally
+            // (~every 5 min at 3s interval) so we don't spam the buyer.
+            if (pollCount > 0 && pollCount % 100 === 0) {
               const state = await sellerOrderDbService.getMethod2State(orderNo);
               const msg = await sellerMethod2Service.missingDocsMessage(state);
               if (msg) await sendOnce(msg);

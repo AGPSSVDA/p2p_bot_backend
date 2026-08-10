@@ -65,21 +65,51 @@ class SellerOrderPoller {
   /**
    * Resume Method 2 chat-image collection for orders stuck in WAITING_DOCUMENTS
    * (e.g. after a server restart).
+   *
+   * CRITICAL: only resume orders that are STILL ACTIVE on Binance right now. A DB
+   * row can sit in WAITING_DOCUMENTS forever after the order was cancelled/expired
+   * on Binance's side — resuming those would re-send "upload documents" to buyers
+   * whose order is long gone (the bug where old buyers got spammed on every
+   * deploy). We cross-check each pending order against Binance's live pending list
+   * and skip (and close out) anything that isn't there.
    */
-  async resumeDocumentCollection() {
+  async resumeDocumentCollection(liveOrders = null) {
     try {
       const pending = await sellerOrderDbService.getOrdersByState(
         SELLER_ORDER_STATES.WAITING_DOCUMENTS
       );
       if (!pending.length) return;
 
-      for (const order of pending) {
-        // Skip orders whose verification loop is already running — start only
-        // the ones that aren't being watched (log only those, to avoid spam).
-        if (this.orderHandler.documentPollers[order.order_number]) continue;
+      // Build the set of order numbers that are ACTIVE on Binance right now.
+      // Prefer a caller-supplied list (from the poll cycle); otherwise fetch once.
+      let live = liveOrders;
+      if (!live) {
+        try { live = await this.fetchOrdersFromBinance(); } catch { live = []; }
+      }
+      const activeOrderNos = new Set(
+        (live || []).map((o) => String(o.orderNumber || o.orderNo)).filter(Boolean)
+      );
 
-        console.log(`[SellerPoller] 🔄 Starting Method 2 verification for ${order.order_number} (ad ${order.ad_no})`);
-        await this.orderHandler.startMethod2Verification(order.order_number);
+      for (const order of pending) {
+        const orderNo = order.order_number;
+
+        // Already being watched — don't start a duplicate loop.
+        if (this.orderHandler.documentPollers[orderNo]) continue;
+
+        // Not active on Binance anymore → stale DB row. Do NOT message the buyer;
+        // close it out so it never gets re-picked.
+        if (!activeOrderNos.has(String(orderNo))) {
+          logger.info(`[SellerPoller] Skipping stale WAITING_DOCUMENTS order ${orderNo} — not active on Binance`);
+          await sellerOrderDbService.setOrderState(
+            orderNo,
+            SELLER_ORDER_STATES.REJECTED,
+            'Stale on resume — order no longer active on Binance'
+          );
+          continue;
+        }
+
+        console.log(`[SellerPoller] 🔄 Resuming Method 2 verification for ${orderNo} (ad ${order.ad_no}) — active on Binance`);
+        await this.orderHandler.startMethod2Verification(orderNo, { resuming: true });
       }
     } catch (error) {
       logger.error(`Failed to resume document verification: ${error.message}`, { error });
@@ -111,12 +141,12 @@ class SellerOrderPoller {
     if (!this.running) return;
 
     try {
-      await this.pollAllAds();
+      const liveOrders = await this.pollAllAds();
       // Also (re)start Method 2 verification for any order stuck in
-      // WAITING_DOCUMENTS that isn't already being watched. This recovers
-      // orders without needing a server restart — e.g. if the verification
-      // loop never started or was interrupted.
-      await this.resumeDocumentCollection();
+      // WAITING_DOCUMENTS that isn't already being watched — but ONLY if it's
+      // still active on Binance (resumeDocumentCollection cross-checks the live
+      // list, so stale orders never get re-messaged).
+      await this.resumeDocumentCollection(liveOrders);
     } catch (error) {
       logger.error(`Seller poller error: ${error.message}`, { error });
     }
@@ -160,9 +190,13 @@ class SellerOrderPoller {
         await this.pollOrdersForAd(ad, allOrders);
       }
 
+      // Return the live order list so resumeDocumentCollection can reuse it
+      // (avoids a second Binance fetch = stays under the rate limit).
+      return allOrders;
     } catch (error) {
       console.error(`[SellerPoller] ❌ Error polling ads:`, error.message);
       logger.error(`Error polling ads: ${error.message}`, { error });
+      return null;
     }
   }
 
