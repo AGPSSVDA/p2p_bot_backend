@@ -173,7 +173,7 @@ class SellerAdsController {
               enabled: ad.rules?.method3_full_enabled || false,
               mobileVerification: ad.rules?.method3_mobile_verification_enabled || false,
               paymentLink: ad.rules?.method3_payment_link_enabled || false,
-              paymentGateway: ad.rules?.method3_payment_gateway || 'razorpay',
+              paymentGateway: ad.rules?.method3_payment_gateway || 'easebuzz',
               deliveryMethod: ad.rules?.method3_delivery_method || 'payment_link'
             }
           },
@@ -443,7 +443,7 @@ class SellerAdsController {
             enabled: updatedAd.rules?.method3_full_enabled === 1 || updatedAd.rules?.method3_full_enabled === true,
             mobileVerification: updatedAd.rules?.method3_mobile_verification_enabled === 1 || updatedAd.rules?.method3_mobile_verification_enabled === true,
             paymentLink: updatedAd.rules?.method3_payment_link_enabled === 1 || updatedAd.rules?.method3_payment_link_enabled === true,
-            paymentGateway: updatedAd.rules?.method3_payment_gateway || 'razorpay',
+            paymentGateway: updatedAd.rules?.method3_payment_gateway || 'easebuzz',
             deliveryMethod: updatedAd.rules?.method3_delivery_method || 'payment_link'
           }
         }
@@ -575,7 +575,7 @@ class SellerAdsController {
             method3_full_enabled: asBool(methods.method3?.enabled),
             method3_mobile_verification_enabled: asBool(methods.method3?.mobileVerification),
             method3_payment_link_enabled: asBool(methods.method3?.paymentLink),
-            method3_payment_gateway: methods.method3?.paymentGateway || 'razorpay',
+            method3_payment_gateway: methods.method3?.paymentGateway || 'easebuzz',
             method3_delivery_method: methods.method3?.deliveryMethod || 'payment_link',
           }
         : {
@@ -585,7 +585,7 @@ class SellerAdsController {
             method3_full_enabled: asBool(req.body.method3_full_enabled),
             method3_mobile_verification_enabled: asBool(req.body.method3_mobile_verification_enabled),
             method3_payment_link_enabled: asBool(req.body.method3_payment_link_enabled),
-            method3_payment_gateway: req.body.method3_payment_gateway || 'razorpay',
+            method3_payment_gateway: req.body.method3_payment_gateway || 'easebuzz',
             method3_delivery_method: req.body.method3_delivery_method || 'payment_link',
           };
 

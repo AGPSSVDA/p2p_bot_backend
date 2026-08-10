@@ -816,7 +816,7 @@ class SellerOrderDbService {
       methods.method3_full_enabled ? 1 : 0,
       methods.method3_mobile_verification_enabled ? 1 : 0,
       methods.method3_payment_link_enabled ? 1 : 0,
-      methods.method3_payment_gateway || 'razorpay',
+      methods.method3_payment_gateway || 'easebuzz',
       methods.method3_delivery_method || 'payment_link',
     ]);
 

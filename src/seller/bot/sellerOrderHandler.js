@@ -1302,11 +1302,12 @@ class SellerOrderHandler {
    */
   async startMethod3Payment(orderNo, adRules) {
     try {
-      const gateway = (adRules.method3_payment_gateway || 'easebuzz').toLowerCase();
+      // Fall back to Easebuzz for any unconfigured/unsupported gateway (old ads
+      // still carry 'razorpay', which isn't wired) so Method 3 never dead-ends.
+      let gateway = (adRules.method3_payment_gateway || 'easebuzz').toLowerCase();
       if (!paymentGatewayService.isSupported(gateway)) {
-        logger.error(`[${orderNo}] Method 3: unsupported gateway '${gateway}'`);
-        await sellerOrderDbService.recordError(orderNo, `Unsupported payment gateway: ${gateway}`);
-        return;
+        logger.warn(`[${orderNo}] Method 3: gateway '${gateway}' not supported — falling back to easebuzz`);
+        gateway = 'easebuzz';
       }
 
       const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
