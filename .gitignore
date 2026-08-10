@@ -71,3 +71,6 @@ data/
 *.db
 order-state.json
 session-*.json
+
+# Server env dump (contains live credentials — never commit)
+server.env

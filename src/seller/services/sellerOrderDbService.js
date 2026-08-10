@@ -827,6 +827,26 @@ class SellerOrderDbService {
     return result.affectedRows >= 1;
   }
 
+  /**
+   * Update ONLY the re-order cooldown (DB-only — cooldown is a bot feature, NOT
+   * a Binance criterion, so this must never call the Binance API). Upsert so the
+   * rules row is created if the ad has none yet.
+   */
+  async updateAdCooldown(sellerId, adNo, { enabled, hours }) {
+    const en = enabled ? 1 : 0;
+    const hrs = Number(hours) > 0 ? Math.round(Number(hours)) : 24;
+    const [result] = await pool.query(
+      `INSERT INTO seller_ad_rules (seller_id, ad_no, reorder_cooldown_enabled, reorder_cooldown_hours)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         reorder_cooldown_enabled = VALUES(reorder_cooldown_enabled),
+         reorder_cooldown_hours = VALUES(reorder_cooldown_hours),
+         updated_at = NOW()`,
+      [sellerId, adNo, en, hrs]
+    );
+    return result.affectedRows >= 1;
+  }
+
   async upsertAdRules(sellerId, adNo, rulesData) {
     const query = `
       INSERT INTO seller_ad_rules (

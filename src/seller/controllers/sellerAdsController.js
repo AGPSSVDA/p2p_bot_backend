@@ -632,6 +632,46 @@ class SellerAdsController {
   }
 
   /**
+   * PUT /api/seller/ads/:adNo/cooldown
+   *
+   * Re-order cooldown is a BOT feature, not a Binance criterion — so this saves
+   * ONLY to our DB and NEVER calls the Binance API. (Previously the cooldown rode
+   * along with sync-eligibility, so a Binance sync failure also lost the cooldown.)
+   *
+   * Body: { enabled: boolean, hours: number }
+   */
+  async updateAdCooldown(req, res) {
+    try {
+      const sellerId = getSellerIdFromRequest(req);
+      const { adNo } = req.params;
+      const enabled = req.body.enabled === true || req.body.enabled === 1 || req.body.enabled === '1';
+      const hours = Number(req.body.hours) > 0 ? Math.round(Number(req.body.hours)) : 24;
+
+      console.log(`\n⏲️  [COOLDOWN] Updating re-order cooldown (DB only, no Binance call)`);
+      console.log(`   Ad No: ${adNo} | enabled: ${enabled} | hours: ${hours}`);
+
+      const ad = await sellerAdService.getAdWithRules(adNo);
+      if (!ad) {
+        return res.status(404).json({ success: false, error: 'Ad not found' });
+      }
+      if (ad.seller_id !== sellerId) {
+        return res.status(403).json({ success: false, error: 'Unauthorized access to this ad' });
+      }
+
+      const ok = await sellerOrderDbService.updateAdCooldown(sellerId, adNo, { enabled, hours });
+      if (!ok) {
+        return res.status(500).json({ success: false, error: 'Failed to save cooldown' });
+      }
+
+      logger.info('✅ Re-order cooldown updated', { sellerId, adNo, enabled, hours });
+      return res.json({ success: true, message: 'Re-order cooldown updated', adNo, cooldown: { enabled, hours } });
+    } catch (error) {
+      logger.error(`Update ad cooldown error: ${error.message}`, { error });
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  /**
    * POST /api/seller/ads/:adNo/sync-eligibility
    *
    * ELIGIBILITY ONLY. Syncs buyer-eligibility criteria to the Binance ad and,
@@ -719,16 +759,17 @@ class SellerAdsController {
       // Add eligibility criteria - include enabled AND send reset values for disabled ones
       console.log(`   Checking criteria...`);
 
-      // Min 30-day trades (userTradeCountMin)
+      // Min 30-day trades — Binance field is userTradeCompleteCountMin (NOT
+      // userTradeCountMin, which Binance silently ignores → criterion never set).
       if (isCriterionEnabled(rules.min30dayTrades)) {
         const val = getCriterionValue(rules.min30dayTrades);
         if (val) {
-          binancePayload.userTradeCountMin = safeInt(val);
-          binancePayload.userTradeCountFilterTime = 1;
-          console.log(`   ✅ Min 30-day trades: ${binancePayload.userTradeCountMin}`);
+          binancePayload.userTradeCompleteCountMin = safeInt(val);
+          binancePayload.userTradeCountFilterTime = 1; // 1 = last 30 days
+          console.log(`   ✅ Min 30-day trades: ${binancePayload.userTradeCompleteCountMin}`);
         }
       } else {
-        binancePayload.userTradeCountMin = 0;
+        binancePayload.userTradeCompleteCountMin = 0;
         console.log(`   🔄 Min 30-day trades: RESET TO 0 (disabled)`);
       }
 
@@ -748,14 +789,22 @@ class SellerAdsController {
         console.log(`   🔄 Min completion rate: RESET TO 0 (disabled)`);
       }
 
-      // Min registered days (buyerRegisterLimit)
+      // Min registered days — needs BOTH fields on Binance:
+      //   buyerRegDaysLimit  (0/1) = the ENABLE flag (without this=1 the days are ignored)
+      //   buyerRegisterLimit (days) = the actual value; Binance MAX is 180 days (hard cap)
       if (isCriterionEnabled(rules.minRegisteredDays)) {
-        const val = getCriterionValue(rules.minRegisteredDays);
-        if (val) {
-          binancePayload.buyerRegisterLimit = safeInt(val);
-          console.log(`   ✅ Min registered days: ${binancePayload.buyerRegisterLimit}`);
+        const val = safeInt(getCriterionValue(rules.minRegisteredDays));
+        if (val > 0) {
+          const days = Math.min(180, val); // Binance rejects > 180
+          binancePayload.buyerRegDaysLimit = 1;
+          binancePayload.buyerRegisterLimit = days;
+          console.log(`   ✅ Min registered days: ${days}${val > 180 ? ` (capped from ${val}; Binance max is 180)` : ''}`);
+        } else {
+          binancePayload.buyerRegDaysLimit = 0;
+          binancePayload.buyerRegisterLimit = 0;
         }
       } else {
+        binancePayload.buyerRegDaysLimit = 0;
         binancePayload.buyerRegisterLimit = 0;
         console.log(`   🔄 Min registered days: RESET TO 0 (disabled)`);
       }
@@ -1004,10 +1053,20 @@ class SellerAdsController {
       console.log(`\n❌ [SYNC] ERROR: ${error.message}`);
       console.log(`   Stack: ${error.stack}`);
       logger.error(`Sync eligibility to Binance error: ${error.message}`, { error });
-      res.status(500).json({
-        success: false,
-        error: error.message || 'Failed to sync eligibility criteria to Binance'
-      });
+
+      // Translate opaque Binance ad-lock errors into something actionable.
+      // 187040 / -9000 = Binance is refusing to update THIS ad (risk-control lock,
+      // frozen ad, or pending review) — not a config problem. Verified: the same
+      // request succeeds on other ads. Admin must edit/re-create the ad on Binance.
+      let friendly = error.message || 'Failed to sync eligibility criteria to Binance';
+      if (/187040|-9000/.test(String(error.message))) {
+        friendly =
+          "Binance is not allowing this ad to be updated right now (error 187040). " +
+          "This is a Binance-side restriction on this specific ad — not your settings. " +
+          "Try editing the ad directly in the Binance app; if that also fails, the ad may be " +
+          "under review/locked — create a new ad and set the criteria there.";
+      }
+      res.status(500).json({ success: false, error: friendly });
     }
   }
 }

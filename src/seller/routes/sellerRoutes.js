@@ -66,6 +66,11 @@ router.post('/ads/:adNo/sync-eligibility', (req, res) => sellerAdsController.syn
 // concept of them, so this never calls the Binance API.
 router.put('/ads/:adNo/methods', (req, res) => sellerAdsController.updateAdMethods(req, res));
 
+// PUT /api/seller/ads/:adNo/cooldown
+// COOLDOWN ONLY -> saves the re-order cooldown to our DB. Bot feature, NOT a
+// Binance criterion — never calls the Binance API.
+router.put('/ads/:adNo/cooldown', (req, res) => sellerAdsController.updateAdCooldown(req, res));
+
 // POST /api/seller/ads/:adNo/toggle
 router.post('/ads/:adNo/toggle', (req, res) => sellerAdsController.toggleAd(req, res));
 
