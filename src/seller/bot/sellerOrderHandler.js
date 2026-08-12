@@ -760,7 +760,8 @@ class SellerOrderHandler {
    * replies with in chat. All decision logic lives in sellerOtpService; this
    * poller just feeds it new buyer text messages and reacts to the result.
    */
-  async startOtpVerification(orderNo, kycName) {
+  async startOtpVerification(orderNo, kycName, options = {}) {
+    const resuming = options.resuming === true;
     try {
       if (this.otpPollers[orderNo]) {
         logger.debug(`[${orderNo}] OTP verification already running`);
@@ -771,21 +772,35 @@ class SellerOrderHandler {
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_MOBILE_OTP);
       await sellerOrderDbService.recordDocumentUploadRequested?.(orderNo, 'mobile');
 
-      // Ask for the mobile number (once, on entry).
-      await this._sendChat({
-        orderNo,
-        content: await sellerOtpService.mobileRequestMessage(),
-        msgType: 'TEXT',
-      });
-
       let pollCount = 0;
       let busy = false;
       let lastMessage = null;
       // Track which chat messages we've already handled so we never process one
-      // twice. We do NOT filter by timestamp — the buyer may have sent their
-      // mobile/OTP before this poller (re)started.
+      // twice.
       const processed = new Set();
       const MAX_POLLS = 300; // ~15 min at 3s
+
+      // BASELINE: mark every chat message that already exists BEFORE we ask for
+      // the mobile as "already seen", so earlier chit-chat ("bhai urgent hai",
+      // "payment link") is NOT treated as mobile/OTP attempts. On a fresh entry
+      // the buyer hasn't answered yet; only replies AFTER our prompt count. On a
+      // resume we DON'T baseline (the buyer may have replied before restart) —
+      // the DB state (mobileNumber/otpCode) prevents mis-processing there.
+      if (!resuming) {
+        try {
+          const existing = await sellerBinanceService.getBuyerTextMessages(orderNo);
+          for (const t of (existing.success ? existing.messages : [])) processed.add(String(t.id));
+        } catch (e) { /* ignore — worst case we process a couple of old msgs */ }
+      }
+
+      // Ask for the mobile number (once, on entry). Skip on resume.
+      if (!resuming) {
+        await this._sendChat({
+          orderNo,
+          content: await sellerOtpService.mobileRequestMessage(),
+          msgType: 'TEXT',
+        });
+      }
 
       const sendOnce = async (content) => {
         if (!content || content === lastMessage) return;
@@ -802,19 +817,17 @@ class SellerOrderHandler {
           const resTexts = await sellerBinanceService.getBuyerTextMessages(orderNo);
           const texts = resTexts.success ? resTexts.messages : [];
 
-          for (const t of texts) {
-            if (!this.otpPollers[orderNo]) break;
-            if (processed.has(String(t.id))) continue;
-            // NOTE: we deliberately do NOT skip "old" messages by timestamp — if
-            // the buyer sent their mobile/OTP before the poller (re)started (e.g.
-            // after a server restart), a timestamp filter would wrongly ignore it.
-            // The `processed` set + DB state (mobileNumber/otpCode) prevent any
-            // double-processing, so it's safe to handle every unprocessed message.
-            processed.add(String(t.id));
+          // Process only ONE new message per cycle (the oldest unprocessed one).
+          // The bug: when several buyer messages were pending at once, a single
+          // wrong reply got counted as 3 attempts and the buyer saw "Attempt
+          // 1/3, 2/3, 3/3, limit exceeded" all at the same time. Handling one
+          // message per 3s cycle makes each attempt a real, separate reply and
+          // gives the buyer time to correct it.
+          const next = texts.find((t) => !processed.has(String(t.id)));
+          if (next) {
+            processed.add(String(next.id));
 
-            const result = await sellerOtpService.handleMessage(orderNo, t.content);
-
-            if (result.status === 'ignored') continue;
+            const result = await sellerOtpService.handleMessage(orderNo, next.content);
 
             if (result.status === 'verified') {
               logger.info(`[${orderNo}] ✅ OTP verified — verifying order`);
@@ -834,7 +847,8 @@ class SellerOrderHandler {
             }
 
             // otp_sent / invalid_mobile / invalid_otp / send_failed → tell the buyer.
-            if (result.message) await sendOnce(result.message);
+            // ('ignored' → not a mobile/OTP-shaped reply; say nothing.)
+            if (result.status !== 'ignored' && result.message) await sendOnce(result.message);
             // A fresh OTP was just sent → allow its confirm text to repeat later.
             if (result.status === 'otp_sent') lastMessage = null;
           }

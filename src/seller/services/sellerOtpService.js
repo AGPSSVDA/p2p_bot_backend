@@ -76,6 +76,13 @@ async function handleMessage(orderNo, text) {
     if (!state.mobileNumber) {
       const mobile = parseMobile(text);
       if (!mobile) {
+        // Pure chit-chat with (almost) no digits ("payment link", "share kro",
+        // "bhai urgent hai") is NOT a mobile-number attempt — ignore it so it
+        // doesn't burn an attempt. Only count it as a wrong attempt when the
+        // buyer clearly tried to send a number (has several digits).
+        const digitCount = (String(text).match(/\d/g) || []).length;
+        if (digitCount < 5) return res('ignored');
+
         const n = await sellerOrderDbService.incrementOtpAttempt(orderNo, 'mobile');
         if (n > MAX_ATTEMPTS) return limitExceeded();
         const message = await sellerMessageService.get(
