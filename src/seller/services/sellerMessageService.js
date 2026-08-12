@@ -88,6 +88,7 @@ function invalidate() {
 //  These are the {tokens} the bot fills at send time.
 // ─────────────────────────────────────────────────────────────────────────────
 const TEMPLATE_VARIABLES = [
+  { name: 'otp',         example: '123456',       description: 'The OTP code (SMS OTP template — must keep {otp} where the code goes)' },
   { name: 'hours',       example: '12',           description: 'Re-order cooldown: hours LEFT before the buyer can order again' },
   { name: 'cooldownHours', example: '24',         description: 'Re-order cooldown: the configured cooldown window (hours)' },
   { name: 'docType',     example: 'Aadhaar',      description: 'Document being verified (Aadhaar / PAN)' },

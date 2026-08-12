@@ -38,15 +38,37 @@ const logger = require('../../utils/logger');
 
 const DEFAULT_URL = 'http://retailsms.nettyfish.com/api/mt/SendSMS';
 // Default matches the DLT-approved template ({otp} = the DLT {#var#} variable).
-// Override via SMS_OTP_TEMPLATE. The gateway rejects text that doesn't match the
-// registered DLT template.
+// The gateway REJECTS text that doesn't match the registered DLT template.
 const DEFAULT_OTP_TEMPLATE =
   'AGPSS_GLOBAL_PVT: Your OTP for mobile number verification is {otp}. This code is valid for 10 minutes. Do not share this OTP with anyone.';
 
-/** Build the OTP message text (env template with {otp} filled). */
-function otpMessage(otp) {
-  const tpl = process.env.SMS_OTP_TEMPLATE || DEFAULT_OTP_TEMPLATE;
-  return tpl.replace(/\{otp\}/g, otp);
+// Loaded lazily to avoid a require cycle (sellerMessageService → nothing heavy,
+// but keep it lazy anyway).
+let _sellerMessageService = null;
+function messageService() {
+  if (!_sellerMessageService) _sellerMessageService = require('./sellerMessageService');
+  return _sellerMessageService;
+}
+
+/**
+ * Build the OTP SMS text with {otp} filled.
+ * Priority: DB template (editable on the Chat Messages page) → env
+ * SMS_OTP_TEMPLATE → hardcoded default. The admin can edit the SMS text from the
+ * frontend, but it MUST stay identical to the DLT-approved template or the SMS
+ * gateway will reject it.
+ */
+async function otpMessage(otp) {
+  const envOrDefault = (process.env.SMS_OTP_TEMPLATE || DEFAULT_OTP_TEMPLATE);
+  let tpl = envOrDefault;
+  try {
+    // seller_sms_otp_template: the editable SMS text. Falls back to env/default.
+    tpl = await messageService().get('seller_sms_otp_template', {}, envOrDefault);
+  } catch (e) {
+    // If the DB lookup fails, keep the env/default so OTP still sends.
+    tpl = envOrDefault;
+  }
+  if (!tpl) tpl = envOrDefault;
+  return String(tpl).replace(/\{otp\}/g, otp);
 }
 
 /**
@@ -147,9 +169,10 @@ function tryParseJson(s) {
   }
 }
 
-/** Send an OTP SMS (builds the message from the env template). */
+/** Send an OTP SMS (builds the message from the editable template / env / default). */
 async function sendOtp(mobile10, otp) {
-  return sendSms(mobile10, otpMessage(otp));
+  const text = await otpMessage(otp);
+  return sendSms(mobile10, text);
 }
 
 module.exports = { sendSms, sendOtp, otpMessage };
