@@ -80,15 +80,25 @@ class SellerOrderDbService {
    */
   async getRecentCompletedOrderByBuyer(buyerId, excludeOrderNumber, hours = 24) {
     if (!buyerId) return null;
+    // "Completed" = the crypto was actually released to the buyer / the trade
+    // truly finished. In Method 3 the bot marks payment_received_at as soon as it
+    // detects the gateway payment, but the crypto is released LATER (often by the
+    // seller manually, because Binance requires 2FA). Cooldown must start only
+    // when the crypto is released — NOT on payment_received_at — otherwise the
+    // buyer is blocked before the trade is even finished. So we key off:
+    //   current_state = COMPLETED, crypto_released_at (Method 3 auto-release),
+    //   or thank_you_message_sent_at (Method 1/2 completion). NOT payment_received_at.
     const query = `
-      SELECT order_number, current_state, payment_received_at,
+      SELECT order_number, current_state, crypto_released_at,
              thank_you_message_sent_at, created_at, updated_at,
-             COALESCE(payment_received_at, thank_you_message_sent_at, updated_at) AS completed_at
+             COALESCE(crypto_released_at, thank_you_message_sent_at, updated_at) AS completed_at
       FROM seller_orders
       WHERE buyer_id = ?
         AND order_number <> ?
-        AND (current_state = 'COMPLETED' OR payment_received_at IS NOT NULL)
-        AND COALESCE(payment_received_at, thank_you_message_sent_at, updated_at)
+        AND (current_state = 'COMPLETED'
+             OR crypto_released_at IS NOT NULL
+             OR thank_you_message_sent_at IS NOT NULL)
+        AND COALESCE(crypto_released_at, thank_you_message_sent_at, updated_at)
               >= (NOW() - INTERVAL ? HOUR)
       ORDER BY completed_at DESC
       LIMIT 1
@@ -108,6 +118,25 @@ class SellerOrderDbService {
       LIMIT ? OFFSET ?
     `;
     const [rows] = await pool.query(query, [adNo, limit, offset]);
+    return rows;
+  }
+
+  /**
+   * Method 3 orders awaiting the seller's MANUAL crypto release: payment was
+   * received but the crypto hasn't been released yet (and the order isn't
+   * finished/cancelled). Used to re-attach the manual-release watcher after a
+   * restart so the cooldown still starts once the seller releases.
+   */
+  async getOrdersAwaitingManualRelease(limit = 50) {
+    const [rows] = await pool.query(
+      `SELECT order_number, ad_no FROM seller_orders
+        WHERE payment_received_at IS NOT NULL
+          AND crypto_released_at IS NULL
+          AND current_state NOT IN ('COMPLETED','REJECTED','CANCELLED')
+        ORDER BY payment_received_at ASC
+        LIMIT ?`,
+      [limit]
+    );
     return rows;
   }
 

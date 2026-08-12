@@ -1482,16 +1482,22 @@ class SellerOrderHandler {
     try {
       const check = await sellerBinanceService.checkIfCanReleaseCoin(orderNo);
       if (!check.success || !check.canRelease) {
-        logger.warn(`[${orderNo}] Cannot release yet (canRelease=${check.canRelease}) — marking READY_TO_RELEASE`);
+        logger.warn(`[${orderNo}] Cannot release yet (canRelease=${check.canRelease}) — waiting for manual release`);
         await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (checkIfCanReleaseCoin=false)');
+        this.pollForManualRelease(orderNo); // cooldown starts only after real release
         return;
       }
 
       const rel = await sellerBinanceService.releaseCoin(orderNo);
       if (!rel.success) {
-        logger.error(`[${orderNo}] releaseCoin failed — manual release needed`, { code: rel.code, message: rel.message });
+        // Auto-release failed (usually Binance requires a 2FA code). The seller
+        // will release manually on Binance — watch for it so we mark the order
+        // completed (and start the re-order cooldown) only once the crypto is
+        // ACTUALLY released, not on payment-received.
+        logger.error(`[${orderNo}] releaseCoin failed — seller must release manually`, { code: rel.code, message: rel.message });
         await sellerOrderDbService.recordError(orderNo, `releaseCoin failed: ${rel.message || rel.code}`);
         await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (releaseCoin failed)');
+        this.pollForManualRelease(orderNo);
         return;
       }
 
@@ -1508,6 +1514,56 @@ class SellerOrderHandler {
       logger.error(`[${orderNo}] releaseCryptoForOrder error: ${error.message}`);
       await sellerOrderDbService.recordError(orderNo, error.message);
     }
+  }
+
+  /**
+   * Method 3: the bot couldn't auto-release (Binance requires 2FA), so the SELLER
+   * releases the crypto manually on Binance. Poll the order status until Binance
+   * reports it COMPLETED (status 4 = paid + released), then mark our order
+   * completed and record crypto_released_at — this is what actually starts the
+   * re-order cooldown (NOT payment-received). Idempotent; survives restarts since
+   * the poller re-checks the DB state.
+   */
+  pollForManualRelease(orderNo) {
+    if (this.paymentTimers[`m3rel_${orderNo}`]) return; // already watching
+
+    let count = 0;
+    const INTERVAL = Number(process.env.SELLER_RELEASE_POLL_INTERVAL) || 15000; // 15s
+    const MAX = Number(process.env.SELLER_RELEASE_MAX_POLLS) || 5760;           // ~24h at 15s
+
+    const timer = setInterval(async () => {
+      count++;
+      try {
+        const st = await sellerBinanceService.getOrderStatusByOrderNumber(orderNo);
+        if (st?.success && st.orderStatus === 4) {
+          // Seller released → order truly complete.
+          logger.info(`[${orderNo}] ✅ Manual release detected (Binance status 4) — marking completed`);
+          clearInterval(timer);
+          delete this.paymentTimers[`m3rel_${orderNo}`];
+          await sellerOrderDbService.recordCryptoReleased(orderNo);
+          this.stateManager.setState(orderNo, SELLER_ORDER_STATES.COMPLETED);
+          await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.COMPLETED, 'Seller released crypto manually');
+          return;
+        }
+        // Order cancelled/appealed → stop watching (no cooldown).
+        if (st?.success && (st.orderStatus === 6 || st.orderStatus === 7)) {
+          logger.info(`[${orderNo}] Manual-release watch: order cancelled (status ${st.orderStatus}) — stop watching`);
+          clearInterval(timer);
+          delete this.paymentTimers[`m3rel_${orderNo}`];
+          return;
+        }
+        if (count >= MAX) {
+          clearInterval(timer);
+          delete this.paymentTimers[`m3rel_${orderNo}`];
+          logger.warn(`[${orderNo}] Manual-release watch timed out after ~24h`);
+        }
+      } catch (e) {
+        logger.debug(`[${orderNo}] manual-release poll error: ${e.message}`);
+      }
+    }, INTERVAL);
+
+    this.paymentTimers[`m3rel_${orderNo}`] = timer;
+    logger.info(`[${orderNo}] ⏳ Watching for seller's manual release (cooldown starts after release)`);
   }
 
   /**

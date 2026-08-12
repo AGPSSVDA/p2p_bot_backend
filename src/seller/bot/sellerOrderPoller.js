@@ -59,7 +59,31 @@ class SellerOrderPoller {
     // Resume watching orders that were left in WAITING_DOCUMENTS.
     this.resumeDocumentCollection();
 
+    // Also re-attach the Method 3 manual-release watcher for orders that were
+    // paid but not yet released (so the cooldown still starts on release).
+    this.resumeManualReleaseWatch();
+
     this.poll();
+  }
+
+  /**
+   * Re-attach the Method 3 manual-release watcher after a restart: for any order
+   * that was paid but whose crypto hasn't been released yet, start watching
+   * Binance so we mark it completed (and begin the cooldown) once the seller
+   * releases manually.
+   */
+  async resumeManualReleaseWatch() {
+    try {
+      const pending = await sellerOrderDbService.getOrdersAwaitingManualRelease();
+      for (const o of pending) {
+        this.orderHandler.pollForManualRelease(o.order_number);
+      }
+      if (pending.length) {
+        logger.info(`[SellerPoller] Re-attached manual-release watch for ${pending.length} Method 3 order(s)`);
+      }
+    } catch (error) {
+      logger.error(`Failed to resume manual-release watch: ${error.message}`, { error });
+    }
   }
 
   /**
