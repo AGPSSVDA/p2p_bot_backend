@@ -26,7 +26,10 @@
  */
 
 const logger = require('../../utils/logger');
-const { matchNames } = require('../../utils/helpers');
+// Seller uses a LOOSER name match than the buyer side: case-insensitive, and a
+// first-name OR last-name match (prefix-tolerant, e.g. "Firoj" ≈ "Firojabhai")
+// counts as a match. Buyer-side helpers.matchNames() is left untouched.
+const { matchNamesLoose: matchNames } = require('../utils/sellerUtils');
 const { verifyPAN } = require('../../services/panService');
 const openaiVision = require('./openaiVisionService');
 const sellerOrderDbService = require('./sellerOrderDbService');

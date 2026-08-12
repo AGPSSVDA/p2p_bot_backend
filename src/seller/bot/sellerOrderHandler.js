@@ -13,7 +13,9 @@ const sellerMethod2Service = require('../services/sellerMethod2Service');
 const sellerMessageService = require('../services/sellerMessageService');
 const sellerOtpService = require('../services/sellerOtpService');
 const paymentGatewayService = require('../services/paymentGatewayService');
-const { matchNames } = require('../../utils/helpers');
+// Loose (first-OR-last-name, case-insensitive) match for seller Method 3 payer
+// vs KYC. Buyer-side helpers.matchNames() is left untouched.
+const { matchNamesLoose: matchNames } = require('../utils/sellerUtils');
 
 class SellerOrderHandler {
   constructor() {
