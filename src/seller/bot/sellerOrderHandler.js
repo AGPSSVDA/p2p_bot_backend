@@ -62,9 +62,26 @@ class SellerOrderHandler {
   /**
    * Send a chat message to the buyer on an order — over the SELLER chat WSS with
    * the SELLER key (sellerChatService). Accepts the object form { orderNo, content }.
+   *
+   * GUARD: once an order is finished (CANCELLED / REJECTED / COMPLETED) the bot
+   * must go SILENT — no more replies, no matter what the buyer types. Otherwise a
+   * buyer can keep chatting a dead order and get the bot to respond. We check the
+   * order's current state right before sending and drop the message if it's over.
    */
   async _sendChat({ orderNo, content }) {
     if (!content) return { success: false, message: 'empty content' };
+    try {
+      const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+      const st = dbOrder?.current_state;
+      if (st === SELLER_ORDER_STATES.CANCELLED ||
+          st === SELLER_ORDER_STATES.REJECTED ||
+          st === SELLER_ORDER_STATES.COMPLETED) {
+        logger.info(`[${orderNo}] Chat send skipped — order is ${st} (bot silent on finished orders)`);
+        return { success: false, message: `order ${st}` };
+      }
+    } catch (e) {
+      // If the state read fails, fall through and send (don't block on a DB hiccup).
+    }
     try {
       const res = await sellerChatService.send(orderNo, content);
       if (!res?.success) {
@@ -357,7 +374,12 @@ class SellerOrderHandler {
       // Message will only be sent AFTER payment is complete (thank you message)
 
       let pollCount = 0;
-      const MAX_POLLS = 100; // ~5 minutes with 3-second interval
+      // Keep polling while the ORDER is still active on Binance — the buyer has
+      // until Binance's own deadline to complete liveness. The bot stops (and
+      // stays silent) once Binance cancels the order. MAX_POLLS is just a backstop
+      // so an interval can't leak forever: default 600 polls = 30 min at 3s
+      // (override with SELLER_LIVENESS_MAX_POLLS).
+      const MAX_POLLS = Number(process.env.SELLER_LIVENESS_MAX_POLLS) || 600;
 
       // Start polling - PRIMARY signal is the Binance chat system message
       // "liveness_check_complete_maker". The additionalKycVerify field is NOT
@@ -375,63 +397,48 @@ class SellerOrderHandler {
               messageType: livenessCheck.messageType
             });
 
-            clearInterval(this.livenessPollers[orderNo]);
-            delete this.livenessPollers[orderNo];
-            if (this.livenessTimers[orderNo]) {
-              clearTimeout(this.livenessTimers[orderNo]);
-              delete this.livenessTimers[orderNo];
-            }
-
+            this._clearLivenessTimers(orderNo);
             await this.onLivenessCompleted(orderNo);
             return;
           }
 
           // ===== SECONDARY: honor additionalKycVerify if it happens to update =====
-          // (0 = not required -> proceed; 2 = verified -> proceed). Best-effort.
+          // (0 = not required -> proceed; 2 = verified -> proceed). Also read the
+          // order status so we can stop if Binance cancelled the order.
           const orderStatus = await sellerBinanceService.getOrderStatusByOrderNumber(orderNo);
           const kycStatus = orderStatus?.success ? orderStatus.additionalKycVerify : undefined;
+          const oStatus = orderStatus?.success ? orderStatus.orderStatus : undefined;
 
           if (kycStatus === 0 || kycStatus === 2) {
             console.log(`[${orderNo}] ✅ Proceeding via additionalKycVerify=${kycStatus} (after ${pollCount} polls)`);
             logger.info(`[${orderNo}] Proceeding via additionalKycVerify=${kycStatus}`);
 
-            clearInterval(this.livenessPollers[orderNo]);
-            delete this.livenessPollers[orderNo];
-            if (this.livenessTimers[orderNo]) {
-              clearTimeout(this.livenessTimers[orderNo]);
-              delete this.livenessTimers[orderNo];
-            }
-
+            this._clearLivenessTimers(orderNo);
             await this.onLivenessCompleted(orderNo);
             return;
           }
 
-          // Still pending
-          if (pollCount % 10 === 0 || pollCount <= 3) {
-            console.log(`[${orderNo}] ⏳ Poll #${pollCount}: Liveness still pending (no chat signal, additionalKycVerify=${kycStatus})`);
+          // ===== STOP ONLY when Binance cancelled the order (6/7) =====
+          // Until then, the buyer still has time — keep waiting silently, do NOT
+          // send a "cancelled/timeout" message.
+          if (oStatus === 6 || oStatus === 7) {
+            console.log(`[${orderNo}] Order cancelled on Binance (status ${oStatus}) — stopping liveness watch`);
+            logger.info(`[${orderNo}] Order cancelled on Binance during liveness wait (status ${oStatus})`);
+            this._clearLivenessTimers(orderNo);
+            this.stateManager.setState(orderNo, SELLER_ORDER_STATES.CANCELLED);
+            await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.CANCELLED, `Order cancelled on Binance (status ${oStatus}) during liveness wait`);
+            return;
           }
 
-          // Timeout
+          // Still pending — just wait. No message to the buyer.
+          if (pollCount % 20 === 0 || pollCount <= 3) {
+            console.log(`[${orderNo}] ⏳ Poll #${pollCount}: Liveness still pending (additionalKycVerify=${kycStatus}, orderStatus=${oStatus})`);
+          }
+
+          // Hard backstop only (should basically never hit — Binance cancels first).
           if (pollCount >= MAX_POLLS) {
-            console.log(`[${orderNo}] ⏱️  Timeout: Max polls (${MAX_POLLS}) reached - liveness not completed`);
-            logger.warn(`[${orderNo}] Timeout: Liveness did not complete within ${MAX_POLLS} polls (~5 minutes)`);
-
-            clearInterval(this.livenessPollers[orderNo]);
-            delete this.livenessPollers[orderNo];
-
-            this.stateManager.setState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
-            await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
-
-            await this._sendChat({
-              orderNo,
-              content: await sellerMessageService.get('seller_liveness_timeout', {}, 'Liveness check timeout. Your order has been cancelled. Please try again.'),
-              msgType: 'TEXT'
-            });
-
-            if (this.livenessTimers[orderNo]) {
-              clearTimeout(this.livenessTimers[orderNo]);
-              delete this.livenessTimers[orderNo];
-            }
+            logger.warn(`[${orderNo}] Liveness watch backstop reached (${MAX_POLLS} polls) — stopping`);
+            this._clearLivenessTimers(orderNo);
           }
 
         } catch (error) {
@@ -441,34 +448,26 @@ class SellerOrderHandler {
       }, 3000); // Poll every 3 seconds (balanced approach)
 
       this.livenessPollers[orderNo] = pollInterval;
-
-      // Timeout as safety net (in case polling stops for some reason)
-      const timeoutId = setTimeout(async () => {
-        logger.warn(`[${orderNo}] Liveness timeout safety net triggered!`);
-
-        if (this.livenessPollers[orderNo]) {
-          clearInterval(this.livenessPollers[orderNo]);
-          delete this.livenessPollers[orderNo];
-        }
-
-        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
-        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.LIVENESS_TIMEOUT);
-
-        await this._sendChat({
-          orderNo,
-          content: await sellerMessageService.get('seller_liveness_timeout', {}, 'Liveness check timeout. Your order has been cancelled. Please try again.'),
-          msgType: 'TEXT'
-        });
-
-        delete this.livenessTimers[orderNo];
-
-      }, 600000); // 10 minutes safety net
-
-      this.livenessTimers[orderNo] = timeoutId;
+      // NOTE: no forced liveness-timeout timer anymore. The poll loop above stops
+      // itself only when liveness completes or Binance cancels the order. This is
+      // what stops the bogus "Liveness still pending / order cancelled" message
+      // from firing while the buyer still has time.
 
     } catch (error) {
       logger.error(`Liveness polling start error: ${error.message}`, { orderNo });
       await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /** Clear the liveness poll interval + any legacy timer for an order. */
+  _clearLivenessTimers(orderNo) {
+    if (this.livenessPollers[orderNo]) {
+      clearInterval(this.livenessPollers[orderNo]);
+      delete this.livenessPollers[orderNo];
+    }
+    if (this.livenessTimers[orderNo]) {
+      clearTimeout(this.livenessTimers[orderNo]);
+      delete this.livenessTimers[orderNo];
     }
   }
 
