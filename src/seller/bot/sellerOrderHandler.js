@@ -676,7 +676,11 @@ class SellerOrderHandler {
               return;
             }
 
-            // Send any per-image message (mismatch / unreadable / not-a-document).
+            // Send any per-image ERROR message (mismatch / unreadable /
+            // not-a-document). We do NOT send "missing docs" here — that would
+            // fire mid-batch when the buyer uploaded all images together and the
+            // rest are still queued. Missing-docs is checked ONCE after the whole
+            // batch below.
             if (result.message) await sendOnce(result.message);
 
             // After a successful doc step, check whether we're all done.
@@ -699,7 +703,17 @@ class SellerOrderHandler {
                 await this.verifyOrderInBinance(orderNo);
                 return;
               }
-              // Not done yet — nudge the buyer for what's left.
+            }
+          }
+
+          // ===== After processing the WHOLE batch this cycle =====
+          // Now that every image the buyer just sent has been processed, tell
+          // them exactly what's still missing (once). This is what makes a
+          // batch upload (all 3 at once) not spam "upload PAN / Aadhaar" for the
+          // images that were actually in the batch.
+          if (this.documentPollers[orderNo]) {
+            const state = await sellerOrderDbService.getMethod2State(orderNo);
+            if (!sellerMethod2Service.isComplete(state)) {
               const msg = await sellerMethod2Service.missingDocsMessage(state);
               if (msg) await sendOnce(msg);
             }
