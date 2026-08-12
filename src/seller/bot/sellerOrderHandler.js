@@ -786,11 +786,21 @@ class SellerOrderHandler {
       // the buyer hasn't answered yet; only replies AFTER our prompt count. On a
       // resume we DON'T baseline (the buyer may have replied before restart) —
       // the DB state (mobileNumber/otpCode) prevents mis-processing there.
+      //
+      // Belt-and-suspenders: we ALSO record a cutoff time and ignore any message
+      // whose createTime is at/older than it — so a message that was already sent
+      // but hadn't propagated to the chat API at baseline-fetch time still can't
+      // trigger a phantom "invalid mobile" attempt before the buyer replies.
+      let promptCutoff = 0;
       if (!resuming) {
         try {
           const existing = await sellerBinanceService.getBuyerTextMessages(orderNo);
-          for (const t of (existing.success ? existing.messages : [])) processed.add(String(t.id));
+          for (const t of (existing.success ? existing.messages : [])) {
+            processed.add(String(t.id));
+            if (t.createTime && t.createTime > promptCutoff) promptCutoff = t.createTime;
+          }
         } catch (e) { /* ignore — worst case we process a couple of old msgs */ }
+        promptCutoff = Math.max(promptCutoff, Date.now() - 1000); // now-ish
       }
 
       // Ask for the mobile number (once, on entry). Skip on resume.
@@ -822,8 +832,12 @@ class SellerOrderHandler {
           // wrong reply got counted as 3 attempts and the buyer saw "Attempt
           // 1/3, 2/3, 3/3, limit exceeded" all at the same time. Handling one
           // message per 3s cycle makes each attempt a real, separate reply and
-          // gives the buyer time to correct it.
-          const next = texts.find((t) => !processed.has(String(t.id)));
+          // gives the buyer time to correct it. We also skip anything at/older
+          // than the prompt cutoff (messages from before we asked for the mobile).
+          const next = texts.find((t) =>
+            !processed.has(String(t.id)) &&
+            !(promptCutoff && t.createTime && t.createTime <= promptCutoff)
+          );
           if (next) {
             processed.add(String(next.id));
 
