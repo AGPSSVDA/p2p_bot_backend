@@ -27,14 +27,21 @@ const getSmsConfig = async (req, res) => {
 // PUT /api/seller/sms-config  { otpTemplate, dltTemplateId }
 const updateSmsConfig = async (req, res) => {
   try {
-    const otpTemplate = (req.body.otpTemplate ?? '').toString();
+    let otpTemplate = (req.body.otpTemplate ?? '').toString();
     const dltTemplateId = (req.body.dltTemplateId ?? '').toString().trim();
 
-    // Light guard: the OTP text must keep the {otp} placeholder or no code is sent.
+    // The admin may paste the DLT-approved text as-is, where the code slot is the
+    // DLT variable "{#var#}". Accept that and normalise it to our {otp} token so
+    // the sender fills it correctly. Both forms are valid input.
+    if (otpTemplate.includes('{#var#}')) {
+      otpTemplate = otpTemplate.replace(/\{#var#\}/g, '{otp}');
+    }
+
+    // Guard: after normalisation there must be a code slot, else no OTP is sent.
     if (otpTemplate && !otpTemplate.includes('{otp}')) {
       return res.status(400).json({
         success: false,
-        error: 'OTP template must contain the {otp} placeholder where the code goes.',
+        error: 'OTP template must contain {otp} (or the DLT {#var#}) where the code goes.',
       });
     }
 
