@@ -42,33 +42,42 @@ const DEFAULT_URL = 'http://retailsms.nettyfish.com/api/mt/SendSMS';
 const DEFAULT_OTP_TEMPLATE =
   'AGPSS_GLOBAL_PVT: Your OTP for mobile number verification is {otp}. This code is valid for 10 minutes. Do not share this OTP with anyone.';
 
-// Loaded lazily to avoid a require cycle (sellerMessageService → nothing heavy,
-// but keep it lazy anyway).
-let _sellerMessageService = null;
-function messageService() {
-  if (!_sellerMessageService) _sellerMessageService = require('./sellerMessageService');
-  return _sellerMessageService;
+// Loaded lazily to avoid require cycles.
+let _smsConfig = null;
+function smsConfig() {
+  if (!_smsConfig) _smsConfig = require('./smsConfigService');
+  return _smsConfig;
 }
 
 /**
  * Build the OTP SMS text with {otp} filled.
- * Priority: DB template (editable on the Chat Messages page) → env
- * SMS_OTP_TEMPLATE → hardcoded default. The admin can edit the SMS text from the
- * frontend, but it MUST stay identical to the DLT-approved template or the SMS
- * gateway will reject it.
+ * Priority: DB SMS config (editable on the SMS Settings section, kept in sync with
+ * its DLT template id) → env SMS_OTP_TEMPLATE → hardcoded default. It MUST stay
+ * identical to the DLT-approved template or the gateway rejects the SMS.
  */
 async function otpMessage(otp) {
   const envOrDefault = (process.env.SMS_OTP_TEMPLATE || DEFAULT_OTP_TEMPLATE);
   let tpl = envOrDefault;
   try {
-    // seller_sms_otp_template: the editable SMS text. Falls back to env/default.
-    tpl = await messageService().get('seller_sms_otp_template', {}, envOrDefault);
+    const dbTpl = await smsConfig().getOtpTemplate();
+    if (dbTpl) tpl = dbTpl;
   } catch (e) {
-    // If the DB lookup fails, keep the env/default so OTP still sends.
-    tpl = envOrDefault;
+    tpl = envOrDefault; // DB hiccup → still send with env/default
   }
   if (!tpl) tpl = envOrDefault;
   return String(tpl).replace(/\{otp\}/g, otp);
+}
+
+/**
+ * The DLT template id to send with this SMS. Prefers the DB config (edited
+ * alongside the text), else env SMS_DLT_TEMPLATE_ID. Returns null if neither set.
+ */
+async function dltTemplateId() {
+  try {
+    const dbId = await smsConfig().getDltTemplateId();
+    if (dbId) return dbId;
+  } catch (e) { /* fall through to env */ }
+  return process.env.SMS_DLT_TEMPLATE_ID || null;
 }
 
 /**
@@ -77,7 +86,7 @@ async function otpMessage(otp) {
  * @param {string} text      message body
  * @returns {Promise<{success:boolean, message?:string, jobId?:string, messageId?:string, providerResponse?:any}>}
  */
-async function sendSms(mobile10, text) {
+async function sendSms(mobile10, text, opts = {}) {
   const url = process.env.SMS_API_URL || DEFAULT_URL;
   const senderId = process.env.SMS_SENDER_ID;
 
@@ -107,8 +116,11 @@ async function sendSms(mobile10, text) {
   params.number = number;
   params.text = text;
   params.route = process.env.SMS_ROUTE || '';
-  // Optional DLT params (lowercase names per docs)
-  if (process.env.SMS_DLT_TEMPLATE_ID) params.dlttemplateid = process.env.SMS_DLT_TEMPLATE_ID;
+  // Optional DLT params (lowercase names per docs). DLT template id can be
+  // supplied by the caller (opts.dltTemplateId — the DB-configured value edited
+  // alongside the text); otherwise fall back to env.
+  const dltId = opts.dltTemplateId || process.env.SMS_DLT_TEMPLATE_ID;
+  if (dltId) params.dlttemplateid = dltId;
   if (process.env.SMS_PEID) params.peid = process.env.SMS_PEID;
   if (process.env.SMS_TELEMARKETER_ID) params.telemarketerid = process.env.SMS_TELEMARKETER_ID;
 
@@ -169,10 +181,15 @@ function tryParseJson(s) {
   }
 }
 
-/** Send an OTP SMS (builds the message from the editable template / env / default). */
+/**
+ * Send an OTP SMS. Text AND DLT template id both come from the editable SMS
+ * config (kept in sync) → env → default, so changing the template also swaps its
+ * matching DLT id.
+ */
 async function sendOtp(mobile10, otp) {
   const text = await otpMessage(otp);
-  return sendSms(mobile10, text);
+  const dltTid = await dltTemplateId();
+  return sendSms(mobile10, text, { dltTemplateId: dltTid });
 }
 
-module.exports = { sendSms, sendOtp, otpMessage };
+module.exports = { sendSms, sendOtp, otpMessage, dltTemplateId };

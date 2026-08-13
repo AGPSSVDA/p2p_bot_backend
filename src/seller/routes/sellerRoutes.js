@@ -11,6 +11,7 @@ const sellerTradeTypesController = require('../controllers/sellerTradeTypesContr
 const sellerBotController = require('../controllers/sellerBotController');
 const openaiUsageController = require('../controllers/openaiUsageController');
 const sellerMessageController = require('../controllers/sellerMessageController');
+const smsConfigController = require('../controllers/smsConfigController');
 
 // Middleware
 const { authMiddleware } = require('../../middleware/authMiddleware'); // Assuming you have auth middleware
@@ -125,6 +126,14 @@ router.get('/openai/usage', (req, res) => openaiUsageController.summary(req, res
 
 // POST /api/seller/openai/credit  — set the purchased credit amount (USD)
 router.post('/openai/credit', (req, res) => openaiUsageController.setCredit(req, res));
+
+/**
+ * ===== SMS OTP CONFIG (editable text + DLT template id) =====
+ */
+// GET /api/seller/sms-config
+router.get('/sms-config', (req, res) => smsConfigController.getSmsConfig(req, res));
+// PUT /api/seller/sms-config  — { otpTemplate, dltTemplateId }
+router.put('/sms-config', (req, res) => smsConfigController.updateSmsConfig(req, res));
 
 /**
  * ===== SELLER CHAT MESSAGES (editable templates for Method 1 & 2) =====
