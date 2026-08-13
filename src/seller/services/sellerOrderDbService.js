@@ -154,6 +154,28 @@ class SellerOrderDbService {
     return rows;
   }
 
+  /**
+   * Orders that have PASSED verification and are now waiting for the trade to
+   * finish (payment/release) — i.e. not yet terminal. Used by the poller to
+   * detect completion/cancellation on Binance (so the thank-you message + the
+   * re-order cooldown fire reliably, even across restarts / after any in-memory
+   * payment poller died). Excludes the terminal states.
+   */
+  async getUnfinishedOrders(limit = 100) {
+    const terminal = ['COMPLETED', 'CANCELLED', 'REJECTED', 'PAYMENT_TIMEOUT'];
+    const placeholders = terminal.map(() => '?').join(',');
+    const query = `
+      SELECT order_number, buyer_id, ad_no, current_state, crypto_released_at,
+             thank_you_message_sent_at, created_at, updated_at
+      FROM seller_orders
+      WHERE current_state NOT IN (${placeholders})
+      ORDER BY created_at DESC
+      LIMIT ?
+    `;
+    const [rows] = await pool.query(query, [...terminal, limit]);
+    return rows;
+  }
+
   // ===== STATE TRANSITIONS =====
 
   /**

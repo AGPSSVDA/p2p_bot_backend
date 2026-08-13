@@ -1648,6 +1648,44 @@ class SellerOrderHandler {
    * ===== STEP 6: SEND THANK YOU MESSAGE =====
    * Final step before order completion
    */
+  /**
+   * Finalise a trade that Binance reports COMPLETED (status 4). Idempotent — the
+   * poller may call it repeatedly. Records the release time (which STARTS the
+   * re-order cooldown), sends the thank-you once, and marks the order COMPLETED.
+   */
+  async finalizeCompletedOrder(orderNo) {
+    // In-memory guard so two overlapping poll cycles can't double-finalise.
+    if (!this._finalizing) this._finalizing = new Set();
+    if (this._finalizing.has(orderNo)) return;
+    this._finalizing.add(orderNo);
+    try {
+      const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+      if (!dbOrder) return;
+      if (dbOrder.current_state === SELLER_ORDER_STATES.COMPLETED) return; // already done
+
+      // Stop any in-flight loops for this order.
+      this.stopMethod2Verification?.(orderNo);
+      this.stopOtpVerification?.(orderNo);
+      this.stopGatewayPolling?.(orderNo);
+
+      // Record the release/completion time (cooldown keys off crypto_released_at).
+      if (!dbOrder.crypto_released_at) {
+        await sellerOrderDbService.recordCryptoReleased(orderNo);
+      }
+      // Send thank-you only once.
+      if (!dbOrder.thank_you_message_sent_at) {
+        await this.sendThankYouMessage(orderNo);
+      } else {
+        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.COMPLETED);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.COMPLETED);
+      }
+    } catch (error) {
+      logger.error(`[${orderNo}] finalizeCompletedOrder error: ${error.message}`);
+    } finally {
+      this._finalizing.delete(orderNo);
+    }
+  }
+
   async sendThankYouMessage(orderNo) {
     try {
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.SENDING_THANK_YOU);

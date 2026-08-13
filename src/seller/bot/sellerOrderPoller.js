@@ -171,12 +171,64 @@ class SellerOrderPoller {
       // still active on Binance (resumeDocumentCollection cross-checks the live
       // list, so stale orders never get re-messaged).
       await this.resumeDocumentCollection(liveOrders);
+      // Detect completed / cancelled trades so the thank-you message + re-order
+      // cooldown fire reliably (independent of any in-memory payment poller).
+      await this.checkOrderCompletions(liveOrders);
     } catch (error) {
       logger.error(`Seller poller error: ${error.message}`, { error });
     }
 
     // Schedule next poll
     setTimeout(() => this.poll(), this.pollInterval);
+  }
+
+  /**
+   * Reliable completion/cancellation detection — runs every poll cycle.
+   *
+   * getPendingSellOrders (liveOrders) returns ONLY active orders (status 1/2).
+   * When an order becomes COMPLETED (4) or CANCELLED (6/7) it DROPS OUT of that
+   * list. So for each of OUR non-terminal orders that is NOT in the live list, we
+   * fetch its real status once and finalise it:
+   *   - status 4 → mark COMPLETED, record crypto_released_at (starts the cooldown),
+   *     send the thank-you message.
+   *   - status 6/7 → mark CANCELLED (bot goes silent).
+   * This works even if the in-memory payment poller died (restart) or timed out.
+   */
+  async checkOrderCompletions(liveOrders = null) {
+    try {
+      const unfinished = await sellerOrderDbService.getUnfinishedOrders();
+      if (!unfinished.length) return;
+
+      const activeSet = new Set(
+        (liveOrders || []).map((o) => String(o.orderNumber || o.orderNo)).filter(Boolean)
+      );
+
+      for (const o of unfinished) {
+        const orderNo = o.order_number;
+        // Still active on Binance (status 1/2) → its normal flow continues.
+        if (activeSet.has(String(orderNo))) continue;
+
+        // Not in the active list — it either completed, got cancelled, or is just
+        // a brand-new order not yet in the snapshot. Query ALL states to be sure.
+        let st;
+        try { st = await sellerBinanceService.getOrderStatusAllStates(orderNo); }
+        catch { continue; }
+        if (!st?.success) continue; // not in the recent window — leave it
+
+        if (st.orderStatus === 4) {
+          // COMPLETED on Binance → finalise (thank-you + cooldown). Idempotent.
+          logger.info(`[${orderNo}] ✅ Detected COMPLETED on Binance (poll) — finalising`);
+          await this.orderHandler.finalizeCompletedOrder(orderNo);
+        } else if (st.orderStatus === 6 || st.orderStatus === 7) {
+          // CANCELLED / system-cancelled → close out (bot goes silent).
+          logger.info(`[${orderNo}] Detected CANCELLED on Binance (status ${st.orderStatus}) — closing out`);
+          await sellerOrderDbService.setOrderState(orderNo, 'CANCELLED', `Binance status ${st.orderStatus}`);
+        }
+        // status 1/2/3 (active/appealing) → leave the normal flow to handle it.
+      }
+    } catch (error) {
+      logger.error(`checkOrderCompletions error: ${error.message}`, { error });
+    }
   }
 
   /**

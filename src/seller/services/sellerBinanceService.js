@@ -357,6 +357,41 @@ async function getOrderStatusByOrderNumber(orderNumber) {
 }
 
 /**
+ * Get an order's status across ALL states — including COMPLETED (4) and
+ * CANCELLED (6/7), which getOrderStatusByOrderNumber (pending-only) can't see.
+ *
+ * listOrders with orderStatusList [1,2,3,4,6,7] returns finished orders too, so
+ * this is how the poller reliably detects completion/cancellation (to fire the
+ * thank-you message + re-order cooldown). Returns { success, orderStatus } or
+ * { success:false } when the order isn't in the recent window.
+ */
+async function getOrderStatusAllStates(orderNumber) {
+  return withRetry(async () => {
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.listOrders)}?${buildSignedQuery({})}`,
+      {
+        orderStatusList: [1, 2, 3, 4, 6, 7],
+        tradeType: 'SELL',
+        page: 1,
+        rows: 50,
+      },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const data = res.data?.data || res.data;
+    const list = Array.isArray(data) ? data : (data?.orderList || data?.data || []);
+    const order = list.find((o) => o.orderNumber === orderNumber);
+    if (!order) return { success: false, message: 'Order not in recent list' };
+    return {
+      success: true,
+      orderNumber: order.orderNumber,
+      orderStatus: order.orderStatus,
+      additionalKycVerify: order.additionalKycVerify,
+      raw: order,
+    };
+  }, 3, 3000, `getOrderStatusAllStates:${orderNumber}`);
+}
+
+/**
  * Retrieve the seller's chat WSS credential (SELLER key).
  * Returns { chatWssUrl, listenKey, listenToken } used to open the chat WebSocket.
  * The REST sendMessage endpoint returns 404 on Binance — sending must go over WSS
@@ -589,6 +624,7 @@ module.exports = {
   getPendingSellOrders,
   getOrderDetail,
   getOrderStatusByOrderNumber,
+  getOrderStatusAllStates,
   getCounterPartyOrderStats,
   getUserDetails,
   verifyAdditionalKyc,
