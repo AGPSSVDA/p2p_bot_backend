@@ -818,23 +818,24 @@ class SellerAdsController {
         console.log(`   🔄 Min completion rate: RESET TO 0 (disabled)`);
       }
 
-      // Min registered days — needs BOTH fields on Binance:
-      //   buyerRegDaysLimit  (0/1) = the ENABLE flag (without this=1 the days are ignored)
-      //   buyerRegisterLimit (days) = the actual value; Binance MAX is 180 days (hard cap)
+      // Min registered days — buyerRegDaysLimit IS the number of days, NOT a 0/1
+      // flag. Verified live against ads/update + getDetailByNo: sending
+      // buyerRegDaysLimit=30 reads back as 30. The old code sent buyerRegDaysLimit=1
+      // (treating it as an enable flag) and put the real value in buyerRegisterLimit,
+      // which ads/update silently ignores — so a "30 days" rule actually enforced
+      // only "1 day" and let any account older than a day through. Binance caps the
+      // value at 180. 0 = requirement off.
       if (isCriterionEnabled(rules.minRegisteredDays)) {
         const val = safeInt(getCriterionValue(rules.minRegisteredDays));
         if (val > 0) {
           const days = Math.min(180, val); // Binance rejects > 180
-          binancePayload.buyerRegDaysLimit = 1;
-          binancePayload.buyerRegisterLimit = days;
+          binancePayload.buyerRegDaysLimit = days;
           console.log(`   ✅ Min registered days: ${days}${val > 180 ? ` (capped from ${val}; Binance max is 180)` : ''}`);
         } else {
           binancePayload.buyerRegDaysLimit = 0;
-          binancePayload.buyerRegisterLimit = 0;
         }
       } else {
         binancePayload.buyerRegDaysLimit = 0;
-        binancePayload.buyerRegisterLimit = 0;
         console.log(`   🔄 Min registered days: RESET TO 0 (disabled)`);
       }
 
