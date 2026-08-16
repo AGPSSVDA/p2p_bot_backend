@@ -841,13 +841,15 @@ class SellerOrderDbService {
     const query = `
       INSERT INTO seller_ad_rules (
         seller_id, ad_no,
-        method1_liveness_enabled, method2_documents_enabled,
+        method1_liveness_enabled, method1_mobile_verification_enabled,
+        method2_documents_enabled,
         method2_mobile_verification_enabled, method3_full_enabled,
         method3_mobile_verification_enabled, method3_payment_link_enabled,
         method3_payment_gateway, method3_delivery_method
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         method1_liveness_enabled = VALUES(method1_liveness_enabled),
+        method1_mobile_verification_enabled = VALUES(method1_mobile_verification_enabled),
         method2_documents_enabled = VALUES(method2_documents_enabled),
         method2_mobile_verification_enabled = VALUES(method2_mobile_verification_enabled),
         method3_full_enabled = VALUES(method3_full_enabled),
@@ -862,6 +864,7 @@ class SellerOrderDbService {
       sellerId,
       adNo,
       methods.method1_liveness_enabled ? 1 : 0,
+      methods.method1_mobile_verification_enabled ? 1 : 0,
       methods.method2_documents_enabled ? 1 : 0,
       methods.method2_mobile_verification_enabled ? 1 : 0,
       methods.method3_full_enabled ? 1 : 0,
@@ -913,12 +916,13 @@ class SellerOrderDbService {
         min_all_trades_count_enabled, min_all_trades_count,
         min_buy_orders_count_enabled, min_buy_orders_count,
         min_sell_orders_count_enabled, min_sell_orders_count,
-        method1_liveness_enabled, method2_documents_enabled,
+        method1_liveness_enabled, method1_mobile_verification_enabled,
+        method2_documents_enabled,
         method2_mobile_verification_enabled, method3_full_enabled,
         method3_mobile_verification_enabled, method3_payment_link_enabled,
         method3_payment_gateway, method3_delivery_method,
         reorder_cooldown_enabled, reorder_cooldown_hours
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         min_30day_trades_enabled = VALUES(min_30day_trades_enabled),
         min_30day_trades = VALUES(min_30day_trades),
@@ -943,6 +947,7 @@ class SellerOrderDbService {
         min_sell_orders_count_enabled = VALUES(min_sell_orders_count_enabled),
         min_sell_orders_count = VALUES(min_sell_orders_count),
         method1_liveness_enabled = VALUES(method1_liveness_enabled),
+        method1_mobile_verification_enabled = VALUES(method1_mobile_verification_enabled),
         method2_documents_enabled = VALUES(method2_documents_enabled),
         method2_mobile_verification_enabled = VALUES(method2_mobile_verification_enabled),
         method3_full_enabled = VALUES(method3_full_enabled),
@@ -970,6 +975,7 @@ class SellerOrderDbService {
         rulesData.min_buy_orders_count_enabled ?? true, rulesData.min_buy_orders_count,
         rulesData.min_sell_orders_count_enabled ?? true, rulesData.min_sell_orders_count,
         rulesData.method1_liveness_enabled,
+        rulesData.method1_mobile_verification_enabled,
         rulesData.method2_documents_enabled,
         rulesData.method2_mobile_verification_enabled,
         rulesData.method3_full_enabled,

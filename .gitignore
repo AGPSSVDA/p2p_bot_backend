@@ -74,3 +74,6 @@ session-*.json
 
 # Server env dump (contains live credentials — never commit)
 server.env
+
+# Runtime-generated Method 3 payment QR images (created per order)
+src/public/qr/*.png

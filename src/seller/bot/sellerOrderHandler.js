@@ -13,6 +13,7 @@ const sellerMethod2Service = require('../services/sellerMethod2Service');
 const sellerMessageService = require('../services/sellerMessageService');
 const sellerOtpService = require('../services/sellerOtpService');
 const paymentGatewayService = require('../services/paymentGatewayService');
+const qrService = require('../services/qrService');
 // Loose (first-OR-last-name, case-insensitive) match for seller Method 3 payer
 // vs KYC. Buyer-side helpers.matchNames() is left untouched.
 const { matchNamesLoose: matchNames } = require('../utils/sellerUtils');
@@ -510,6 +511,20 @@ class SellerOrderHandler {
         logger.info(`[${orderNo}] Documents required (m2=${!!adRules?.method2_documents_enabled}, m3=${!!adRules?.method3_full_enabled}) - starting document verification`);
         await this.startMethod2Verification(orderNo);
         return; // Order is verified only after documents (and OTP/payment) pass
+      }
+
+      // ===== METHOD 1 OPTIONAL OTP =====
+      // Method 1 = liveness only. If the admin turned on mobile OTP for this ad,
+      // run the SAME OTP flow as Method 2 (ask mobile → NettyFish SMS → verify the
+      // reply) right after liveness. startOtpVerification calls verifyOrderInBinance
+      // itself once the OTP is confirmed, so we return here. When OTP is off, we
+      // fall through and verify the order immediately after liveness (unchanged).
+      const kycName = dbOrder?.buyer_kyc_name && dbOrder.buyer_kyc_name !== '(Unknown)'
+        ? dbOrder.buyer_kyc_name : 'Customer';
+      if (adRules?.method1_mobile_verification_enabled) {
+        logger.info(`[${orderNo}] Method 1 OTP enabled — starting mobile OTP after liveness`);
+        await this.startOtpVerification(orderNo, kycName);
+        return; // Order is verified only after OTP passes
       }
 
       // ===== STEP 4: ORDER VERIFICATION IN BINANCE =====
@@ -1409,6 +1424,28 @@ class SellerOrderHandler {
         ),
       });
 
+      // 3b) Also send a scannable QR of the same link. Easebuzz doesn't return a QR
+      // and Binance chat shows images only by URL, so we render the link into a PNG
+      // ourselves and send its public URL. Best-effort: if QR fails, the link above
+      // still works, so we never block the payment on it.
+      try {
+        const qrRes = await qrService.generatePaymentQr(linkRes.link, orderNo);
+        if (qrRes.success && qrRes.url) {
+          await this._sendChat({
+            orderNo,
+            content: await sellerMessageService.get(
+              'seller_m3_payment_qr',
+              { qr: qrRes.url, amount, fiat },
+              `Or scan this QR to pay ${amount} ${fiat}: ${qrRes.url}`
+            ),
+          });
+        } else {
+          logger.warn(`[${orderNo}] Payment QR not sent: ${qrRes.message || 'unknown'}`);
+        }
+      } catch (qrErr) {
+        logger.warn(`[${orderNo}] Payment QR step failed (link still sent): ${qrErr.message}`);
+      }
+
       // 4) Poll the gateway for payment
       await this.pollGatewayPayment(orderNo, gateway, linkRes.merchantTxn, kycName);
 
@@ -1523,20 +1560,33 @@ class SellerOrderHandler {
    */
   async releaseCryptoForOrder(orderNo) {
     try {
+      const totpService = require('../services/totpService');
+      console.log(`\n🔓 [${orderNo}] ===== AUTO-RELEASE START =====`);
+      console.log(`    2FA secret configured : ${totpService.hasSecret() ? 'YES (Google TOTP)' : 'NO (releasing without 2FA)'}`);
+
+      // Step A: is release allowed yet?
+      console.log(`    Step 1: checkIfCanReleaseCoin ...`);
       const check = await sellerBinanceService.checkIfCanReleaseCoin(orderNo);
+      console.log(`      → success=${check.success} canRelease=${check.canRelease} code=${check.code} msg=${check.message || ''}`);
       if (!check.success || !check.canRelease) {
+        console.log(`      ⚠️  Not releasable yet → falling back to manual release watch`);
         logger.warn(`[${orderNo}] Cannot release yet (canRelease=${check.canRelease}) — waiting for manual release`);
         await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (checkIfCanReleaseCoin=false)');
         this.pollForManualRelease(orderNo); // cooldown starts only after real release
         return;
       }
 
+      // Step B: release the crypto.
+      console.log(`    Step 2: releaseCoin ...`);
       const rel = await sellerBinanceService.releaseCoin(orderNo);
+      console.log(`      → success=${rel.success} code=${rel.code} msg=${rel.message || ''}`);
+      console.log(`      → raw: ${JSON.stringify(rel.raw)}`);
       if (!rel.success) {
-        // Auto-release failed (usually Binance requires a 2FA code). The seller
-        // will release manually on Binance — watch for it so we mark the order
-        // completed (and start the re-order cooldown) only once the crypto is
-        // ACTUALLY released, not on payment-received.
+        // Auto-release failed (e.g. Binance requires 2FA on this account). The
+        // seller will release manually on Binance — watch for it so we mark the
+        // order completed (and start the re-order cooldown) only once the crypto
+        // is ACTUALLY released, not on payment-received.
+        console.log(`      ❌ releaseCoin FAILED (code=${rel.code}) → seller must release manually`);
         logger.error(`[${orderNo}] releaseCoin failed — seller must release manually`, { code: rel.code, message: rel.message });
         await sellerOrderDbService.recordError(orderNo, `releaseCoin failed: ${rel.message || rel.code}`);
         await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (releaseCoin failed)');
@@ -1544,6 +1594,8 @@ class SellerOrderHandler {
         return;
       }
 
+      console.log(`    ✅ [${orderNo}] CRYPTO AUTO-RELEASED SUCCESSFULLY (no 2FA needed)`);
+      console.log(`🔓 [${orderNo}] ===== AUTO-RELEASE DONE =====\n`);
       logger.info(`[${orderNo}] ✅ Crypto released`);
       await sellerOrderDbService.recordCryptoReleased(orderNo);
       await this._sendChat({
@@ -1554,6 +1606,7 @@ class SellerOrderHandler {
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.COMPLETED);
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.COMPLETED);
     } catch (error) {
+      console.log(`    ❌ [${orderNo}] releaseCryptoForOrder EXCEPTION: ${error.message}`);
       logger.error(`[${orderNo}] releaseCryptoForOrder error: ${error.message}`);
       await sellerOrderDbService.recordError(orderNo, error.message);
     }

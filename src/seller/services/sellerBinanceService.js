@@ -219,20 +219,31 @@ async function checkIfCanReleaseCoin(orderNo) {
  * Method 3: Release the crypto to the buyer.
  * Endpoint: POST /sapi/v1/c2c/orderMatch/releaseCoin
  *
- * The body may carry 2FA codes (googleVerifyCode / mobileVerifyCode / emailVerifyCode)
- * depending on the account's security settings. We pass whatever is configured via
- * env (SELLER_RELEASE_AUTH_TYPE / SELLER_RELEASE_* codes); if the account doesn't
- * require them (like verifyAdditionalKyc, which "does not require authentication"),
- * the empty body works. On failure the caller marks the order READY_TO_RELEASE and
- * alerts the admin instead of forcing a release.
+ * 2FA: when the account has Google Authenticator, releaseCoin needs a fresh
+ * googleVerifyCode (a 30-second TOTP). We generate it on each call from the
+ * account's 2FA secret (SELLER_RELEASE_2FA_SECRET) via totpService — a STATIC env
+ * code would already be stale. authType defaults to GOOGLE when a secret is set.
+ * If no secret is configured the body goes out without a code (works when the
+ * account/endpoint doesn't require 2FA — verified live on a no-2FA account); on any
+ * failure the caller marks the order READY_TO_RELEASE and the seller releases
+ * manually. We surface code+message so the caller can fall back cleanly.
  */
 async function releaseCoin(orderNo) {
   return withRetry(async () => {
     const qs = buildSignedQuery({ orderNumber: orderNo });
     const body = { orderNumber: orderNo };
-    // Optional 2FA — only include when configured.
-    if (process.env.SELLER_RELEASE_AUTH_TYPE) body.authType = process.env.SELLER_RELEASE_AUTH_TYPE;
-    if (process.env.SELLER_RELEASE_GOOGLE_CODE) body.googleVerifyCode = process.env.SELLER_RELEASE_GOOGLE_CODE;
+
+    // 2FA: prefer a freshly-generated Google Authenticator TOTP; else any static
+    // codes explicitly set for accounts that use email/mobile verification instead.
+    const totpService = require('./totpService');
+    const freshGoogle = totpService.currentGoogleCode();
+    if (freshGoogle) {
+      body.authType = process.env.SELLER_RELEASE_AUTH_TYPE || 'GOOGLE';
+      body.googleVerifyCode = freshGoogle;
+    } else if (process.env.SELLER_RELEASE_AUTH_TYPE) {
+      body.authType = process.env.SELLER_RELEASE_AUTH_TYPE;
+    }
+    if (!freshGoogle && process.env.SELLER_RELEASE_GOOGLE_CODE) body.googleVerifyCode = process.env.SELLER_RELEASE_GOOGLE_CODE;
     if (process.env.SELLER_RELEASE_MOBILE_CODE) body.mobileVerifyCode = process.env.SELLER_RELEASE_MOBILE_CODE;
     if (process.env.SELLER_RELEASE_EMAIL_CODE) body.emailVerifyCode = process.env.SELLER_RELEASE_EMAIL_CODE;
 
@@ -242,7 +253,7 @@ async function releaseCoin(orderNo) {
       { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
     );
     const success = res.data?.code === '000000' || res.data?.code === 0 || res.status === 200;
-    return { success, code: res.data?.code, message: res.data?.message || 'release requested', raw: res.data };
+    return { success, code: res.data?.code, message: res.data?.message || res.data?.msg || 'release requested', raw: res.data };
   }, 3, 3000, `releaseCoin:${orderNo}`);
 }
 

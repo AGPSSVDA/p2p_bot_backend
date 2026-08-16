@@ -161,7 +161,8 @@ class SellerAdsController {
           methods: {
             method1: {
               name: 'Liveness Check',
-              enabled: ad.rules?.method1_liveness_enabled || false
+              enabled: ad.rules?.method1_liveness_enabled || false,
+              mobileVerification: ad.rules?.method1_mobile_verification_enabled === 1 || ad.rules?.method1_mobile_verification_enabled === true
             },
             method2: {
               name: 'Documents + OTP',
@@ -295,7 +296,8 @@ class SellerAdsController {
           methods: {
             method1: {
               name: 'Liveness Check',
-              enabled: ad.rules.method1_liveness_enabled
+              enabled: ad.rules.method1_liveness_enabled,
+              mobileVerification: ad.rules.method1_mobile_verification_enabled === 1 || ad.rules.method1_mobile_verification_enabled === true
             },
             method2: {
               name: 'Documents + OTP',
@@ -443,7 +445,8 @@ class SellerAdsController {
         methods: {
           method1: {
             name: 'Liveness Check',
-            enabled: updatedAd.rules?.method1_liveness_enabled === 1 || updatedAd.rules?.method1_liveness_enabled === true
+            enabled: updatedAd.rules?.method1_liveness_enabled === 1 || updatedAd.rules?.method1_liveness_enabled === true,
+            mobileVerification: updatedAd.rules?.method1_mobile_verification_enabled === 1 || updatedAd.rules?.method1_mobile_verification_enabled === true
           },
           method2: {
             name: 'Documents + OTP',
@@ -582,6 +585,7 @@ class SellerAdsController {
       const payload = methods
         ? {
             method1_liveness_enabled: asBool(methods.method1?.enabled),
+            method1_mobile_verification_enabled: asBool(methods.method1?.mobileVerification),
             method2_documents_enabled: asBool(methods.method2?.enabled),
             method2_mobile_verification_enabled: asBool(methods.method2?.mobileVerification),
             method3_full_enabled: asBool(methods.method3?.enabled),
@@ -592,6 +596,7 @@ class SellerAdsController {
           }
         : {
             method1_liveness_enabled: asBool(req.body.method1_liveness_enabled),
+            method1_mobile_verification_enabled: asBool(req.body.method1_mobile_verification_enabled),
             method2_documents_enabled: asBool(req.body.method2_documents_enabled),
             method2_mobile_verification_enabled: asBool(req.body.method2_mobile_verification_enabled),
             method3_full_enabled: asBool(req.body.method3_full_enabled),
@@ -622,7 +627,10 @@ class SellerAdsController {
         message: 'Verification methods updated',
         adNo,
         methods: {
-          method1: { enabled: payload.method1_liveness_enabled },
+          method1: {
+            enabled: payload.method1_liveness_enabled,
+            mobileVerification: payload.method1_mobile_verification_enabled,
+          },
           method2: {
             enabled: payload.method2_documents_enabled,
             mobileVerification: payload.method2_mobile_verification_enabled,
@@ -788,18 +796,25 @@ class SellerAdsController {
       // Add eligibility criteria - include enabled AND send reset values for disabled ones
       console.log(`   Checking criteria...`);
 
-      // Min 30-day trades — Binance field is userTradeCompleteCountMin (NOT
-      // userTradeCountMin, which Binance silently ignores → criterion never set).
+      // Min 30-day trades — maps to userAllTradeCountMin, NOT userTradeCompleteCountMin.
+      // Verified live (2026-08-16): userTradeCompleteCountMin sets on the ad and reads
+      // back fine but does NOT actually block the order (even with All-time filter) — a
+      // buyer below the minimum still ordered. userAllTradeCountMin DOES block (a buyer
+      // with 23 all-trades was blocked by min 25). So we send this criterion as
+      // userAllTradeCountMin. Because "Min All Trades Count" below also uses that same
+      // Binance field, the two are merged — the HIGHER of the two wins (stricter).
+      // userTradeCompleteCountMin is force-reset to 0 so a stale value can't linger.
+      binancePayload.userTradeCompleteCountMin = 0;
+      let allTradeMin = 0;
       if (isCriterionEnabled(rules.min30dayTrades)) {
-        const val = getCriterionValue(rules.min30dayTrades);
-        if (val) {
-          binancePayload.userTradeCompleteCountMin = safeInt(val);
+        const val = safeInt(getCriterionValue(rules.min30dayTrades));
+        if (val > 0) {
+          allTradeMin = val;
           binancePayload.userTradeCountFilterTime = filterTime.tradeCount;
-          console.log(`   ✅ Min 30-day trades: ${binancePayload.userTradeCompleteCountMin} (filter=${filterTime.tradeCount === 1 ? '30D' : 'All-time'})`);
+          console.log(`   ✅ Min trades (→ userAllTradeCountMin): ${val} (filter=${filterTime.tradeCount === 1 ? '30D' : 'All-time'})`);
         }
       } else {
-        binancePayload.userTradeCompleteCountMin = 0;
-        console.log(`   🔄 Min 30-day trades: RESET TO 0 (disabled)`);
+        console.log(`   🔄 Min trades: disabled`);
       }
 
       // Min completion rate (userTradeCompleteRateMin)
@@ -823,14 +838,18 @@ class SellerAdsController {
       // buyerRegDaysLimit=30 reads back as 30. The old code sent buyerRegDaysLimit=1
       // (treating it as an enable flag) and put the real value in buyerRegisterLimit,
       // which ads/update silently ignores — so a "30 days" rule actually enforced
-      // only "1 day" and let any account older than a day through. Binance caps the
-      // value at 180. 0 = requirement off.
+      // only "1 day" and let any account older than a day through.
+      //
+      // Binance MAX is 90 days (NOT 180 as the sapi-v7.4 doc claims). Verified live:
+      // 90 accepted, 91+ rejected with 187030 "registered-days over limit". We cap
+      // to 90 here so a larger admin value never triggers that error. 0 = off.
+      const REG_DAYS_MAX = 90;
       if (isCriterionEnabled(rules.minRegisteredDays)) {
         const val = safeInt(getCriterionValue(rules.minRegisteredDays));
         if (val > 0) {
-          const days = Math.min(180, val); // Binance rejects > 180
+          const days = Math.min(REG_DAYS_MAX, val); // Binance rejects > 90 (187030)
           binancePayload.buyerRegDaysLimit = days;
-          console.log(`   ✅ Min registered days: ${days}${val > 180 ? ` (capped from ${val}; Binance max is 180)` : ''}`);
+          console.log(`   ✅ Min registered days: ${days}${val > REG_DAYS_MAX ? ` (capped from ${val}; Binance max is ${REG_DAYS_MAX})` : ''}`);
         } else {
           binancePayload.buyerRegDaysLimit = 0;
         }
@@ -839,20 +858,22 @@ class SellerAdsController {
         console.log(`   🔄 Min registered days: RESET TO 0 (disabled)`);
       }
 
-      // Min all trades count (userAllTradeCountMin)
+      // Min all trades count (userAllTradeCountMin). Both this and "Min 30-Day Trades"
+      // above target userAllTradeCountMin (the field that actually blocks), so we take
+      // the HIGHER of the two — the stricter requirement wins.
       if (isCriterionEnabled(rules.minAllTradesCount)) {
-        const val = getCriterionValue(rules.minAllTradesCount);
-        if (val) {
-          binancePayload.userAllTradeCountMin = safeInt(val);
-          // All-trades shares the same filter enum as min-30-day trades. Ensure it's
-          // set even when the 30-day-trades criterion above is disabled.
+        const val = safeInt(getCriterionValue(rules.minAllTradesCount));
+        if (val > 0) {
+          allTradeMin = Math.max(allTradeMin, val);
           binancePayload.userTradeCountFilterTime = filterTime.tradeCount;
-          console.log(`   ✅ Min all trades: ${binancePayload.userAllTradeCountMin} (filter=${filterTime.tradeCount === 1 ? '30D' : 'All-time'})`);
+          console.log(`   ✅ Min all trades: ${val}`);
         }
       } else {
-        binancePayload.userAllTradeCountMin = 0;
-        console.log(`   🔄 Min all trades: RESET TO 0 (disabled)`);
+        console.log(`   🔄 Min all trades: disabled`);
       }
+      // Commit the merged all-trade minimum (0 clears it when neither is set).
+      binancePayload.userAllTradeCountMin = allTradeMin;
+      console.log(`   📊 Final userAllTradeCountMin = ${allTradeMin} (max of Min-Trades + Min-All-Trades)`);
 
       // Min buy orders count (userBuyTradeCountMin)
       if (isCriterionEnabled(rules.minBuyOrdersCount)) {
@@ -1098,7 +1119,15 @@ class SellerAdsController {
       // frozen ad, or pending review) — not a config problem. Verified: the same
       // request succeeds on other ads. Admin must edit/re-create the ad on Binance.
       let friendly = error.message || 'Failed to sync eligibility criteria to Binance';
-      if (/187040|-9000/.test(String(error.message))) {
+      const errStr = String(error.message);
+      // 187030 = registered-days value over Binance's limit. Verified live: 90 is
+      // accepted, 91+ rejected. Check this BEFORE the generic -9000 branch (187030
+      // comes back as code -9000 too, so the order matters).
+      if (/187030/.test(errStr)) {
+        friendly =
+          "Min Registered Days is too high — Binance's maximum is 90 days. " +
+          "Please set it to 90 or less and sync again.";
+      } else if (/187040|-9000/.test(errStr)) {
         friendly =
           "Binance is not allowing this ad to be updated right now (error 187040). " +
           "This is a Binance-side restriction on this specific ad — not your settings. " +

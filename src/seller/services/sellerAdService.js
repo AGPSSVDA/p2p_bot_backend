@@ -135,6 +135,9 @@ class SellerAdService {
         method1_liveness_enabled: rulesData.method1_liveness_enabled !== undefined
           ? rulesData.method1_liveness_enabled === true
           : (existingRules?.method1_liveness_enabled === 1 || existingRules?.method1_liveness_enabled === true),
+        method1_mobile_verification_enabled: rulesData.method1_mobile_verification_enabled !== undefined
+          ? rulesData.method1_mobile_verification_enabled === true
+          : (existingRules?.method1_mobile_verification_enabled === 1 || existingRules?.method1_mobile_verification_enabled === true),
         method2_documents_enabled: rulesData.method2_documents_enabled !== undefined
           ? rulesData.method2_documents_enabled === true
           : (existingRules?.method2_documents_enabled === 1 || existingRules?.method2_documents_enabled === true),

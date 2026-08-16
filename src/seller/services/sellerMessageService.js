@@ -102,6 +102,7 @@ const TEMPLATE_VARIABLES = [
   { name: 'amount',      example: '210',          description: 'Method 3: order fiat amount to pay' },
   { name: 'fiat',        example: 'INR',          description: 'Method 3: fiat currency' },
   { name: 'link',        example: 'https://…',    description: 'Method 3: payment link/QR URL' },
+  { name: 'qr',          example: 'https://…/qr/pay_123.png', description: 'Method 3: scannable QR image URL of the payment link' },
   { name: 'payerName',   example: 'RAHUL SHARMA', description: 'Method 3: payer bank/card name (mismatch message)' },
   { name: 'orderNo',     example: '22899…416',    description: 'Binance order number' },
 ];
