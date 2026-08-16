@@ -180,6 +180,12 @@ class SellerAdsController {
           cooldown: {
             enabled: ad.rules?.reorder_cooldown_enabled === 1 || ad.rules?.reorder_cooldown_enabled === true,
             hours: ad.rules?.reorder_cooldown_hours || 24
+          },
+          // Admin-selectable 30D(1)/All-time(2) scope for the criteria that support it.
+          filterTime: {
+            tradeCount: Number(ad.rules?.user_trade_count_filter_time) || 1,
+            completionRate: Number(ad.rules?.completion_rate_filter_time) || 1,
+            tradeVolume: Number(ad.rules?.trade_volume_filter_time) || 2
           }
         },
         summary: ad.rules ? sellerAdService.getRuleSummary(ad.rules) : { methods: '', minTradesCount: 0, minCompletionRate: 0, minRegisteredDays: 0 }
@@ -308,6 +314,12 @@ class SellerAdsController {
           cooldown: {
             enabled: ad.rules.reorder_cooldown_enabled === 1 || ad.rules.reorder_cooldown_enabled === true,
             hours: ad.rules.reorder_cooldown_hours || 24
+          },
+          // Admin-selectable 30D(1)/All-time(2) scope for the criteria that support it.
+          filterTime: {
+            tradeCount: Number(ad.rules.user_trade_count_filter_time) || 1,
+            completionRate: Number(ad.rules.completion_rate_filter_time) || 1,
+            tradeVolume: Number(ad.rules.trade_volume_filter_time) || 2
           }
         }
       };
@@ -703,9 +715,13 @@ class SellerAdsController {
       if (frontendRules && frontendRules.eligibility) {
         console.log(`   ✅ Using rules from frontend (latest changes)`);
         rules = frontendRules.eligibility;
+        // Keep the DB row handy so filter-time can fall back to it when the
+        // frontend didn't send an explicit filterTime block.
+        rules.__dbRow = await sellerOrderDbService.getAdRules(adNo);
       } else {
         console.log(`   Using rules from database`);
         rules = await sellerOrderDbService.getAdRules(adNo);
+        rules.__dbRow = rules; // DB-only path: the row IS the source
       }
 
       if (!rules) {
@@ -725,6 +741,19 @@ class SellerAdsController {
       // Step 2: Build Binance update payload with only enabled criteria
       console.log(`\n🔨 [SYNC] Step 2: Building Binance payload...`);
       const binancePayload = {};
+
+      // Filter-time (30D vs All-time) is now admin-selectable per ad. It can arrive
+      // from the frontend rules (rules.filterTime.*) or fall back to the DB row, then
+      // to the Binance-safe defaults (count/rate = 30D, volume = All-time). Only
+      // 1 (Last 30D) and 2 (All-time) are valid Binance enum values.
+      const onlyFilter = (v, fallback) => (v === 1 || v === 2 || v === '1' || v === '2') ? Number(v) : fallback;
+      const ftIn = (frontendRules && frontendRules.filterTime) || {};
+      const filterTime = {
+        tradeCount: onlyFilter(ftIn.tradeCount ?? rules.__dbRow?.user_trade_count_filter_time, 1),
+        completionRate: onlyFilter(ftIn.completionRate ?? rules.__dbRow?.completion_rate_filter_time, 1),
+        tradeVolume: onlyFilter(ftIn.tradeVolume ?? rules.__dbRow?.trade_volume_filter_time, 2),
+      };
+      console.log(`   Filter times: tradeCount=${filterTime.tradeCount} completionRate=${filterTime.completionRate} tradeVolume=${filterTime.tradeVolume}`);
 
       // Helper function to safely parse integers
       const safeInt = (val) => {
@@ -765,8 +794,8 @@ class SellerAdsController {
         const val = getCriterionValue(rules.min30dayTrades);
         if (val) {
           binancePayload.userTradeCompleteCountMin = safeInt(val);
-          binancePayload.userTradeCountFilterTime = 1; // 1 = last 30 days
-          console.log(`   ✅ Min 30-day trades: ${binancePayload.userTradeCompleteCountMin}`);
+          binancePayload.userTradeCountFilterTime = filterTime.tradeCount;
+          console.log(`   ✅ Min 30-day trades: ${binancePayload.userTradeCompleteCountMin} (filter=${filterTime.tradeCount === 1 ? '30D' : 'All-time'})`);
         }
       } else {
         binancePayload.userTradeCompleteCountMin = 0;
@@ -781,8 +810,8 @@ class SellerAdsController {
           const pct = Math.min(100, Math.max(0, safeFloat(val)));
           const decimalRate = pct / 100;
           binancePayload.userTradeCompleteRateMin = decimalRate;
-          binancePayload.userTradeCompleteRateFilterTime = 1;
-          console.log(`   ✅ Min completion rate: ${pct}% → ${decimalRate}`);
+          binancePayload.userTradeCompleteRateFilterTime = filterTime.completionRate;
+          console.log(`   ✅ Min completion rate: ${pct}% → ${decimalRate} (filter=${filterTime.completionRate === 1 ? '30D' : 'All-time'})`);
         }
       } else {
         binancePayload.userTradeCompleteRateMin = 0;
@@ -814,7 +843,10 @@ class SellerAdsController {
         const val = getCriterionValue(rules.minAllTradesCount);
         if (val) {
           binancePayload.userAllTradeCountMin = safeInt(val);
-          console.log(`   ✅ Min all trades: ${binancePayload.userAllTradeCountMin}`);
+          // All-trades shares the same filter enum as min-30-day trades. Ensure it's
+          // set even when the 30-day-trades criterion above is disabled.
+          binancePayload.userTradeCountFilterTime = filterTime.tradeCount;
+          console.log(`   ✅ Min all trades: ${binancePayload.userAllTradeCountMin} (filter=${filterTime.tradeCount === 1 ? '30D' : 'All-time'})`);
         }
       } else {
         binancePayload.userAllTradeCountMin = 0;
@@ -853,8 +885,8 @@ class SellerAdsController {
         if (val) {
           binancePayload.userTradeVolumeMin = safeFloat(val);
           binancePayload.userTradeVolumeAsset = 'USDT';
-          binancePayload.userTradeVolumeFilterTime = 2;
-          console.log(`   ✅ Min trade volume: ${binancePayload.userTradeVolumeMin} USDT (premium)`);
+          binancePayload.userTradeVolumeFilterTime = filterTime.tradeVolume;
+          console.log(`   ✅ Min trade volume: ${binancePayload.userTradeVolumeMin} USDT (filter=${filterTime.tradeVolume === 1 ? '30D' : 'All-time'})`);
         }
       } else {
         binancePayload.userTradeVolumeMin = 0;
@@ -870,7 +902,7 @@ class SellerAdsController {
             binancePayload.userTradeVolumeAsset = 'USDT';
           }
           if (!binancePayload.userTradeVolumeFilterTime) {
-            binancePayload.userTradeVolumeFilterTime = 2;
+            binancePayload.userTradeVolumeFilterTime = filterTime.tradeVolume;
           }
           console.log(`   ✅ Max trade volume: ${binancePayload.userTradeVolumeMax} USDT (premium)`);
         }
@@ -1020,6 +1052,12 @@ class SellerAdsController {
         dbUpdates.min_btc_holding_enabled = isEnabled ? 1 : 0;
         dbUpdates.min_btc_holding = isEnabled ? (getCriterionValue(rules.minBtcHolding) || 0) : 0;
       }
+
+      // Persist the admin-selected filter times (same values we just sent to
+      // Binance), so the choice survives and feeds the next sync's fallback.
+      dbUpdates.user_trade_count_filter_time = filterTime.tradeCount;
+      dbUpdates.completion_rate_filter_time = filterTime.completionRate;
+      dbUpdates.trade_volume_filter_time = filterTime.tradeVolume;
 
       // Update database
       try {
