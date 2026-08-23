@@ -83,20 +83,20 @@ async function logUsage({ orderNumber = null, model = 'gpt-4o', usage, purpose =
   }
 }
 
-/** Admin-entered purchased credit (USD). */
+/**
+ * Purchased OpenAI credit (USD). Now set via env OPENAI_CREDIT_USD (not the
+ * frontend). Falls back to the old DB value, then 0, so nothing breaks if the env
+ * var isn't set yet on a given server.
+ */
 async function getCreditAdded() {
-  const [rows] = await pool.query('SELECT credit_added_usd FROM openai_credit_config WHERE id = 1');
-  return rows.length ? Number(rows[0].credit_added_usd) : 0;
-}
-
-async function setCreditAdded(usd) {
-  const amount = Math.max(0, Number(usd) || 0);
-  await pool.query(
-    `INSERT INTO openai_credit_config (id, credit_added_usd) VALUES (1, ?)
-     ON DUPLICATE KEY UPDATE credit_added_usd = VALUES(credit_added_usd), updated_at = NOW()`,
-    [amount]
-  );
-  return amount;
+  const envVal = Number(process.env.OPENAI_CREDIT_USD);
+  if (Number.isFinite(envVal) && envVal >= 0) return envVal;
+  try {
+    const [rows] = await pool.query('SELECT credit_added_usd FROM openai_credit_config WHERE id = 1');
+    return rows.length ? Number(rows[0].credit_added_usd) : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -200,7 +200,6 @@ module.exports = {
   logUsage,
   getSummary,
   getCreditAdded,
-  setCreditAdded,
   getRemaining,
   isCreditExhausted,
   tokenOverhead,

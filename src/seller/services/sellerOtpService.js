@@ -166,8 +166,20 @@ async function sendOtpFor(orderNo, mobile) {
   return res('otp_sent', message);
 }
 
-/** First prompt: ask the buyer for their mobile number (handler sends on entry). */
-async function mobileRequestMessage() {
+/**
+ * First prompt: ask the buyer for their mobile number (handler sends on entry).
+ * Method 1 has no document step, so it uses its OWN template that talks about
+ * liveness instead of documents. Method 2/3 keep the original document template.
+ * @param {string} [method] 'method1' → liveness-worded prompt; anything else → docs.
+ */
+async function mobileRequestMessage(method) {
+  if (method === 'method1') {
+    return sellerMessageService.get(
+      'seller_m1_otp_mobile_request',
+      {},
+      'Liveness check completed ✅\nSend me your mobile no for verification.'
+    );
+  }
   return sellerMessageService.get(
     'seller_otp_mobile_request',
     {},

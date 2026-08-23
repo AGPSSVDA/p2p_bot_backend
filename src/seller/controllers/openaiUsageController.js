@@ -16,16 +16,8 @@ class OpenaiUsageController {
     }
   }
 
-  // POST /api/seller/openai/credit   body: { creditAdded: number }
-  async setCredit(req, res) {
-    try {
-      const amount = await openaiUsage.setCreditAdded(req.body?.creditAdded);
-      return res.json({ success: true, creditAdded: amount });
-    } catch (error) {
-      logger.error(`OpenAI set credit error: ${error.message}`, { error });
-      return res.status(500).json({ success: false, error: error.message });
-    }
-  }
+  // Credit is now set via env OPENAI_CREDIT_USD, not the frontend. The old
+  // POST /api/seller/openai/credit endpoint has been removed.
 }
 
 module.exports = new OpenaiUsageController();

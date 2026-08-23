@@ -122,10 +122,8 @@ router.post('/bot/start', (req, res) => sellerBotController.start(req, res));
  */
 
 // GET /api/seller/openai/usage  — spend, remaining, request log
+// (credit is set via env OPENAI_CREDIT_USD, not an endpoint)
 router.get('/openai/usage', (req, res) => openaiUsageController.summary(req, res));
-
-// POST /api/seller/openai/credit  — set the purchased credit amount (USD)
-router.post('/openai/credit', (req, res) => openaiUsageController.setCredit(req, res));
 
 /**
  * ===== SMS OTP CONFIG (editable text + DLT template id) =====

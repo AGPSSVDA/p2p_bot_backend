@@ -523,7 +523,7 @@ class SellerOrderHandler {
         ? dbOrder.buyer_kyc_name : 'Customer';
       if (adRules?.method1_mobile_verification_enabled) {
         logger.info(`[${orderNo}] Method 1 OTP enabled — starting mobile OTP after liveness`);
-        await this.startOtpVerification(orderNo, kycName);
+        await this.startOtpVerification(orderNo, kycName, { method: 'method1' });
         return; // Order is verified only after OTP passes
       }
 
@@ -776,6 +776,9 @@ class SellerOrderHandler {
    */
   async startOtpVerification(orderNo, kycName, options = {}) {
     const resuming = options.resuming === true;
+    // Which method triggered OTP — Method 1 uses a liveness-worded mobile prompt,
+    // Method 2/3 keep the document-worded one. Only affects the first prompt text.
+    const method = options.method;
     try {
       if (this.otpPollers[orderNo]) {
         logger.debug(`[${orderNo}] OTP verification already running`);
@@ -821,7 +824,7 @@ class SellerOrderHandler {
       if (!resuming) {
         await this._sendChat({
           orderNo,
-          content: await sellerOtpService.mobileRequestMessage(),
+          content: await sellerOtpService.mobileRequestMessage(method),
           msgType: 'TEXT',
         });
       }
@@ -1193,6 +1196,28 @@ class SellerOrderHandler {
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.ORDER_VERIFIED);
       await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.ORDER_VERIFIED);
 
+      // Method 1 ONLY: tell the buyer the order is verified and they can pay.
+      // (Method 3 sends its own payment link/QR; Method 2 keeps its current flow.)
+      // We detect "Method 1 only" as: not Method 3 and not Method 2 for this ad.
+      try {
+        const vOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+        const vAdNo = vOrder?.ad_no || this.stateManager.get(orderNo)?.adNo;
+        const vRules = vAdNo ? await sellerOrderDbService.getAdRules(vAdNo) : null;
+        const isMethod1Only = !vRules?.method3_full_enabled && !vRules?.method2_documents_enabled;
+        if (isMethod1Only) {
+          await this._sendChat({
+            orderNo,
+            content: await sellerMessageService.get(
+              'seller_m1_order_verified',
+              {},
+              'Your order is verified. You can pay now.'
+            ),
+          });
+        }
+      } catch (msgErr) {
+        logger.warn(`[${orderNo}] Method 1 verified-message step failed: ${msgErr.message}`);
+      }
+
       // ===== STEP 5: PAYMENT HANDLING =====
       // For Method 1: Binance handles payment automatically
       await this.handlePayment(orderNo);
@@ -1560,9 +1585,9 @@ class SellerOrderHandler {
    */
   async releaseCryptoForOrder(orderNo) {
     try {
-      const totpService = require('../services/totpService');
+      const hasFundPwd = !!process.env.SELLER_FUND_PASSWORD;
       console.log(`\n🔓 [${orderNo}] ===== AUTO-RELEASE START =====`);
-      console.log(`    2FA secret configured : ${totpService.hasSecret() ? 'YES (Google TOTP)' : 'NO (releasing without 2FA)'}`);
+      console.log(`    Fund password configured : ${hasFundPwd ? 'YES (FUND_PWD auto-release)' : 'NO (will fall back to manual)'}`);
 
       // Step A: is release allowed yet?
       console.log(`    Step 1: checkIfCanReleaseCoin ...`);
@@ -1576,9 +1601,25 @@ class SellerOrderHandler {
         return;
       }
 
-      // Step B: release the crypto.
-      console.log(`    Step 2: releaseCoin ...`);
-      const rel = await sellerBinanceService.releaseCoin(orderNo);
+      // Resolve payId + confirmPaidType for the FUND_PWD release. payId comes from
+      // the order detail; confirmPaidType is 'normal' when the buyer has already
+      // paid (order status 2), 'quick' when still pending (status 1).
+      let payId = null;
+      let confirmPaidType = 'normal';
+      try {
+        const detail = await sellerBinanceService.getOrderDetail(orderNo);
+        const d = detail?.raw || {};
+        payId = d.payId ?? d.payMethodId ?? d.selectedPayId ?? detail?.payId ?? null;
+        const status = Number(detail?.orderStatus ?? d.orderStatus);
+        if (status === 1) confirmPaidType = 'quick';
+        console.log(`    payId=${payId != null ? payId : '(none)'} | orderStatus=${status || '?'} → confirmPaidType=${confirmPaidType}`);
+      } catch (dErr) {
+        console.log(`    (order detail lookup failed: ${dErr.message} — releasing without payId)`);
+      }
+
+      // Step B: release the crypto (FUND_PWD method).
+      console.log(`    Step 2: releaseCoin (FUND_PWD) ...`);
+      const rel = await sellerBinanceService.releaseCoin(orderNo, { payId, confirmPaidType });
       console.log(`      → success=${rel.success} code=${rel.code} msg=${rel.message || ''}`);
       console.log(`      → raw: ${JSON.stringify(rel.raw)}`);
       if (!rel.success) {
@@ -1594,7 +1635,7 @@ class SellerOrderHandler {
         return;
       }
 
-      console.log(`    ✅ [${orderNo}] CRYPTO AUTO-RELEASED SUCCESSFULLY (no 2FA needed)`);
+      console.log(`    ✅ [${orderNo}] CRYPTO AUTO-RELEASED SUCCESSFULLY (FUND_PWD)`);
       console.log(`🔓 [${orderNo}] ===== AUTO-RELEASE DONE =====\n`);
       logger.info(`[${orderNo}] ✅ Crypto released`);
       await sellerOrderDbService.recordCryptoReleased(orderNo);

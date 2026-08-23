@@ -31,6 +31,9 @@ const sellerBinanceConfig = {
     // Method 3: release crypto to the buyer after payment is verified.
     checkCanRelease: '/sapi/v1/c2c/orderMatch/checkIfCanReleaseCoin',
     releaseCoin:     '/sapi/v1/c2c/orderMatch/releaseCoin',
+    // RSA public key used to encrypt the fund password for FUND_PWD auto-release
+    // (per Binance support's auto-release doc).
+    rsaPublicKey:    '/sapi/v1/c2c/cryptography/rsa-public-key',
 
     // Chat
     chatCredential:  '/sapi/v1/c2c/chat/retrieveChatCredential',

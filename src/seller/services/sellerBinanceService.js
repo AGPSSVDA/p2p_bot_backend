@@ -216,37 +216,88 @@ async function checkIfCanReleaseCoin(orderNo) {
 }
 
 /**
- * Method 3: Release the crypto to the buyer.
- * Endpoint: POST /sapi/v1/c2c/orderMatch/releaseCoin
- *
- * 2FA: when the account has Google Authenticator, releaseCoin needs a fresh
- * googleVerifyCode (a 30-second TOTP). We generate it on each call from the
- * account's 2FA secret (SELLER_RELEASE_2FA_SECRET) via totpService — a STATIC env
- * code would already be stale. authType defaults to GOOGLE when a secret is set.
- * If no secret is configured the body goes out without a code (works when the
- * account/endpoint doesn't require 2FA — verified live on a no-2FA account); on any
- * failure the caller marks the order READY_TO_RELEASE and the seller releases
- * manually. We surface code+message so the caller can fall back cleanly.
+ * Fetch Binance's RSA public key used to encrypt the fund password.
+ * Endpoint: GET /sapi/v1/c2c/cryptography/rsa-public-key → { data: "<base64 SPKI>" }
+ * (per Binance support's auto-release doc, PDF 1, Step 1.)
  */
-async function releaseCoin(orderNo) {
+async function getRsaPublicKey() {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({});
+    const res = await axios.get(
+      `${url(sellerBinanceConfig.endpoints.rsaPublicKey)}?${qs}`,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const key = res.data?.data;
+    if (!key) throw new Error(`rsa-public-key: no key in response (code ${res.data?.code})`);
+    return key;
+  }, 3, 3000, 'getRsaPublicKey');
+}
+
+/**
+ * Encrypt the fund password with Binance's RSA public key.
+ * The doc specifies Java "RSA/ECB/OAEPWITHSHA-256ANDMGF1PADDING" — the Node
+ * equivalent is RSA_PKCS1_OAEP_PADDING with oaepHash 'sha256' (MGF1 defaults to the
+ * same hash). Verified round-trip locally. `publicKeyBase64` is the base64 SPKI
+ * (DER) string returned by getRsaPublicKey().
+ */
+function encryptFundPassword(fundPassword, publicKeyBase64) {
+  const keyObj = crypto.createPublicKey({
+    key: Buffer.from(publicKeyBase64, 'base64'),
+    format: 'der',
+    type: 'spki',
+  });
+  return crypto.publicEncrypt(
+    { key: keyObj, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+    Buffer.from(String(fundPassword), 'utf-8')
+  ).toString('base64');
+}
+
+/**
+ * Method 3: Release the crypto to the buyer using the FUND PASSWORD method
+ * (Binance support's auto-release doc, PDF 1).
+ *
+ * Flow: fetch the RSA public key → RSA-OAEP-SHA256 encrypt the fund password →
+ * POST releaseCoin with { authType:'FUND_PWD', code:<encrypted>, orderNumber,
+ * payId, confirmPaidType }.
+ *   confirmPaidType 'normal' → order status 2 (buyer already paid)  ← our case
+ *   confirmPaidType 'quick'  → order status 1 (pending buyer payment)
+ *
+ * The fund password comes from env SELLER_FUND_PASSWORD; it is only ever held in
+ * memory, RSA-encrypted per call, and NEVER logged. If it isn't set, we skip the
+ * code (works only if the account needs no auth) so the caller can fall back to
+ * manual release. `payId` and `confirmPaidType` are passed by the caller.
+ *
+ * @param {string} orderNo
+ * @param {object} [opts] { payId, confirmPaidType }
+ */
+async function releaseCoin(orderNo, opts = {}) {
   return withRetry(async () => {
     const qs = buildSignedQuery({ orderNumber: orderNo });
     const body = { orderNumber: orderNo };
+    if (opts.payId != null) body.payId = opts.payId;
+    body.confirmPaidType = opts.confirmPaidType || 'normal';
 
-    // 2FA: prefer a freshly-generated Google Authenticator TOTP; else any static
-    // codes explicitly set for accounts that use email/mobile verification instead.
-    const totpService = require('./totpService');
-    const freshGoogle = totpService.currentGoogleCode();
-    if (freshGoogle) {
-      body.authType = process.env.SELLER_RELEASE_AUTH_TYPE || 'GOOGLE';
-      body.googleVerifyCode = freshGoogle;
+    // FUND_PWD auto-release: encrypt the fund password with Binance's RSA key.
+    const fundPassword = process.env.SELLER_FUND_PASSWORD;
+    if (fundPassword) {
+      try {
+        const pubKey = await getRsaPublicKey();
+        body.authType = 'FUND_PWD';
+        body.code = encryptFundPassword(fundPassword, pubKey);
+      } catch (keyErr) {
+        logger.error(`[${orderNo}] Fund-password encryption failed: ${keyErr.message}`);
+        // Fall through without a code — Binance will reject if auth is required,
+        // and the caller then routes to manual release.
+      }
     } else if (process.env.SELLER_RELEASE_AUTH_TYPE) {
+      // Legacy fallback (e.g. an account still on a static auth type).
       body.authType = process.env.SELLER_RELEASE_AUTH_TYPE;
+      if (process.env.SELLER_RELEASE_GOOGLE_CODE) body.googleVerifyCode = process.env.SELLER_RELEASE_GOOGLE_CODE;
+      if (process.env.SELLER_RELEASE_MOBILE_CODE) body.mobileVerifyCode = process.env.SELLER_RELEASE_MOBILE_CODE;
+      if (process.env.SELLER_RELEASE_EMAIL_CODE) body.emailVerifyCode = process.env.SELLER_RELEASE_EMAIL_CODE;
     }
-    if (!freshGoogle && process.env.SELLER_RELEASE_GOOGLE_CODE) body.googleVerifyCode = process.env.SELLER_RELEASE_GOOGLE_CODE;
-    if (process.env.SELLER_RELEASE_MOBILE_CODE) body.mobileVerifyCode = process.env.SELLER_RELEASE_MOBILE_CODE;
-    if (process.env.SELLER_RELEASE_EMAIL_CODE) body.emailVerifyCode = process.env.SELLER_RELEASE_EMAIL_CODE;
 
+    // Never log the encrypted code or the password.
     const res = await axios.post(
       `${url(sellerBinanceConfig.endpoints.releaseCoin)}?${qs}`,
       body,
@@ -641,6 +692,8 @@ module.exports = {
   verifyAdditionalKyc,
   checkIfCanReleaseCoin,
   releaseCoin,
+  getRsaPublicKey,
+  encryptFundPassword,
   sendMessage,
   getChatCredential,
   getChatMessages,
