@@ -175,7 +175,9 @@ class SellerAdsController {
               mobileVerification: ad.rules?.method3_mobile_verification_enabled || false,
               paymentLink: ad.rules?.method3_payment_link_enabled || false,
               paymentGateway: ad.rules?.method3_payment_gateway || 'easebuzz',
-              deliveryMethod: ad.rules?.method3_delivery_method || 'payment_link'
+              deliveryMethod: ad.rules?.method3_delivery_method || 'payment_link',
+              expressQrEnabled: ad.rules?.method3_express_qr_enabled === 1 || ad.rules?.method3_express_qr_enabled === true,
+              expressLinkEnabled: ad.rules?.method3_express_link_enabled === 1 || ad.rules?.method3_express_link_enabled === true
             }
           },
           cooldown: {
@@ -310,7 +312,9 @@ class SellerAdsController {
               mobileVerification: ad.rules.method3_mobile_verification_enabled,
               paymentLink: ad.rules.method3_payment_link_enabled,
               paymentGateway: ad.rules.method3_payment_gateway,
-              deliveryMethod: ad.rules.method3_delivery_method
+              deliveryMethod: ad.rules.method3_delivery_method,
+              expressQrEnabled: ad.rules.method3_express_qr_enabled === 1 || ad.rules.method3_express_qr_enabled === true,
+              expressLinkEnabled: ad.rules.method3_express_link_enabled === 1 || ad.rules.method3_express_link_enabled === true
             }
           },
           cooldown: {
@@ -593,6 +597,8 @@ class SellerAdsController {
             method3_payment_link_enabled: asBool(methods.method3?.paymentLink),
             method3_payment_gateway: methods.method3?.paymentGateway || 'easebuzz',
             method3_delivery_method: methods.method3?.deliveryMethod || 'payment_link',
+            method3_express_qr_enabled: asBool(methods.method3?.expressQrEnabled),
+            method3_express_link_enabled: asBool(methods.method3?.expressLinkEnabled),
           }
         : {
             method1_liveness_enabled: asBool(req.body.method1_liveness_enabled),
@@ -604,6 +610,8 @@ class SellerAdsController {
             method3_payment_link_enabled: asBool(req.body.method3_payment_link_enabled),
             method3_payment_gateway: req.body.method3_payment_gateway || 'easebuzz',
             method3_delivery_method: req.body.method3_delivery_method || 'payment_link',
+            method3_express_qr_enabled: asBool(req.body.method3_express_qr_enabled),
+            method3_express_link_enabled: asBool(req.body.method3_express_link_enabled),
           };
 
       // Methods are optional — admin may enable any, all, or none. With no

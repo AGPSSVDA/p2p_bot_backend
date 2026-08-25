@@ -164,6 +164,38 @@ async function getUserDetails(userId) {
 }
 
 /**
+ * Get the seller's own UPI details (UPI ID + payee name) from their configured
+ * payment methods. Used for the Express UPI flow: Binance leaves the Express UPI
+ * QR field empty (can't be set via API), so we build a UPI QR from the seller's
+ * real UPI ID (which IS filled on their normal UPI method) and show it to the buyer.
+ * Endpoint: GET /sapi/v1/c2c/paymentMethod/getPayMethodByUserId
+ * @returns {Promise<{upiId:string|null, payeeName:string|null}>}
+ */
+async function getSellerUpiDetails() {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({});
+    const res = await axios.get(
+      `${url('/sapi/v1/c2c/paymentMethod/getPayMethodByUserId')}?${qs}`,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const methods = res.data?.data || [];
+    // Prefer a plain UPI method that has a pay_account (UPI ID) filled in.
+    for (const m of methods) {
+      const ident = (m.tradeMethodIdentifier || m.tradeMethod?.identifier || '').toLowerCase();
+      // Skip the Express UPI method itself (its fields are empty) and take a normal UPI.
+      if (ident.includes('p2plus') || ident.includes('express')) continue;
+      const fields = m.fieldList || [];
+      const acct = fields.find(f => f.fieldContentType === 'pay_account' && f.fieldValue);
+      if (acct && /^[\w.\-]+@[\w.\-]+$/.test(String(acct.fieldValue).trim())) {
+        const payee = fields.find(f => f.fieldContentType === 'payee' && f.fieldValue);
+        return { upiId: String(acct.fieldValue).trim(), payeeName: payee?.fieldValue || null };
+      }
+    }
+    return { upiId: null, payeeName: null };
+  }, 3, 3000, 'getSellerUpiDetails');
+}
+
+/**
  * Verify Additional KYC — confirms the order on Binance's side.
  * Endpoint: POST /sapi/v1/c2c/orderMatch/verifiedAdditionalKyc
  *
@@ -305,7 +337,34 @@ async function releaseCoin(orderNo, opts = {}) {
     );
     const success = res.data?.code === '000000' || res.data?.code === 0 || res.status === 200;
     return { success, code: res.data?.code, message: res.data?.message || res.data?.msg || 'release requested', raw: res.data };
-  }, 3, 3000, `releaseCoin:${orderNo}`);
+    // retries=1: a release must NEVER re-send the fund password. A wrong password
+    // is aborted by withRetry's 83895/83896 guard anyway; this is belt-and-braces.
+  }, 1, 3000, `releaseCoin:${orderNo}`);
+}
+
+/**
+ * Method 3 auto-release via the EXPRESS-UPI / Lightning endpoint.
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/releaseOrder
+ *
+ * Per Binance support's Express-UPI reply, this needs NO fund password and NO 2FA
+ * — just a standard signed request with the order number. This is the preferred
+ * auto-release path for Express-UPI-enabled (whitelisted) merchant accounts.
+ *
+ * The orderNo goes in the signed query (like our other signed POSTs); the body
+ * carries orderNo too. Signature/timestamp are handled by buildSignedQuery. On any
+ * failure we surface code+message so the caller can fall back to manual release.
+ */
+async function releaseOrder(orderNo) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ orderNumber: orderNo });
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.releaseOrder)}?${qs}`,
+      { orderNumber: orderNo },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const success = res.data?.code === '000000' || res.data?.code === 0 || res.status === 200;
+    return { success, code: res.data?.code, message: res.data?.message || res.data?.msg || 'release requested', raw: res.data };
+  }, 1, 3000, `releaseOrder:${orderNo}`);
 }
 
 /**
@@ -689,9 +748,11 @@ module.exports = {
   getOrderStatusAllStates,
   getCounterPartyOrderStats,
   getUserDetails,
+  getSellerUpiDetails,
   verifyAdditionalKyc,
   checkIfCanReleaseCoin,
   releaseCoin,
+  releaseOrder,
   getRsaPublicKey,
   encryptFundPassword,
   sendMessage,

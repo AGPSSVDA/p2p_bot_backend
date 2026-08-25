@@ -257,6 +257,15 @@ async function withRetry(fn, retries = 3, delayMs = 3000, label = '') {
       }
       logger.warn(`${label} attempt ${i}/${retries} failed`, meta);
 
+      // NEVER retry a wrong fund/security password — Binance locks the account
+      // after 3 wrong attempts. 83893 = "last chance", 83895/83896 = fund password
+      // incorrect. Abort immediately so one release attempt only ever consumes ONE
+      // password try (a retry here could burn the last chance and lock the account).
+      if (bizCode === 83893 || bizCode === 83895 || bizCode === 83896) {
+        logger.error(`${label}: wrong/last-chance fund password (code ${bizCode}) — aborting (NOT retrying) to preserve remaining attempts`);
+        throw err;
+      }
+
       // -1021: Timestamp drifted out of tolerance — re-sync immediately
       // and shrink the wait so the next retry uses the fresh offset.
       if (bizCode === -1021 && i < retries) {

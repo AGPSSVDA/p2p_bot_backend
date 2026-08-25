@@ -845,8 +845,9 @@ class SellerOrderDbService {
         method2_documents_enabled,
         method2_mobile_verification_enabled, method3_full_enabled,
         method3_mobile_verification_enabled, method3_payment_link_enabled,
-        method3_payment_gateway, method3_delivery_method
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        method3_payment_gateway, method3_delivery_method,
+        method3_express_qr_enabled, method3_express_link_enabled
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         method1_liveness_enabled = VALUES(method1_liveness_enabled),
         method1_mobile_verification_enabled = VALUES(method1_mobile_verification_enabled),
@@ -857,6 +858,8 @@ class SellerOrderDbService {
         method3_payment_link_enabled = VALUES(method3_payment_link_enabled),
         method3_payment_gateway = VALUES(method3_payment_gateway),
         method3_delivery_method = VALUES(method3_delivery_method),
+        method3_express_qr_enabled = VALUES(method3_express_qr_enabled),
+        method3_express_link_enabled = VALUES(method3_express_link_enabled),
         updated_at = NOW()
     `;
 
@@ -872,6 +875,8 @@ class SellerOrderDbService {
       methods.method3_payment_link_enabled ? 1 : 0,
       methods.method3_payment_gateway || 'easebuzz',
       methods.method3_delivery_method || 'payment_link',
+      methods.method3_express_qr_enabled ? 1 : 0,
+      methods.method3_express_link_enabled ? 1 : 0,
     ]);
 
     // insert -> affectedRows 1; update with changes -> 1 or 2. updated_at=NOW()

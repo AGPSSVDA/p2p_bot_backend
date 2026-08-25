@@ -18,6 +18,18 @@ const qrService = require('../services/qrService');
 // vs KYC. Buyer-side helpers.matchNames() is left untouched.
 const { matchNamesLoose: matchNames } = require('../utils/sellerUtils');
 
+/**
+ * Pick the first usable payId from candidates. A usable id is present and not 0
+ * (UPI orders often carry payId:0, which is not the real payment-method id).
+ * Returns null when none qualify.
+ */
+function pickPayId(...candidates) {
+  for (const c of candidates) {
+    if (c != null && Number(c) > 0) return c;
+  }
+  return null;
+}
+
 class SellerOrderHandler {
   constructor() {
     this.stateManager = new SellerStateManager();
@@ -1388,6 +1400,18 @@ class SellerOrderHandler {
       // Fall back to Easebuzz for any unconfigured/unsupported gateway (old ads
       // still carry 'razorpay', which isn't wired) so Method 3 never dead-ends.
       let gateway = (adRules.method3_payment_gateway || 'easebuzz').toLowerCase();
+
+      // ===== EXPRESS UPI gateway =====
+      // When the admin picks Express UPI, we do NOT send a payment link/QR — the
+      // buyer pays through Binance's own Express UPI, and Binance reports the order
+      // as paid (status 2). The bot just watches the order status; once the buyer
+      // has paid, it auto-releases the crypto. No Easebuzz, no gateway polling.
+      if (gateway === 'express_upi' || gateway === 'express' || gateway === 'expressupi') {
+        logger.info(`[${orderNo}] Method 3: Express UPI — no payment link; watching Binance for payment then auto-release`);
+        await this.startExpressUpiFlow(orderNo, adRules);
+        return;
+      }
+
       if (!paymentGatewayService.isSupported(gateway)) {
         logger.warn(`[${orderNo}] Method 3: gateway '${gateway}' not supported — falling back to easebuzz`);
         gateway = 'easebuzz';
@@ -1477,6 +1501,141 @@ class SellerOrderHandler {
     } catch (error) {
       logger.error(`Method 3 payment start error: ${error.message}`, { orderNo });
       await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /**
+   * ===== METHOD 3: EXPRESS UPI FLOW =====
+   * No payment link/QR. The buyer pays through Binance's own Express UPI, so
+   * Binance moves the order to status 2 (WAIT_RELEASE) once they've paid. We poll
+   * the order status; the moment it reads "paid", we auto-release the crypto
+   * (checkIfCanReleaseCoin → releaseCoin via fund password). Binance itself owns the
+   * payment verification and name match for Express UPI, so the bot's job is simply:
+   * detect paid → release.
+   */
+  async startExpressUpiFlow(orderNo, adRules = {}) {
+    try {
+      const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
+      const amount = Number(dbOrder?.fiat_amount || dbOrder?.total_price || 0) || undefined;
+      const fiat = dbOrder?.fiat_unit || 'INR';
+
+      // Binance leaves the Express UPI QR field empty (can't be set via API), so we
+      // give the buyer the seller's real UPI ID — as a scannable QR and/or the UPI
+      // link — based on the admin's choice (Enable QR / Enable Link on the ad).
+      const wantQr = adRules.method3_express_qr_enabled === 1 || adRules.method3_express_qr_enabled === true;
+      const wantLink = adRules.method3_express_link_enabled === 1 || adRules.method3_express_link_enabled === true;
+
+      let upi = { upiId: null, payeeName: null };
+      try { upi = await sellerBinanceService.getSellerUpiDetails(); } catch (e) { /* fall back to generic message */ }
+
+      // Intro message (editable template).
+      await this._sendChat({
+        orderNo,
+        content: await sellerMessageService.get(
+          'seller_m3_express_upi_pay',
+          { amount: amount || '', fiat },
+          'Your order is verified. Please complete the payment via UPI below. Your crypto will be released automatically once payment is confirmed.'
+        ),
+      });
+
+      if (upi.upiId && (wantQr || wantLink)) {
+        const { upiLink, url: qrUrl } = await qrService.generateUpiQr({
+          orderNo, upiId: upi.upiId, payeeName: upi.payeeName, amount, note: `Order ${orderNo}`,
+        });
+        // Enable QR → send the scannable QR image URL.
+        if (wantQr && qrUrl) {
+          await this._sendChat({
+            orderNo,
+            content: await sellerMessageService.get(
+              'seller_m3_express_qr',
+              { qr: qrUrl, amount: amount || '', fiat, upiId: upi.upiId },
+              `Scan this QR to pay ${amount || ''} ${fiat}: ${qrUrl}`
+            ),
+          });
+        }
+        // Enable Link → send the UPI id + upi:// link.
+        if (wantLink) {
+          await this._sendChat({
+            orderNo,
+            content: await sellerMessageService.get(
+              'seller_m3_express_link',
+              { upiId: upi.upiId, link: upiLink || '', amount: amount || '', fiat },
+              `Pay ${amount || ''} ${fiat} to UPI ID: ${upi.upiId}`
+            ),
+          });
+        }
+      } else if (!upi.upiId) {
+        logger.warn(`[${orderNo}] Express UPI: no seller UPI ID found — buyer must use the Binance Express UPI screen`);
+      }
+
+      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
+      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
+
+      if (this.gatewayPollers[orderNo]) return; // already watching
+      let pollCount = 0;
+      let busy = false;
+      const INTERVAL = Number(process.env.SELLER_EXPRESS_POLL_INTERVAL) || 10000; // 10s
+      const MAX_POLLS = Number(process.env.SELLER_EXPRESS_MAX_POLLS) || 8640;      // ~24h
+
+      console.log(`\n🟢 [${orderNo}] EXPRESS UPI: watching Binance order status for payment...`);
+
+      const poll = setInterval(async () => {
+        if (busy) return;
+        busy = true;
+        try {
+          pollCount++;
+          // Query across all states so we see 2 (paid), 4 (done), 6/7 (cancelled).
+          const st = await sellerBinanceService.getOrderStatusAllStates(orderNo);
+          if (!st?.success) { busy = false; return; }
+          const status = Number(st.orderStatus);
+
+          if (status === 2) {
+            // ✅ Buyer paid via Express UPI → auto-release now.
+            console.log(`🟢 [${orderNo}] EXPRESS UPI: buyer PAID (status 2) → auto-releasing`);
+            logger.info(`[${orderNo}] Express UPI payment confirmed (status 2) — auto-releasing`);
+            this._clearExpressPoller(orderNo);
+            await sellerOrderDbService.recordPaymentReceived?.(orderNo);
+            await this.releaseCryptoForOrder(orderNo);
+            return;
+          }
+          if (status === 4) {
+            // Already completed (Binance released it itself, e.g. Lightning-style).
+            console.log(`🟢 [${orderNo}] EXPRESS UPI: order COMPLETED (status 4) — finalizing`);
+            this._clearExpressPoller(orderNo);
+            await this.finalizeCompletedOrder(orderNo);
+            return;
+          }
+          if (status === 6 || status === 7) {
+            console.log(`🟢 [${orderNo}] EXPRESS UPI: order CANCELLED (status ${status}) — stopping`);
+            this._clearExpressPoller(orderNo);
+            this.stateManager.setState(orderNo, SELLER_ORDER_STATES.CANCELLED);
+            await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.CANCELLED, 'Express UPI: order cancelled');
+            return;
+          }
+
+          if (pollCount >= MAX_POLLS) {
+            console.log(`🟢 [${orderNo}] EXPRESS UPI: payment window ended (timeout)`);
+            this._clearExpressPoller(orderNo);
+          }
+        } catch (e) {
+          logger.warn(`[${orderNo}] Express UPI poll error: ${e.message}`);
+        } finally {
+          busy = false;
+        }
+      }, INTERVAL);
+
+      this.gatewayPollers[orderNo] = poll;
+    } catch (error) {
+      logger.error(`[${orderNo}] startExpressUpiFlow error: ${error.message}`);
+      await sellerOrderDbService.recordError(orderNo, error.message);
+    }
+  }
+
+  /** Stop the Express UPI order-status poller. */
+  _clearExpressPoller(orderNo) {
+    if (this.gatewayPollers[orderNo]) {
+      clearInterval(this.gatewayPollers[orderNo]);
+      delete this.gatewayPollers[orderNo];
     }
   }
 
@@ -1609,9 +1768,17 @@ class SellerOrderHandler {
       try {
         const detail = await sellerBinanceService.getOrderDetail(orderNo);
         const d = detail?.raw || {};
-        payId = d.payId ?? d.payMethodId ?? d.selectedPayId ?? detail?.payId ?? null;
+        // selectedPayId is the real payment-method id (e.g. 73161742). Prefer it —
+        // d.payId is often 0 for UPI, and `??` would wrongly keep that 0. Fall back
+        // to payMethods[0].id, then any non-zero payId.
+        const firstMethodId = Array.isArray(d.payMethods) && d.payMethods[0] ? d.payMethods[0].id : null;
+        payId = pickPayId(d.selectedPayId, firstMethodId, d.payMethodId, d.payId);
         const status = Number(detail?.orderStatus ?? d.orderStatus);
-        if (status === 1) confirmPaidType = 'quick';
+        // Per Binance's doc: confirmPaidType 'normal' = order status 2 (buyer paid),
+        // 'quick' = order status 1 (pending buyer payment on Binance). Our gateway
+        // already collected the money, but the buyer may not have pressed "Mark as
+        // Paid" on Binance, so the order can still be status 1 → quick.
+        confirmPaidType = (status === 1) ? 'quick' : 'normal';
         console.log(`    payId=${payId != null ? payId : '(none)'} | orderStatus=${status || '?'} → confirmPaidType=${confirmPaidType}`);
       } catch (dErr) {
         console.log(`    (order detail lookup failed: ${dErr.message} — releasing without payId)`);

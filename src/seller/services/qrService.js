@@ -65,4 +65,31 @@ async function generatePaymentQr(data, orderNo) {
   }
 }
 
-module.exports = { generatePaymentQr };
+/**
+ * Build a UPI payment deep-link string from the seller's UPI ID.
+ * Format: upi://pay?pa=<upiId>&pn=<payeeName>&am=<amount>&cu=INR&tn=<note>
+ * This is what any UPI app (GPay/PhonePe/Paytm) opens to pre-fill a payment.
+ */
+function buildUpiLink({ upiId, payeeName, amount, note }) {
+  const p = new URLSearchParams();
+  p.set('pa', upiId);
+  if (payeeName) p.set('pn', payeeName);
+  if (amount) p.set('am', String(amount));
+  p.set('cu', 'INR');
+  if (note) p.set('tn', note);
+  return `upi://pay?${p.toString()}`;
+}
+
+/**
+ * Generate a scannable UPI QR for the seller's UPI ID + order amount. Returns the
+ * public image URL plus the raw upi:// link (handy if the buyer prefers a link).
+ * @returns {Promise<{success, url?, upiLink?, filePath?, message?}>}
+ */
+async function generateUpiQr({ orderNo, upiId, payeeName, amount, note }) {
+  if (!upiId) return { success: false, message: 'no UPI ID' };
+  const upiLink = buildUpiLink({ upiId, payeeName, amount, note });
+  const res = await generatePaymentQr(upiLink, `upi_${orderNo}`);
+  return { ...res, upiLink };
+}
+
+module.exports = { generatePaymentQr, generateUpiQr, buildUpiLink };
