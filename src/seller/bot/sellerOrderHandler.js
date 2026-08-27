@@ -1518,15 +1518,13 @@ class SellerOrderHandler {
       const dbOrder = await sellerOrderDbService.getOrderByNumber(orderNo);
       const amount = Number(dbOrder?.fiat_amount || dbOrder?.total_price || 0) || undefined;
       const fiat = dbOrder?.fiat_unit || 'INR';
+      const kycName = dbOrder?.buyer_kyc_name && dbOrder.buyer_kyc_name !== '(Unknown)'
+        ? dbOrder.buyer_kyc_name : 'Customer';
+      const phone = dbOrder?.mobile_number || null;
 
-      // Binance leaves the Express UPI QR field empty (can't be set via API), so we
-      // give the buyer the seller's real UPI ID — as a scannable QR and/or the UPI
-      // link — based on the admin's choice (Enable QR / Enable Link on the ad).
+      // Admin chose whether to give the buyer a QR image, a payment link, or both.
       const wantQr = adRules.method3_express_qr_enabled === 1 || adRules.method3_express_qr_enabled === true;
       const wantLink = adRules.method3_express_link_enabled === 1 || adRules.method3_express_link_enabled === true;
-
-      let upi = { upiId: null, payeeName: null };
-      try { upi = await sellerBinanceService.getSellerUpiDetails(); } catch (e) { /* fall back to generic message */ }
 
       // Intro message (editable template).
       await this._sendChat({
@@ -1534,38 +1532,23 @@ class SellerOrderHandler {
         content: await sellerMessageService.get(
           'seller_m3_express_upi_pay',
           { amount: amount || '', fiat },
-          'Your order is verified. Please complete the payment via UPI below. Your crypto will be released automatically once payment is confirmed.'
+          'Your order is verified. Please complete the payment shown on your Binance order screen. Your crypto will be released automatically once payment is confirmed.'
         ),
       });
 
-      if (upi.upiId && (wantQr || wantLink)) {
-        const { upiLink, url: qrUrl } = await qrService.generateUpiQr({
-          orderNo, upiId: upi.upiId, payeeName: upi.payeeName, amount, note: `Order ${orderNo}`,
-        });
-        // Enable QR → send the scannable QR image URL.
-        if (wantQr && qrUrl) {
-          await this._sendChat({
-            orderNo,
-            content: await sellerMessageService.get(
-              'seller_m3_express_qr',
-              { qr: qrUrl, amount: amount || '', fiat, upiId: upi.upiId },
-              `Scan this QR to pay ${amount || ''} ${fiat}: ${qrUrl}`
-            ),
-          });
+      // Upload the one-time payment detail (Easebuzz QR/link) INTO the order so
+      // Binance shows it on the buyer's Express UPI screen (fixes "Payment details
+      // not ready"). Per Binance's p2plus doc: uploadOrderPaymentMethod.
+      // SELLER_EXPRESS_SKIP_UPLOAD=true leaves the order un-uploaded (only 1 upload
+      // allowed per order) so we can test the field format manually on a fresh order.
+      if (String(process.env.SELLER_EXPRESS_SKIP_UPLOAD).toLowerCase() === 'true') {
+        console.log(`\n⏭️  [${orderNo}] EXPRESS UPI: auto-upload SKIPPED (SELLER_EXPRESS_SKIP_UPLOAD=true)`);
+      } else {
+        try {
+          await this.uploadExpressUpiPaymentDetail(orderNo, { amount, fiat, kycName, phone, wantQr, wantLink });
+        } catch (upErr) {
+          logger.error(`[${orderNo}] Express UPI upload failed: ${upErr.message}`);
         }
-        // Enable Link → send the UPI id + upi:// link.
-        if (wantLink) {
-          await this._sendChat({
-            orderNo,
-            content: await sellerMessageService.get(
-              'seller_m3_express_link',
-              { upiId: upi.upiId, link: upiLink || '', amount: amount || '', fiat },
-              `Pay ${amount || ''} ${fiat} to UPI ID: ${upi.upiId}`
-            ),
-          });
-        }
-      } else if (!upi.upiId) {
-        logger.warn(`[${orderNo}] Express UPI: no seller UPI ID found — buyer must use the Binance Express UPI screen`);
       }
 
       this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
@@ -1629,6 +1612,74 @@ class SellerOrderHandler {
       logger.error(`[${orderNo}] startExpressUpiFlow error: ${error.message}`);
       await sellerOrderDbService.recordError(orderNo, error.message);
     }
+  }
+
+  /**
+   * Upload the one-time Express UPI payment detail into the order (fixes the
+   * buyer's "Payment details not ready"). Uses the EASEBUZZ gateway (same as the
+   * normal Method 3 flow) — so we get a real payment link + a QR of that link, plus
+   * gateway payment tracking. Per Binance's p2plus doc:
+   *   1. Easebuzz createLink → payment link (+ we render its QR)
+   *   2. getTradeMethodDetail(identifier) → the upload field ids
+   *   3. uploadOrderPaymentMethod(orderNo, identifier, [{id, fieldValue}])
+   * Only done ONCE per order. `wantQr`/`wantLink` = admin's dashboard choice.
+   * @returns {Promise<{merchantTxn:string|null}>} so the caller can poll the gateway.
+   */
+  async uploadExpressUpiPaymentDetail(orderNo, { amount, fiat, kycName, phone, wantQr, wantLink }) {
+    // Which p2plus method is on this order?
+    const detail = await sellerBinanceService.getOrderDetail(orderNo);
+    const method = (detail?.raw?.payMethods || []).find(m => /p2plus|express/i.test(m.identifier || ''));
+    const identifier = method?.identifier;
+    if (!identifier) { logger.warn(`[${orderNo}] Express UPI: no p2plus method on order`); return { merchantTxn: null }; }
+
+    // Easebuzz payment link (same as normal Method 3) + a QR image of that link.
+    const linkRes = await paymentGatewayService.createLink('easebuzz', {
+      orderNo, amount, name: kycName, phone,
+    });
+    if (!linkRes.success || !linkRes.link) {
+      logger.error(`[${orderNo}] Express UPI: Easebuzz link creation failed`, { detail: linkRes.message });
+      return { merchantTxn: null };
+    }
+    await sellerOrderDbService.savePaymentLink(orderNo, {
+      gateway: 'easebuzz', link: linkRes.link, merchantTxn: linkRes.merchantTxn, amount,
+    });
+    let qrUrl = null;
+    try {
+      const qr = await qrService.generatePaymentQr(linkRes.link, orderNo);
+      if (qr.success) qrUrl = qr.url;
+    } catch (e) { /* QR optional */ }
+
+    // Field ids for this method (which field.id is the QR-url / button).
+    const md = await sellerBinanceService.getTradeMethodDetail(identifier);
+    const qrField = (md.fields || []).find(f => f.fieldContentType === 'upload_qr_code_url');
+
+    // Only ONE upload is allowed per order, so we send ONE fieldList. We use the QR
+    // field (upload_qr_code_url) — verified working live (code 000000). It encodes
+    // the Easebuzz payment link, so the buyer scans it to pay whether the admin
+    // picked "QR" or "Link". (The button field's exact JSON format is unconfirmed;
+    // mixing it in risks failing the whole upload, so we keep to the reliable QR.)
+    const fieldList = [];
+    if (qrField && qrUrl) {
+      fieldList.push({ id: String(qrField.id), fieldValue: qrUrl });
+    }
+    if (!fieldList.length) {
+      logger.warn(`[${orderNo}] Express UPI: no QR field/url to upload (qrField=${!!qrField} qrUrl=${!!qrUrl})`);
+      return { merchantTxn: linkRes.merchantTxn };
+    }
+
+    console.log(`\n📤 [${orderNo}] EXPRESS UPI: uploading Easebuzz payment detail to order (${identifier}) fields=${fieldList.map(f => f.id).join(',')}`);
+    const res = await sellerBinanceService.uploadOrderPaymentMethod(orderNo, identifier, fieldList);
+    console.log(`   → success=${res.success} code=${res.code} msg=${res.message || ''}`);
+    // -9000 "Payment method already uploaded" means a prior upload succeeded — a
+    // buyer already has the payment detail. Only ONE upload is allowed per order,
+    // so treat this as success (idempotent), not a failure.
+    const alreadyUploaded = String(res.code) === '-9000' && /already uploaded/i.test(res.message || '');
+    if (!res.success && !alreadyUploaded) {
+      logger.error(`[${orderNo}] uploadOrderPaymentMethod failed`, { code: res.code, message: res.message, raw: res.raw });
+    } else {
+      logger.info(`[${orderNo}] ✅ Express UPI payment detail ${alreadyUploaded ? 'already present' : 'uploaded'} — buyer can now pay`);
+    }
+    return { merchantTxn: linkRes.merchantTxn };
   }
 
   /** Stop the Express UPI order-status poller. */

@@ -196,6 +196,58 @@ async function getSellerUpiDetails() {
 }
 
 /**
+ * Get a p2plus trade-method's upload fields (id + fieldId + contentType).
+ * Endpoint: GET /sapi/v1/c2c/paymentMethod/getTradeMethodDetail?identifier=...
+ * Needed before uploadOrderPaymentMethod so we know which field.id carries the QR.
+ * @returns {Promise<{id, name, fields:[{id, fieldId, fieldContentType, fieldTitle}]}>}
+ */
+async function getTradeMethodDetail(identifier) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({ identifier });
+    const res = await axios.get(
+      `${url(sellerBinanceConfig.endpoints.getTradeMethodDetail)}?${qs}`,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const d = res.data?.data || {};
+    return {
+      id: d.id,
+      identifier: d.identifier,
+      name: d.name,
+      fields: (d.fieldList || []).map(f => ({
+        id: f.id, fieldId: f.fieldId, fieldContentType: f.fieldContentType, fieldTitle: f.fieldTitle,
+      })),
+    };
+  }, 3, 3000, `getTradeMethodDetail:${identifier}`);
+}
+
+/**
+ * Upload a one-time payment detail (QR URL / link / button JSON) into a specific
+ * ORDER for a p2plus payment method (per Binance's p2plus integration doc).
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/uploadOrderPaymentMethod
+ * Body: { orderNo, tradeMethodIdentifier, fieldList:[{ id, fieldValue }] }
+ *
+ * NOTE: this is what fills the buyer's "Payment details not ready" — it's an
+ * ORDER-level upload (not ad-level, which silently ignores QR). Can be done ONCE
+ * per order.
+ * @param {string} orderNo
+ * @param {string} identifier  the p2plus trade-method identifier (e.g. p2plusIndiaUPI)
+ * @param {Array<{id:string, fieldValue:string}>} fieldList
+ */
+async function uploadOrderPaymentMethod(orderNo, identifier, fieldList) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({});
+    const body = { orderNo, tradeMethodIdentifier: identifier, fieldList };
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.uploadOrderPaymentMethod)}?${qs}`,
+      body,
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const success = res.data?.code === '000000' || res.data?.code === 0 || res.status === 200;
+    return { success, code: res.data?.code, message: res.data?.message || res.data?.msg, raw: res.data };
+  }, 2, 3000, `uploadOrderPaymentMethod:${orderNo}`);
+}
+
+/**
  * Verify Additional KYC — confirms the order on Binance's side.
  * Endpoint: POST /sapi/v1/c2c/orderMatch/verifiedAdditionalKyc
  *
@@ -749,6 +801,8 @@ module.exports = {
   getCounterPartyOrderStats,
   getUserDetails,
   getSellerUpiDetails,
+  getTradeMethodDetail,
+  uploadOrderPaymentMethod,
   verifyAdditionalKyc,
   checkIfCanReleaseCoin,
   releaseCoin,

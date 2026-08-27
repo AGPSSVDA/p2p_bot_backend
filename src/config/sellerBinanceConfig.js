@@ -34,6 +34,10 @@ const sellerBinanceConfig = {
     // Express-UPI / Lightning auto-release: NO fund password / 2FA. Just a signed
     // POST with orderNo (per Binance support's Express-UPI reply). Preferred method.
     releaseOrder:    '/sapi/v1/c2c/orderMatch/releaseOrder',
+    // p2plus / Express UPI: fetch a trade-method's upload fields, and upload the
+    // one-time QR/link into a specific ORDER (per Binance's p2plus integration doc).
+    getTradeMethodDetail:     '/sapi/v1/c2c/paymentMethod/getTradeMethodDetail',
+    uploadOrderPaymentMethod: '/sapi/v1/c2c/orderMatch/uploadOrderPaymentMethod',
     // RSA public key used to encrypt the fund password for FUND_PWD auto-release
     // (per Binance support's auto-release doc).
     rsaPublicKey:    '/sapi/v1/c2c/cryptography/rsa-public-key',
