@@ -1649,21 +1649,24 @@ class SellerOrderHandler {
       if (qr.success) qrUrl = qr.url;
     } catch (e) { /* QR optional */ }
 
-    // Field ids for this method (which field.id is the QR-url / button).
+    // Field ids for this method. The QR field (upload_qr_code_url, id=2507) is the
+    // one that works — verified live (code 000000). It accepts EITHER a QR image URL
+    // OR the raw payment link, so we use it for both admin choices:
+    //   - "Enable QR"   → upload the QR image URL (buyer scans it)
+    //   - "Enable Link" → upload the Easebuzz payment link directly
+    // (The button field id=2508 needs an undocumented JSON format that all attempts
+    //  rejected with 83996, so we don't use it.) Only ONE upload per order is allowed.
     const md = await sellerBinanceService.getTradeMethodDetail(identifier);
     const qrField = (md.fields || []).find(f => f.fieldContentType === 'upload_qr_code_url');
 
-    // Only ONE upload is allowed per order, so we send ONE fieldList. We use the QR
-    // field (upload_qr_code_url) — verified working live (code 000000). It encodes
-    // the Easebuzz payment link, so the buyer scans it to pay whether the admin
-    // picked "QR" or "Link". (The button field's exact JSON format is unconfirmed;
-    // mixing it in risks failing the whole upload, so we keep to the reliable QR.)
+    // Choose the value: Link → raw payment link; otherwise → QR image URL.
+    const value = wantLink && !wantQr ? linkRes.link : (qrUrl || linkRes.link);
     const fieldList = [];
-    if (qrField && qrUrl) {
-      fieldList.push({ id: String(qrField.id), fieldValue: qrUrl });
+    if (qrField && value) {
+      fieldList.push({ id: String(qrField.id), fieldValue: value });
     }
     if (!fieldList.length) {
-      logger.warn(`[${orderNo}] Express UPI: no QR field/url to upload (qrField=${!!qrField} qrUrl=${!!qrUrl})`);
+      logger.warn(`[${orderNo}] Express UPI: no field/value to upload (qrField=${!!qrField})`);
       return { merchantTxn: linkRes.merchantTxn };
     }
 
