@@ -804,26 +804,26 @@ class SellerAdsController {
       // Add eligibility criteria - include enabled AND send reset values for disabled ones
       console.log(`   Checking criteria...`);
 
-      // Min 30-day trades — maps to userAllTradeCountMin, NOT userTradeCompleteCountMin.
-      // Verified live (2026-08-16): userTradeCompleteCountMin sets on the ad and reads
-      // back fine but does NOT actually block the order (even with All-time filter) — a
-      // buyer below the minimum still ordered. userAllTradeCountMin DOES block (a buyer
-      // with 23 all-trades was blocked by min 25). So we send this criterion as
-      // userAllTradeCountMin. Because "Min All Trades Count" below also uses that same
-      // Binance field, the two are merged — the HIGHER of the two wins (stricter).
-      // userTradeCompleteCountMin is force-reset to 0 so a stale value can't linger.
+      // "Max Trades (completed)" — maps to userAllTradeCountMax (verified live: sticks
+      // and blocks). This is a MAX: e.g. 20 means buyers with FEWER than 20 all-time
+      // trades can order, and buyers with 20+ are blocked. (Field rules.min30dayTrades
+      // is the same UI slot; it now means "max".) userTradeCompleteCountMin is
+      // force-reset to 0 so a stale value from the old min-behaviour can't linger.
       binancePayload.userTradeCompleteCountMin = 0;
-      let allTradeMin = 0;
       if (isCriterionEnabled(rules.min30dayTrades)) {
         const val = safeInt(getCriterionValue(rules.min30dayTrades));
         if (val > 0) {
-          allTradeMin = val;
+          binancePayload.userAllTradeCountMax = val;
           binancePayload.userTradeCountFilterTime = filterTime.tradeCount;
-          console.log(`   ✅ Min trades (→ userAllTradeCountMin): ${val} (filter=${filterTime.tradeCount === 1 ? '30D' : 'All-time'})`);
+          console.log(`   ✅ Max trades (→ userAllTradeCountMax): ${val} — buyers with ${val}+ trades are blocked (filter=${filterTime.tradeCount === 1 ? '30D' : 'All-time'})`);
+        } else {
+          binancePayload.userAllTradeCountMax = 0;
         }
       } else {
-        console.log(`   🔄 Min trades: disabled`);
+        binancePayload.userAllTradeCountMax = 0;
+        console.log(`   🔄 Max trades: disabled`);
       }
+      let allTradeMin = 0;
 
       // Min completion rate (userTradeCompleteRateMin)
       if (isCriterionEnabled(rules.min30dayCompletionRate)) {
@@ -866,22 +866,20 @@ class SellerAdsController {
         console.log(`   🔄 Min registered days: RESET TO 0 (disabled)`);
       }
 
-      // Min all trades count (userAllTradeCountMin). Both this and "Min 30-Day Trades"
-      // above target userAllTradeCountMin (the field that actually blocks), so we take
-      // the HIGHER of the two — the stricter requirement wins.
+      // Min all trades count (userAllTradeCountMin) — the MINIMUM all-time trades a
+      // buyer needs. Separate from the "Max Trades" above (userAllTradeCountMax).
       if (isCriterionEnabled(rules.minAllTradesCount)) {
         const val = safeInt(getCriterionValue(rules.minAllTradesCount));
         if (val > 0) {
-          allTradeMin = Math.max(allTradeMin, val);
+          allTradeMin = val;
           binancePayload.userTradeCountFilterTime = filterTime.tradeCount;
           console.log(`   ✅ Min all trades: ${val}`);
         }
       } else {
         console.log(`   🔄 Min all trades: disabled`);
       }
-      // Commit the merged all-trade minimum (0 clears it when neither is set).
+      // Commit the all-trade minimum (0 clears it when disabled).
       binancePayload.userAllTradeCountMin = allTradeMin;
-      console.log(`   📊 Final userAllTradeCountMin = ${allTradeMin} (max of Min-Trades + Min-All-Trades)`);
 
       // Min buy orders count (userBuyTradeCountMin)
       if (isCriterionEnabled(rules.minBuyOrdersCount)) {
