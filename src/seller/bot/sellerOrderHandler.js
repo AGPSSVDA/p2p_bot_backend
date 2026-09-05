@@ -1775,6 +1775,18 @@ class SellerOrderHandler {
       console.log(`\n🔓 [${orderNo}] ===== AUTO-RELEASE START =====`);
       console.log(`    Fund password configured : ${hasFundPwd ? 'YES (FUND_PWD auto-release)' : 'NO (will fall back to manual)'}`);
 
+      // SAFETY: if the fund password was already rejected once this run (83893/83895/
+      // 83896), STOP auto-releasing — Binance locks the account after 3 wrong tries.
+      // Every order would otherwise burn another attempt. Route to manual release
+      // until the operator fixes SELLER_FUND_PASSWORD and restarts the bot.
+      if (this._fundPwdRejected) {
+        console.log(`    ⛔ Fund password was rejected earlier this run — SKIPPING auto-release to protect the account. Manual release only.`);
+        logger.error(`[${orderNo}] Auto-release skipped: fund password previously rejected. Fix SELLER_FUND_PASSWORD and restart the bot.`);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (fund password rejected)');
+        this.pollForManualRelease(orderNo);
+        return;
+      }
+
       // Step A: is release allowed yet?
       console.log(`    Step 1: checkIfCanReleaseCoin ...`);
       const check = await sellerBinanceService.checkIfCanReleaseCoin(orderNo);
@@ -1823,6 +1835,8 @@ class SellerOrderHandler {
         // is ACTUALLY released, not on payment-received.
         console.log(`      ❌ releaseCoin FAILED (code=${rel.code}) → seller must release manually`);
         logger.error(`[${orderNo}] releaseCoin failed — seller must release manually`, { code: rel.code, message: rel.message });
+        // Wrong fund password → latch so we don't burn more attempts this run.
+        if ([83893, 83895, 83896, '83893', '83895', '83896'].includes(rel.code)) this._fundPwdRejected = true;
         await sellerOrderDbService.recordError(orderNo, `releaseCoin failed: ${rel.message || rel.code}`);
         await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (releaseCoin failed)');
         this.pollForManualRelease(orderNo);
@@ -1843,6 +1857,16 @@ class SellerOrderHandler {
     } catch (error) {
       console.log(`    ❌ [${orderNo}] releaseCryptoForOrder EXCEPTION: ${error.message}`);
       logger.error(`[${orderNo}] releaseCryptoForOrder error: ${error.message}`);
+      // Wrong fund password (withRetry threw on 83893/83895/83896) → latch so we
+      // don't try to release any more orders this run and risk locking the account.
+      if (/83893|83895|83896|fund password/i.test(error.message || '')) {
+        this._fundPwdRejected = true;
+        console.log(`    ⛔ Fund password rejected — auto-release DISABLED for this run. Fix SELLER_FUND_PASSWORD and restart the bot. Order routed to manual release.`);
+        try {
+          await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT, 'ready to release — manual (fund password rejected)');
+          this.pollForManualRelease(orderNo);
+        } catch (e) { /* best effort */ }
+      }
       await sellerOrderDbService.recordError(orderNo, error.message);
     }
   }
