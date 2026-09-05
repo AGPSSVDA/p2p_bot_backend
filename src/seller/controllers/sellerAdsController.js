@@ -907,14 +907,18 @@ class SellerAdsController {
 
       // ADVANCED OPTIONS - Premium eligibility criteria
 
+      // Trade volume is measured in BTC on Binance (the app shows "0.0039 BTC" /
+      // "0.07 BTC"), so we send the value as-is with userTradeVolumeAsset=BTC. Values
+      // are small decimals — safeFloat preserves them.
+
       // Option 1: Min trade volume (userTradeVolumeMin)
       if (isCriterionEnabled(rules.minTradeVolume)) {
         const val = getCriterionValue(rules.minTradeVolume);
         if (val) {
           binancePayload.userTradeVolumeMin = safeFloat(val);
-          binancePayload.userTradeVolumeAsset = 'USDT';
+          binancePayload.userTradeVolumeAsset = 'BTC';
           binancePayload.userTradeVolumeFilterTime = filterTime.tradeVolume;
-          console.log(`   ✅ Min trade volume: ${binancePayload.userTradeVolumeMin} USDT (filter=${filterTime.tradeVolume === 1 ? '30D' : 'All-time'})`);
+          console.log(`   ✅ Min trade volume: ${binancePayload.userTradeVolumeMin} BTC (filter=${filterTime.tradeVolume === 1 ? '30D' : 'All-time'})`);
         }
       } else {
         binancePayload.userTradeVolumeMin = 0;
@@ -927,12 +931,12 @@ class SellerAdsController {
         if (val) {
           binancePayload.userTradeVolumeMax = safeFloat(val);
           if (!binancePayload.userTradeVolumeAsset) {
-            binancePayload.userTradeVolumeAsset = 'USDT';
+            binancePayload.userTradeVolumeAsset = 'BTC';
           }
           if (!binancePayload.userTradeVolumeFilterTime) {
             binancePayload.userTradeVolumeFilterTime = filterTime.tradeVolume;
           }
-          console.log(`   ✅ Max trade volume: ${binancePayload.userTradeVolumeMax} USDT (premium)`);
+          console.log(`   ✅ Max trade volume: ${binancePayload.userTradeVolumeMax} BTC (premium)`);
         }
       } else {
         binancePayload.userTradeVolumeMax = 0;
