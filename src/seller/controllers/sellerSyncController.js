@@ -32,9 +32,11 @@ class SellerSyncController {
       console.log('🔄 [SELLER SYNC] Starting ad sync from Binance...');
       logger.info('🔄 [SELLER SYNC] Starting ad sync from Binance', { sellerId });
 
-      // 1. Fetch ads from Binance using seller credentials
+      // 1. Fetch ads from Binance using seller credentials. Use a high `rows` so we
+      // get ALL ads (not just the first 20) — otherwise ads beyond page 1 never get
+      // their status refreshed and show up stale (e.g. "live" when actually offline).
       console.log('📡 [SELLER SYNC] Calling getSellerAds()...');
-      const binanceAds = await getSellerAds();
+      const binanceAds = await getSellerAds(1, 100);
       console.log('✅ [SELLER SYNC] getSellerAds() returned', binanceAds.length, 'ads');
       logger.info(`✅ [SELLER SYNC] Fetched ${binanceAds.length} ads from Binance`, { sellerId, count: binanceAds.length });
 
@@ -125,8 +127,24 @@ class SellerSyncController {
         }
       }
 
-      console.log(`\n🎉 [SELLER SYNC] Sync completed: ${syncedCount} synced, ${skippedCount} skipped, ${binanceAds.length} total`);
-      logger.info(`✅ [SELLER SYNC] Sync completed: ${syncedCount}/${binanceAds.length} ads synced`, { sellerId, synced: syncedCount, skipped: skippedCount });
+      // Close any ad that is in our DB but NO LONGER in Binance's list — it was
+      // deleted/closed on Binance, so it must not keep showing as live. Mark such
+      // ads ad_status=4 (Closed). Only touch SELL ads we actually got a list for.
+      let closedCount = 0;
+      try {
+        const liveAdNos = binanceAds
+          .filter(a => a.tradeType === 'SELL' || a.tradeType === 'sell')
+          .map(a => a.advNo);
+        if (liveAdNos.length > 0) {
+          closedCount = await sellerOrderDbService.closeAdsNotIn(sellerId, liveAdNos);
+          if (closedCount > 0) console.log(`🧹 [SELLER SYNC] Closed ${closedCount} ad(s) no longer on Binance`);
+        }
+      } catch (closeErr) {
+        logger.warn(`[SELLER SYNC] closeAdsNotIn failed: ${closeErr.message}`);
+      }
+
+      console.log(`\n🎉 [SELLER SYNC] Sync completed: ${syncedCount} synced, ${skippedCount} skipped, ${closedCount} closed, ${binanceAds.length} total`);
+      logger.info(`✅ [SELLER SYNC] Sync completed: ${syncedCount}/${binanceAds.length} ads synced`, { sellerId, synced: syncedCount, skipped: skippedCount, closed: closedCount });
 
       console.log('📤 [SELLER SYNC] Sending response with', syncedAds.length, 'ads');
       res.status(200).json({

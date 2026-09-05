@@ -723,6 +723,22 @@ class SellerOrderDbService {
 
   // ===== AD MANAGEMENT =====
 
+  /**
+   * Close (ad_status=4) every SELL ad of this seller whose ad_no is NOT in the given
+   * list — i.e. ads that Binance no longer returns (deleted/closed there). Keeps the
+   * frontend's "live" list honest after a sync. Returns the number of ads closed.
+   */
+  async closeAdsNotIn(sellerId, liveAdNos) {
+    if (!Array.isArray(liveAdNos) || liveAdNos.length === 0) return 0;
+    const placeholders = liveAdNos.map(() => '?').join(',');
+    const [res] = await pool.query(
+      `UPDATE seller_ads SET ad_status = 4
+         WHERE seller_id = ? AND ad_status <> 4 AND ad_no NOT IN (${placeholders})`,
+      [sellerId, ...liveAdNos]
+    );
+    return res.affectedRows || 0;
+  }
+
   async upsertAd(sellerId, adNo, adData) {
     const query = `
       INSERT INTO seller_ads (
