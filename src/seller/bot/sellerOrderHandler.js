@@ -1538,76 +1538,34 @@ class SellerOrderHandler {
 
       // Upload the one-time payment detail (Easebuzz QR/link) INTO the order so
       // Binance shows it on the buyer's Express UPI screen (fixes "Payment details
-      // not ready"). Per Binance's p2plus doc: uploadOrderPaymentMethod.
+      // not ready"). Per Binance's p2plus doc: uploadOrderPaymentMethod. It returns
+      // the Easebuzz merchantTxn so we can poll the GATEWAY for payment (the buyer
+      // pays on Easebuzz, NOT on the Binance screen — so we must watch Easebuzz,
+      // not the Binance order status, or the order times out and cancels).
       // SELLER_EXPRESS_SKIP_UPLOAD=true leaves the order un-uploaded (only 1 upload
       // allowed per order) so we can test the field format manually on a fresh order.
+      let merchantTxn = null;
       if (String(process.env.SELLER_EXPRESS_SKIP_UPLOAD).toLowerCase() === 'true') {
         console.log(`\n⏭️  [${orderNo}] EXPRESS UPI: auto-upload SKIPPED (SELLER_EXPRESS_SKIP_UPLOAD=true)`);
       } else {
         try {
-          await this.uploadExpressUpiPaymentDetail(orderNo, { amount, fiat, kycName, phone, wantQr, wantLink });
+          const up = await this.uploadExpressUpiPaymentDetail(orderNo, { amount, fiat, kycName, phone, wantQr, wantLink });
+          merchantTxn = up?.merchantTxn || null;
         } catch (upErr) {
           logger.error(`[${orderNo}] Express UPI upload failed: ${upErr.message}`);
         }
       }
 
-      this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
-      await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
-
-      if (this.gatewayPollers[orderNo]) return; // already watching
-      let pollCount = 0;
-      let busy = false;
-      const INTERVAL = Number(process.env.SELLER_EXPRESS_POLL_INTERVAL) || 10000; // 10s
-      const MAX_POLLS = Number(process.env.SELLER_EXPRESS_MAX_POLLS) || 8640;      // ~24h
-
-      console.log(`\n🟢 [${orderNo}] EXPRESS UPI: watching Binance order status for payment...`);
-
-      const poll = setInterval(async () => {
-        if (busy) return;
-        busy = true;
-        try {
-          pollCount++;
-          // Query across all states so we see 2 (paid), 4 (done), 6/7 (cancelled).
-          const st = await sellerBinanceService.getOrderStatusAllStates(orderNo);
-          if (!st?.success) { busy = false; return; }
-          const status = Number(st.orderStatus);
-
-          if (status === 2) {
-            // ✅ Buyer paid via Express UPI → auto-release now.
-            console.log(`🟢 [${orderNo}] EXPRESS UPI: buyer PAID (status 2) → auto-releasing`);
-            logger.info(`[${orderNo}] Express UPI payment confirmed (status 2) — auto-releasing`);
-            this._clearExpressPoller(orderNo);
-            await sellerOrderDbService.recordPaymentReceived?.(orderNo);
-            await this.releaseCryptoForOrder(orderNo);
-            return;
-          }
-          if (status === 4) {
-            // Already completed (Binance released it itself, e.g. Lightning-style).
-            console.log(`🟢 [${orderNo}] EXPRESS UPI: order COMPLETED (status 4) — finalizing`);
-            this._clearExpressPoller(orderNo);
-            await this.finalizeCompletedOrder(orderNo);
-            return;
-          }
-          if (status === 6 || status === 7) {
-            console.log(`🟢 [${orderNo}] EXPRESS UPI: order CANCELLED (status ${status}) — stopping`);
-            this._clearExpressPoller(orderNo);
-            this.stateManager.setState(orderNo, SELLER_ORDER_STATES.CANCELLED);
-            await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.CANCELLED, 'Express UPI: order cancelled');
-            return;
-          }
-
-          if (pollCount >= MAX_POLLS) {
-            console.log(`🟢 [${orderNo}] EXPRESS UPI: payment window ended (timeout)`);
-            this._clearExpressPoller(orderNo);
-          }
-        } catch (e) {
-          logger.warn(`[${orderNo}] Express UPI poll error: ${e.message}`);
-        } finally {
-          busy = false;
-        }
-      }, INTERVAL);
-
-      this.gatewayPollers[orderNo] = poll;
+      // Watch the Easebuzz gateway for the buyer's payment. On payment we mark the
+      // Binance order as paid (so it isn't system-cancelled) and then auto-release.
+      if (merchantTxn) {
+        console.log(`\n🟢 [${orderNo}] EXPRESS UPI: watching Easebuzz gateway for payment (txn ${merchantTxn})...`);
+        await this.pollGatewayPayment(orderNo, 'easebuzz', merchantTxn, kycName);
+      } else {
+        logger.error(`[${orderNo}] Express UPI: no merchantTxn — cannot watch payment`);
+        this.stateManager.setState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
+        await sellerOrderDbService.setOrderState(orderNo, SELLER_ORDER_STATES.WAITING_PAYMENT);
+      }
     } catch (error) {
       logger.error(`[${orderNo}] startExpressUpiFlow error: ${error.message}`);
       await sellerOrderDbService.recordError(orderNo, error.message);
@@ -1781,6 +1739,21 @@ class SellerOrderHandler {
       } else {
         console.log(`    decision         : no gateway payer name → release on prior verification (liveness+docs${''})`);
         logger.info(`[${orderNo}] Method 3: no payer name from gateway (likely UPI) — proceeding on prior verification`);
+      }
+
+      // For Express UPI the buyer paid on OUR gateway, not on the Binance screen, so
+      // the Binance order is still WAIT_PAYMENT. Mark it paid first so it moves to
+      // WAIT_RELEASE (otherwise releaseCoin can't run and the order would cancel).
+      // Best-effort: if it's already paid, Binance just returns an error we ignore.
+      try {
+        const detail = await sellerBinanceService.getOrderDetail(orderNo);
+        if (Number(detail?.orderStatus) === 1) {
+          console.log(`    → marking order as paid on Binance (was status 1)...`);
+          const mp = await sellerBinanceService.markOrderAsPaid(orderNo);
+          console.log(`      markOrderAsPaid → success=${mp.success} code=${mp.code} msg=${mp.message || ''}`);
+        }
+      } catch (mpErr) {
+        logger.warn(`[${orderNo}] markOrderAsPaid step failed (continuing): ${mpErr.message}`);
       }
 
       console.log(`    → releasing crypto...`);

@@ -196,6 +196,28 @@ async function getSellerUpiDetails() {
 }
 
 /**
+ * Mark an order as paid on Binance so its payment timer doesn't auto-cancel it.
+ * Endpoint: POST /sapi/v1/c2c/orderMatch/markOrderAsPaid
+ *
+ * Needed for Express UPI: the buyer pays through OUR gateway (Easebuzz), not on the
+ * Binance screen, so Binance's status stays WAIT_PAYMENT and the order gets
+ * system-cancelled at the timeout. Once we detect the gateway payment we call this
+ * to move the order to WAIT_RELEASE, then release.
+ */
+async function markOrderAsPaid(orderNo) {
+  return withRetry(async () => {
+    const qs = buildSignedQuery({});
+    const res = await axios.post(
+      `${url(sellerBinanceConfig.endpoints.markPaid)}?${qs}`,
+      { orderNumber: orderNo, orderNo },
+      { headers: headers(), timeout: 12000, httpsAgent: ipv4Agent }
+    );
+    const success = res.data?.code === '000000' || res.data?.code === 0 || res.status === 200;
+    return { success, code: res.data?.code, message: res.data?.message || res.data?.msg, raw: res.data };
+  }, 2, 3000, `markOrderAsPaid:${orderNo}`);
+}
+
+/**
  * Get a p2plus trade-method's upload fields (id + fieldId + contentType).
  * Endpoint: GET /sapi/v1/c2c/paymentMethod/getTradeMethodDetail?identifier=...
  * Needed before uploadOrderPaymentMethod so we know which field.id carries the QR.
@@ -803,6 +825,7 @@ module.exports = {
   getSellerUpiDetails,
   getTradeMethodDetail,
   uploadOrderPaymentMethod,
+  markOrderAsPaid,
   verifyAdditionalKyc,
   checkIfCanReleaseCoin,
   releaseCoin,
