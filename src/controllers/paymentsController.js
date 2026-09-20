@@ -178,9 +178,17 @@ async function approvePayment(req, res) {
       await orderDb.updateOrder(orderNo, { utr_number: utr });
 
       // Mirror to in-memory state if the bot is currently tracking the order
+      //
+      // manualMuted is cleared here: the operator routed this payout back
+      // through the bot via the Payments page, so the bot resumes talking
+      // (waitRelease, then thankYou on completion). Orders paid entirely
+      // outside the system never hit this branch and stay muted.
       const live = stateManager.get(orderNo);
       if (live) {
-        stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, { utr });
+        stateManager.set(orderNo, ORDER_STATE.PAYMENT_SENT, {
+          utr,
+          manualMuted: false,
+        });
       }
     }
 

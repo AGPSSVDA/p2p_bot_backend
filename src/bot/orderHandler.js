@@ -651,6 +651,20 @@ class OrderHandler {
       text,
     });
 
+    // Manual handover — the operator is paying the seller by hand and is
+    // talking to them directly. The message is already logged above so it
+    // still shows on the dashboard, but the bot must NOT reply to anything.
+    // Returning here (rather than relying on the mute inside _sendTpl) also
+    // skips the keyword-escalation check, so a seller saying "cancel" or
+    // "thank you" mid-manual-payout can't flip the order to ESCALATED
+    // behind the operator's back.
+    if (order.manualMuted || order.state === ORDER_STATE.AWAITING_MANUAL_PAYMENT) {
+      logger.info('Reply suppressed — manual payment in progress', {
+        orderNo, state: order.state,
+      });
+      return;
+    }
+
     // Problem-keyword escalation ("cancel", "fraud", "scam", etc.) is
     // SKIPPED in nearly every state. Per business rule:
     //
@@ -702,10 +716,12 @@ class OrderHandler {
         await this._handleTDSConsent(orderNo, text);
         break;
 
+      // NOTE: AWAITING_MANUAL_PAYMENT is deliberately absent — those orders
+      // return early above (manual handover mute). The bot must not reply
+      // "please wait" to a seller the operator already paid by hand.
       case ORDER_STATE.PAN_VERIFIED:
       case ORDER_STATE.TDS_ACCEPTED:
       case ORDER_STATE.PROCESSING_PAYMENT:
-      case ORDER_STATE.AWAITING_MANUAL_PAYMENT:
       case ORDER_STATE.VALIDATING_PAN:
         await this._sendTpl(orderNo, 'waitProcessing');
         break;
@@ -1374,7 +1390,12 @@ class OrderHandler {
       // cancel "unsafe" list so the timer won't cancel the order during
       // the operator's pay-out window.
       if (result.manual) {
-        stateManager.set(orderNo, ORDER_STATE.AWAITING_MANUAL_PAYMENT);
+        // manualMuted: from here on the operator owns the conversation.
+        // The bot sends the handover template below and then never speaks
+        // again on this order (see _isManualMuted).
+        stateManager.set(orderNo, ORDER_STATE.AWAITING_MANUAL_PAYMENT, {
+          manualMuted: true,
+        });
         orderDb.recordPayoutPending(stateManager.get(orderNo));
 
         // Pick the right message based on WHY auto-payment was skipped:
@@ -1915,6 +1936,46 @@ class OrderHandler {
     };
   }
 
+  // ── Manual-handover chat mute ─────────────────────────────────────────────
+  //  Once an order falls back to manual payment (auto_payout OFF, or any
+  //  other manual reason), the operator pays the seller by hand and talks to
+  //  them directly. The bot must go SILENT from that point on — per business
+  //  rule. Otherwise the seller gets nonsense: they release the crypto, say
+  //  "thank you", and the bot — still parked in AWAITING_MANUAL_PAYMENT —
+  //  keeps replying "your order is processing, please wait".
+  //
+  //  The mute is a per-order flag (`manualMuted`) set exactly once, when the
+  //  order enters AWAITING_MANUAL_PAYMENT. It covers every later template:
+  //  waitProcessing, waitRelease, paymentProcessing, thankYou,
+  //  orderCancelledRemote — everything.
+  //
+  //  Whitelist: the handover message itself (manualPaymentPending /
+  //  manualPaymentUpi) is the LAST thing the bot says. It's rendered in the
+  //  same tick the flag is set, so it's allowed through explicitly.
+  //
+  //  Not muted: PAN / TDS / cancellation templates that run BEFORE the
+  //  manual fallback — the flag simply isn't set yet at that point.
+  _isManualMuted(orderNo, templateKey) {
+    const HANDOVER_TEMPLATES = ['manualPaymentPending', 'manualPaymentUpi'];
+    if (HANDOVER_TEMPLATES.includes(templateKey)) return false;
+
+    const order = stateManager.get(orderNo);
+    if (!order) return false;
+
+    // The flag is the primary signal, but AWAITING_MANUAL_PAYMENT alone is
+    // enough: if the process restarted, the in-memory flag is gone while the
+    // order is still parked in manual state. Deriving from the state too
+    // means a restart can never accidentally un-mute a manual order.
+    if (!order.manualMuted && order.state !== ORDER_STATE.AWAITING_MANUAL_PAYMENT) {
+      return false;
+    }
+
+    logger.info('Chat muted — order handed over to manual payment', {
+      orderNo, state: order.state, suppressedTemplate: templateKey,
+    });
+    return true;
+  }
+
   // ── Render + send a template by key with the GLOBAL var map ───────────────
   //  Sends EVERY message block configured for the key (multi-template
   //  support: add 1..N messages to any section in the Chat Templates page and
@@ -1922,6 +1983,7 @@ class OrderHandler {
   //
   //  Returns true if all non-empty blocks were delivered.
   async _sendTpl(orderNo, templateKey, extras = {}) {
+    if (this._isManualMuted(orderNo, templateKey)) return false;
     const vars = this._buildVars(orderNo, extras);
     let blocks;
     try {
@@ -1949,6 +2011,7 @@ class OrderHandler {
   //  Used for paymentSent / paymentFailed / thankYou / returning-seller where
   //  a dropped block mid-sequence would break the conversation.
   async _sendTplReliable(orderNo, templateKey, extras = {}) {
+    if (this._isManualMuted(orderNo, templateKey)) return false;
     const vars = this._buildVars(orderNo, extras);
     let blocks;
     try {
